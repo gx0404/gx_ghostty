@@ -16,14 +16,14 @@ pub const Endpoint = struct {
         var numbers: [14]u8 = undefined;
         std.mem.writeInt(u64, numbers[0..8], identity.logon_id, .little);
         std.mem.writeInt(u32, numbers[8..12], identity.session_id, .little);
-        numbers[12] = @intFromEnum(identity.integrity);
+        numbers[12] = @backingInt(identity.integrity);
         numbers[13] = @intFromBool(identity.elevated);
         hash.update(&numbers);
-        inline for (std.meta.fields(policy.Isolation)) |field| hash.update(&@field(isolation, field.name));
+        inline for (@typeInfo(policy.Isolation).@"struct".field_names) |field| hash.update(&@field(isolation, field));
         var digest: [32]u8 = undefined;
         hash.final(&digest);
         var ascii: [120]u8 = undefined;
-        const text = try std.fmt.bufPrint(&ascii, "\\\\.\\pipe\\ghostty-gx-v1-{s}", .{std.fmt.bytesToHex(digest, .lower)});
+        const text = try std.mem.print(&ascii, "\\\\.\\pipe\\ghostty-gx-v1-{s}", .{std.fmt.bytesToHex(digest, .lower)});
         var result: Endpoint = .{ .name = @splat(0), .isolation = isolation };
         _ = try std.unicode.utf8ToUtf16Le(&result.name, text);
         return result;
@@ -37,8 +37,8 @@ pub fn hello(buffer: *[hello_size]u8, epoch: u128, identity: policy.Identity, is
     std.mem.writeInt(u128, buffer[8..24], epoch, .little);
     std.mem.writeInt(u32, buffer[24..28], identity.process.pid, .little);
     std.mem.writeInt(u64, buffer[28..36], identity.process.birth, .little);
-    inline for (std.meta.fields(policy.Isolation), 0..) |field, i|
-        @memcpy(buffer[36 + i * 32 ..][0..32], &@field(isolation, field.name));
+    inline for (@typeInfo(policy.Isolation).@"struct".field_names, 0..) |field, i|
+        @memcpy(buffer[36 + i * 32 ..][0..32], &@field(isolation, field));
 }
 
 pub fn verifyHello(buffer: *const [hello_size]u8, local: security.Facts, peer: security.Facts, isolation: policy.Isolation) !u128 {
@@ -51,8 +51,8 @@ pub fn verifyHello(buffer: *const [hello_size]u8, local: security.Facts, peer: s
         .birth = std.mem.readInt(u64, buffer[28..36], .little),
     };
     var peer_isolation: policy.Isolation = undefined;
-    inline for (std.meta.fields(policy.Isolation), 0..) |field, i|
-        @memcpy(&@field(peer_isolation, field.name), buffer[36 + i * 32 ..][0..32]);
+    inline for (@typeInfo(policy.Isolation).@"struct".field_names, 0..) |field, i|
+        @memcpy(&@field(peer_isolation, field), buffer[36 + i * 32 ..][0..32]);
     try policy.authenticate(local.identity, peer.identity, claimed, isolation, peer_isolation, false);
     try security.verifyImage(local, peer);
     return epoch;
@@ -71,15 +71,15 @@ test "apprt.win32.ipc.wire namespace excludes process but includes isolation" {
     try std.testing.expectEqualDeep(first, try Endpoint.init(isolation, other));
     other.elevated = true;
     try std.testing.expect(!std.mem.eql(u16, &first.name, &(try Endpoint.init(isolation, other)).name));
-    inline for (std.meta.fields(policy.Isolation)) |field| {
+    inline for (@typeInfo(policy.Isolation).@"struct".field_names) |field| {
         var changed = isolation;
-        @field(changed, field.name)[0] += 1;
+        @field(changed, field)[0] += 1;
         try std.testing.expect(!std.mem.eql(u16, &first.name, &(try Endpoint.init(changed, identity)).name));
     }
 }
 
 test "apprt.win32.ipc.wire handshake claims must match actual process birth" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const local = try security.inspect(n.GetCurrentProcessId());
     defer local.deinit();
     const isolation: policy.Isolation = .{ .config_root = @splat(1), .build = @splat(2), .class = @splat(3), .install = @splat(4) };

@@ -104,7 +104,7 @@ fn isCjk(cp: u32) bool {
 }
 
 fn reject(state: *State, reason: Reason) void {
-    if (state.reject()) perf.count(prefix ++ "rejected", @intFromEnum(reason));
+    if (state.reject()) perf.count(prefix ++ "rejected", @backingInt(reason));
 }
 
 /// A stack-scoped bridge from SharedGrid.getIndex to recursive resolver calls.

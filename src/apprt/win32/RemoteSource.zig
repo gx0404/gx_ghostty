@@ -263,12 +263,12 @@ test "remote fixture snapshot reads real terminal scrollback and disabled gate t
 }
 
 fn sameViewState(first: *const protocol.SurfaceState, second: *const protocol.SurfaceState) bool {
-    inline for (@typeInfo(protocol.SurfaceState).@"struct".fields) |field| {
-        if (comptime field.type == protocol.Title or field.type == protocol.Text) {
+    inline for (@typeInfo(protocol.SurfaceState).@"struct".field_names) |field| {
+        if (comptime @FieldType(protocol.SurfaceState, field) == protocol.Title or @FieldType(protocol.SurfaceState, field) == protocol.Text) {
             // Bounded strings initialize only their live prefix. Their spare
             // capacity is not part of the state and must never be inspected.
-            if (!std.mem.eql(u8, @field(first.*, field.name).slice(), @field(second.*, field.name).slice())) return false;
-        } else if (!std.meta.eql(@field(first.*, field.name), @field(second.*, field.name))) return false;
+            if (!std.mem.eql(u8, @field(first.*, field).slice(), @field(second.*, field).slice())) return false;
+        } else if (!std.meta.eql(@field(first.*, field), @field(second.*, field))) return false;
     }
     return true;
 }
@@ -387,7 +387,7 @@ fn dispatchInput(state: *State, event: *const protocol.Input) !void {
                 .dead = value.dead,
             } else null;
             _ = try core.gxWin32KeyCallback(.{
-                .action = @enumFromInt(@intFromEnum(key.action)),
+                .action = @fromBackingInt(@intCast(@backingInt(key.action))),
                 .key = try protocol.physicalKey(input.Key, key.physical),
                 .mods = @bitCast(key.modifiers),
                 .consumed_mods = @bitCast(key.consumed_modifiers),
@@ -1167,7 +1167,7 @@ pub fn routeAction(app: *App, target: apprt.Target, comptime action: apprt.Actio
         },
         .pwd => state.view.pwd = clipped(protocol.Text, value.pwd),
         .ring_bell => state.view.bell = true,
-        .mouse_shape => state.view.cursor = @intCast(@intFromEnum(value)),
+        .mouse_shape => state.view.cursor = @intCast(@backingInt(value)),
         .mouse_visibility => state.view.mouse_visible = value == .visible,
         .show_child_exited => {
             state.view.exited = true;
@@ -1181,7 +1181,7 @@ pub fn routeAction(app: *App, target: apprt.Target, comptime action: apprt.Actio
             return true;
         },
         .open_url => {
-            try requestUiEvent(state, .{ .open_url = .{ .kind = @enumFromInt(@intFromEnum(value.kind)), .url = try protocol.SnapshotText.init(value.url) } });
+            try requestUiEvent(state, .{ .open_url = .{ .kind = @fromBackingInt(@intCast(@backingInt(value.kind))), .url = try protocol.SnapshotText.init(value.url) } });
             return true;
         },
         .desktop_notification => {
@@ -1213,7 +1213,7 @@ pub fn routeAction(app: *App, target: apprt.Target, comptime action: apprt.Actio
             return true;
         },
         .progress_report => {
-            try requestUiEvent(state, .{ .runtime = .{ .progress = .{ .state = @intCast(@intFromEnum(value.state)), .progress = if (value.progress) |percent| @min(percent, 100) else null } } });
+            try requestUiEvent(state, .{ .runtime = .{ .progress = .{ .state = @intCast(@backingInt(value.state)), .progress = if (value.progress) |percent| @min(percent, 100) else null } } });
             return true;
         },
         .command_finished => {
@@ -1254,15 +1254,15 @@ pub fn routeAction(app: *App, target: apprt.Target, comptime action: apprt.Actio
                     .tab => .prompt_tab_title,
                     .window => .prompt_window_title,
                 },
-                .inspector => .{ .inspector = @enumFromInt(@intFromEnum(value)) },
+                .inspector => .{ .inspector = @fromBackingInt(@intCast(@backingInt(value))) },
                 .set_tab_title => .{ .set_tab_title = value.title },
                 .set_window_title => .{ .set_window_title = value.title },
-                .new_split => .{ .new_split = @enumFromInt(@intFromEnum(value)) },
-                .close_tab => .{ .close_tab = @enumFromInt(@intFromEnum(value)) },
-                .goto_split => .{ .goto_split = @enumFromInt(@intFromEnum(value)) },
-                .goto_window => .{ .goto_window = @enumFromInt(@intFromEnum(value)) },
+                .new_split => .{ .new_split = @fromBackingInt(@intCast(@backingInt(value))) },
+                .close_tab => .{ .close_tab = @fromBackingInt(@intCast(@backingInt(value))) },
+                .goto_split => .{ .goto_split = @fromBackingInt(@intCast(@backingInt(value))) },
+                .goto_window => .{ .goto_window = @fromBackingInt(@intCast(@backingInt(value))) },
                 .move_tab => .{ .move_tab = value.amount },
-                .open_config => .{ .open_config = @enumFromInt(@intFromEnum(value)) },
+                .open_config => .{ .open_config = @fromBackingInt(@intCast(@backingInt(value))) },
                 .reload_config => .reload_config,
                 else => return false,
             };

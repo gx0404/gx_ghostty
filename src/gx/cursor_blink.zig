@@ -77,7 +77,7 @@ pub fn testThread(comptime Thread: type, comptime Renderer: type, comptime xev: 
         renderer.draw_mutex = .init;
         renderer.display_realized = gate != 2;
         renderer.gx_cursor_blink_affects = gate != 1;
-        var config = try std.meta.Child(@typeInfo(@TypeOf(Thread.init)).@"fn".params[1].type.?).default(std.testing.allocator);
+        var config = try std.meta.Child(@typeInfo(@TypeOf(Thread.init)).@"fn".param_types[1].?).default(std.testing.allocator);
         defer config.deinit();
         var thread = try Thread.init(std.testing.allocator, &config, undefined, &renderer, undefined);
         defer thread.deinit();
@@ -102,7 +102,7 @@ pub fn testThread(comptime Thread: type, comptime Renderer: type, comptime xev: 
 }
 
 pub fn testFocus(comptime Thread: type, comptime Renderer: type, comptime drain: anytype, comptime callback: anytype) !void {
-    if (@import("builtin").os.tag.isDarwin()) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag.isDarwin()) return error.SkipZigTest;
     var renderer: Renderer = undefined;
     renderer.draw_mutex = .init;
     renderer.display_realized = true;
@@ -110,8 +110,8 @@ pub fn testFocus(comptime Thread: type, comptime Renderer: type, comptime drain:
     renderer.focused = true;
     renderer.has_custom_shaders = false;
     renderer.kitty_animation_next_ms = null;
-    renderer.display_link = null;
-    var config = try std.meta.Child(@typeInfo(@TypeOf(Thread.init)).@"fn".params[1].type.?).default(std.testing.allocator);
+    renderer.display_link = if (@TypeOf(renderer.display_link) == void) {} else null;
+    var config = try std.meta.Child(@typeInfo(@TypeOf(Thread.init)).@"fn".param_types[1].?).default(std.testing.allocator);
     defer config.deinit();
     var thread = try Thread.init(std.testing.allocator, &config, undefined, &renderer, undefined);
     defer thread.deinit();

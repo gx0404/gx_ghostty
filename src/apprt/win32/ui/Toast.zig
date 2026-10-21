@@ -339,7 +339,7 @@ test "toast text is stored up to a character boundary" {
     toast.store(.{ .text = "Copied", .icon = d2d.icons.check_mark });
     try testing.expectEqualStrings("Copied", toast.text[0..toast.text_len]);
     try testing.expectEqual(@as(?u21, d2d.icons.check_mark), toast.icon);
-    toast.store(.{ .text = "\u{6C49}" ** 100 });
+    toast.store(.{ .text = std.mem.asBytes(&@as([100]["\u{6C49}".len]u8, @splat("\u{6C49}".*))) });
     try testing.expect(toast.text_len <= toast.text.len);
     try testing.expect(std.unicode.utf8ValidateSlice(toast.text[0..toast.text_len]));
     try testing.expectEqual(@as(?u21, null), toast.icon);

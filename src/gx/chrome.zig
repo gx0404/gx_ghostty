@@ -52,7 +52,7 @@ pub const Options = struct {
     /// and, like the rest of the GTK look, apply with `window-theme`
     /// `auto` or `ghostty`.
     pub fn fromConfig(config: *const Config) Options {
-        const titlebar = builtin.os.tag != .windows and switch (config.@"window-theme") {
+        const titlebar = builtin.target.os.tag != .windows and switch (config.@"window-theme") {
             .auto, .ghostty => true,
             .system, .light, .dark => false,
         };
@@ -373,7 +373,7 @@ test "Options.fromConfig" {
     config.@"window-theme" = .ghostty;
     const options = Options.fromConfig(&config);
     try testing.expectEqual(@as(u24, 0x010203), options.divider.?.toHex());
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         try testing.expectEqual(@as(?Color, null), options.title_bar);
         try testing.expectEqual(@as(?Color, null), options.title_bar_text);
     } else {

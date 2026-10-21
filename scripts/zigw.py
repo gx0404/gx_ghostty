@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """钉版 Zig 包装器：解析 Zig、校验版本、补项目内全局缓存，再原样透传参数与退出码。
 
-解析顺序：$GX_GHOSTTY_ZIG > $ZIG > <repo>/.local/toolchains/zig/zig-0.16.0/zig[.exe]
+解析顺序：$GX_GHOSTTY_ZIG > $ZIG > <repo>/.local/toolchains/zig/zig-0.17.0/zig[.exe]
 （安装根可用 GX_GHOSTTY_ZIG_HOME 覆盖）> PATH 中的 zig。环境变量一旦设置就是权威：
 指向不存在的文件直接报错，不会悄悄回退到后面的候选。
 

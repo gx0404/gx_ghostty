@@ -119,7 +119,7 @@ painted_area_w: i32 = 0,
 frozen: ?tab_layout.Frozen = null,
 
 geometry_cache: tab_layout.Cache = .{},
-labels: [max_tabs]CachedLabel = [_]CachedLabel{.{}} ** max_tabs,
+labels: [max_tabs]CachedLabel = @as([max_tabs]CachedLabel, @splat(.{})),
 polling: tab_layout.Polling = .{},
 
 /// Inline renaming: what is renamed, the text field over it (a popup, or
@@ -135,14 +135,14 @@ rename_font: ?*anyopaque = null,
 tracking_mouse: bool = false,
 
 /// What runs in the tabs' focused terminals.
-processes: [max_tabs]ProcessName = [_]ProcessName{.{}} ** max_tabs,
+processes: [max_tabs]ProcessName = @as([max_tabs]ProcessName, @splat(.{})),
 
 /// The new-output trackers of the terminals, by core surface id.
 tracked: [max_tracked]Tracked = undefined,
 tracked_len: usize = 0,
 
 /// The status each tab was painted with, to repaint when it changes.
-painted_status: [max_tabs]StatusKey = [_]StatusKey{.{}} ** max_tabs,
+painted_status: [max_tabs]StatusKey = @as([max_tabs]StatusKey, @splat(.{})),
 
 /// Ticks of `onTimer` (one per second).
 ticks: u32 = 0,
@@ -524,8 +524,8 @@ const Colors = struct {
 
 fn sharedTokens(t: style.Tokens) gx.ui_tokens.Tokens {
     var out: gx.ui_tokens.Tokens = undefined;
-    inline for (@typeInfo(gx.ui_tokens.Tokens).@"struct".fields) |field| {
-        @field(out, field.name) = @field(t, field.name);
+    inline for (@typeInfo(gx.ui_tokens.Tokens).@"struct".field_names) |field| {
+        @field(out, field) = @field(t, field);
     }
     return out;
 }
@@ -1127,7 +1127,7 @@ fn withShortcut(buf: []u8, text: []const u8, keys: ?Shortcut) []const u8 {
     if (kept.len == text.len) {
         if (keys) |k| {
             var key_buf: [64]u8 = undefined;
-            const suffix = std.fmt.bufPrint(&key_buf, " ({s})", .{k.text()}) catch return writer.buffered();
+            const suffix = std.mem.print(&key_buf, " ({s})", .{k.text()}) catch return writer.buffered();
             writer.writeAll(tab_layout.utf8Prefix(suffix, buf.len - kept.len)) catch unreachable;
         }
     }
@@ -1864,8 +1864,8 @@ fn refreshProgramsOfApp(app: *App) void {
 fn refreshPrograms(self: *TabBar, table: *gx.proc.Table) bool {
     const win = self.window();
     const count = @min(win.tab_count, max_tabs);
-    var next: [max_tabs]ProcessName = [_]ProcessName{.{}} ** max_tabs;
-    var roots: [max_tabs]?gx.proc.Pid = [_]?gx.proc.Pid{null} ** max_tabs;
+    var next: [max_tabs]ProcessName = @as([max_tabs]ProcessName, @splat(.{}));
+    var roots: [max_tabs]?gx.proc.Pid = @as([max_tabs]?gx.proc.Pid, @splat(null));
     var pids: [max_tabs]gx.proc.Pid = undefined;
     var pid_count: usize = 0;
     for (0..count) |i| {
@@ -2396,7 +2396,7 @@ test "caption colors are consumed without tinting a bare material" {
         strip_text: d2d.Color = .white,
         strip_text_inactive: d2d.Color = d2d.Color.white.withAlpha(0.36),
 
-        fn hoverGlyphColor(self: @This()) d2d.Color {
+        pub fn hoverGlyphColor(self: @This()) d2d.Color {
             return if (self.tokens.high_contrast) self.tokens.hover_text else self.strip_text;
         }
     };
@@ -2579,8 +2579,8 @@ test "the signature takes the shared chrome color, the highlight in high contras
     // The win32 tokens with the brand accent (`fromColors` follows the
     // theme), as `Tokens.fromConfig` derives them by default.
     var brand = tokens;
-    inline for (@typeInfo(gx.ui_tokens.Tokens).@"struct".fields) |field| {
-        @field(brand, field.name) = @field(shared, field.name);
+    inline for (@typeInfo(gx.ui_tokens.Tokens).@"struct".field_names) |field| {
+        @field(brand, field) = @field(shared, field);
     }
     try testing.expectEqual(@as(u24, 0xcba6f7), signatureOf(brand, chrome).toHex());
     try testing.expectEqual(gx.chrome.tabSignature(brand.accent, chrome, chrome.active_tab, brand.background), signatureOf(brand, chrome));

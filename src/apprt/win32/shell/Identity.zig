@@ -35,7 +35,7 @@ pub fn init(alloc: std.mem.Allocator, mode: Mode, canonical_exe: []const u8, reg
     std.crypto.hash.sha2.Sha256.hash(normalized, &path_hash, .{});
     const name = switch (mode) {
         .installed => installed_aumid,
-        .portable => try std.fmt.allocPrint(owned, "{s}.Portable.{s}", .{ installed_aumid, std.fmt.bytesToHex(path_hash[0..16], .lower) }),
+        .portable => try owned.print("{s}.Portable.{s}", .{ installed_aumid, std.fmt.bytesToHex(path_hash[0..16], .lower) }),
     };
     var activator = guid(installed_activator);
     if (mode == .portable) {
@@ -81,7 +81,7 @@ fn registrationString(alloc: std.mem.Allocator, comptime key: []const u8, compti
     if (bytes < 2 or bytes % 2 != 0 or bytes > data.len * 2) return error.InvalidRegistration;
     const text = data[0 .. bytes / 2 - 1];
     if (data[bytes / 2 - 1] != 0 or std.mem.indexOfScalar(u16, text, 0) != null) return error.InvalidRegistration;
-    return alloc.dupeZ(u16, text);
+    return alloc.dupeSentinel(u16, text, 0);
 }
 
 fn registrationMatches(alloc: std.mem.Allocator, exe: [:0]const u16, activator: []const u16, registered_exe: [:0]const u16, command: [:0]const u16) !bool {
@@ -246,7 +246,7 @@ pub const iid_agile = guid("94ea2b94-e9cc-49e0-c0ff-ee64ca8f5b90");
 /// installation uses the stable exported manifest below.
 pub fn activatorText(self: *const Identity, buffer: *[36]u8) []const u8 {
     const value = self.activator;
-    return std.fmt.bufPrint(buffer, "{x:0>8}-{x:0>4}-{x:0>4}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+    return std.mem.print(buffer, "{x:0>8}-{x:0>4}-{x:0>4}-{x:0>2}{x:0>2}-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
         value.Data1, value.Data2, value.Data3, value.Data4[0], value.Data4[1], value.Data4[2], value.Data4[3], value.Data4[4], value.Data4[5], value.Data4[6], value.Data4[7],
     }) catch unreachable;
 }

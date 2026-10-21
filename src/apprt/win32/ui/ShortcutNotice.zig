@@ -66,8 +66,8 @@ pub fn deinit(self: *ShortcutNotice) void {
 /// Show `content` at the bottom of the window.
 pub fn show(self: *ShortcutNotice, content: Content) void {
     var end: usize = 0;
-    inline for (std.meta.fields(Content), 0..) |field, i| {
-        const text = @field(content, field.name);
+    inline for (@typeInfo(Content).@"struct".field_names, 0..) |field, i| {
+        const text = @field(content, field);
         const len = @min(text.len, self.buf.len - end);
         @memcpy(self.buf[end..][0..len], text[0..len]);
         end += len;
@@ -135,7 +135,7 @@ fn noticePlacement(self: *ShortcutNotice) ?Notice.Placement {
 }
 
 fn piece(self: *const ShortcutNotice, p: Piece) []const u8 {
-    const i = @intFromEnum(p);
+    const i = @backingInt(p);
     const start = if (i == 0) 0 else self.ends[i - 1];
     return self.buf[start..self.ends[i]];
 }

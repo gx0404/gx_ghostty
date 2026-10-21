@@ -585,15 +585,15 @@ pub const Leader = struct {
 
     /// A value for object data: never 0, so never null.
     pub fn encode(self: Leader) usize {
-        return @as(usize, self.pid) << 8 | (@as(usize, @intFromEnum(self.kind)) + 1);
+        return @as(usize, self.pid) << 8 | (@as(usize, @backingInt(self.kind)) + 1);
     }
 
     pub fn decode(value: usize) ?Leader {
         const tag = value & 0xff;
-        if (tag == 0 or tag > std.meta.fields(gx.leader.Kind).len) return null;
+        if (tag == 0 or tag > @typeInfo(gx.leader.Kind).@"enum".field_names.len) return null;
         return .{
             .pid = @truncate(value >> 8),
-            .kind = @enumFromInt(@as(@typeInfo(gx.leader.Kind).@"enum".tag_type, @intCast(tag - 1))),
+            .kind = @fromBackingInt(@as(@typeInfo(gx.leader.Kind).@"enum".tag_type, @intCast(tag - 1))),
         };
     }
 };
@@ -814,8 +814,8 @@ test "Timeline stops when no window polls" {
 test "Leader round-trips through object data" {
     const testing = std.testing;
     try testing.expectEqual(@as(?Leader, null), Leader.decode(0));
-    inline for (std.meta.fields(gx.leader.Kind)) |field| {
-        const kind: gx.leader.Kind = @enumFromInt(field.value);
+    inline for (@typeInfo(gx.leader.Kind).@"enum".field_values) |field_value| {
+        const kind: gx.leader.Kind = @fromBackingInt(field_value);
         for ([_]gx.proc.Pid{ 0, 1, 4_194_304 }) |pid| {
             const value = (Leader{ .pid = pid, .kind = kind }).encode();
             try testing.expect(value != 0);

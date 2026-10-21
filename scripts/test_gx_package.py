@@ -561,7 +561,7 @@ class PackageTests(Case):
         self.package(skip_installer=True, build=True, runner=runner)
         command, cwd = calls[0]
         self.assertEqual(command[1:3], [str(self.root / "scripts" / "zigw.py"), "build"])
-        for flag in ("-Dapp-runtime=win32", "-Dtarget=x86_64-windows-gnu", "-Doptimize=ReleaseFast",
+        for flag in ("-Dapp-runtime=win32", "-Dtarget=x86_64-windows-gnu", "-Doptimize=fast",
                      f"-Dversion-string={VS}", "--prefix"):
             self.assertIn(flag, command)
         self.assertEqual(cwd, str(self.root))

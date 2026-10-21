@@ -2,8 +2,8 @@
 """gx_ghostty 一键环境：钉版 Zig 与框架 venv 装进仓库内 .local/；--check 是只读体检。
 
 默认（just setup）幂等补齐：
-  1. 钉版 Zig 0.16.0 → .local/toolchains/zig/zig-0.16.0/（委托 setup_zig.py）。
-     $GX_GHOSTTY_ZIG / $ZIG 已指向可用的 0.16.0 时，按 zigw 解析顺序它优先生效，跳过下载。
+  1. 钉版 Zig 0.17.0 → .local/toolchains/zig/zig-0.17.0/（委托 setup_zig.py）。
+     $GX_GHOSTTY_ZIG / $ZIG 已指向可用的 0.17.0 时，按 zigw 解析顺序它优先生效，跳过下载。
   2. 框架 venv → .local/tools/venv/，内装 graphifyy==0.9.73：有 uv 时用
      `uv venv --python <真实解释器> <venv>` + `uv pip install --python <venv python>`，
      否则 `python -m venv` + pip；已就绪则跳过。

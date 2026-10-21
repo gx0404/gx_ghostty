@@ -266,7 +266,7 @@ fn actionAccel(alloc: std.mem.Allocator, config: *const configpkg.Config, action
     const trigger = menuTrigger(&config.keybind.set, action) orelse return null;
     var buf: [128]u8 = undefined;
     const accel = try key.accelFromTrigger(&buf, trigger) orelse return null;
-    return try alloc.dupeZ(u8, accel);
+    return try alloc.dupeSentinel(u8, accel, 0);
 }
 
 fn menuTrigger(set: *const input.Binding.Set, action: input.Binding.Action) ?input.Binding.Trigger {
@@ -493,7 +493,7 @@ fn zoomMapped(widget: *gtk.Widget, _: ?*anyopaque) callconv(.c) void {
 fn showZoom(percent: *gtk.Label) void {
     var buf: [16]u8 = undefined;
     const value = zoomPercent(percent.as(gtk.Widget)) orelse 100;
-    percent.setText(std.fmt.bufPrintZ(&buf, "{d}%", .{value}) catch "100%");
+    percent.setText(std.mem.printSentinel(&buf, "{d}%", .{value}, 0) catch "100%");
 }
 
 fn zoomPercent(widget: *gtk.Widget) ?u32 {
@@ -688,7 +688,7 @@ fn hasAppAction(app: *Application, name: [:0]const u8) bool {
 }
 
 fn languageStamp(lang: gx.i18n.Language) usize {
-    return @as(usize, @intFromEnum(lang)) + 1;
+    return @as(usize, @backingInt(lang)) + 1;
 }
 
 // The generated binding declares the result as non-null, but GTK returns

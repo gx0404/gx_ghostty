@@ -29,7 +29,7 @@ pub fn keys(arena: Allocator, sequences: []const []const Trigger) Allocator.Erro
         box.append(try sequence(arena, steps));
     }
     if (sequences.len > shown) {
-        const more = dimLabel(try std.fmt.allocPrintSentinel(arena, "+{d}", .{sequences.len - shown}, 0));
+        const more = dimLabel(try arena.printSentinel("+{d}", .{sequences.len - shown}, 0));
         more.setTooltipText(try sequencesText(arena, sequences[shown..]));
         box.append(more);
     }
@@ -65,7 +65,7 @@ pub fn fromLabels(arena: Allocator, labels: []const []const u8, pending: bool) A
     box.as(gtk.Widget).setValign(.center);
     for (labels, 0..) |text, i| {
         if (i > 0) box.append(dimLabel("+"));
-        const label = gtk.Label.new(try arena.dupeZ(u8, text));
+        const label = gtk.Label.new(try arena.dupeSentinel(u8, text, 0));
         label.as(gtk.Widget).addCssClass("keycap");
         box.append(label.as(gtk.Widget));
     }

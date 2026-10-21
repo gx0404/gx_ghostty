@@ -113,7 +113,7 @@ test "tab transfer restores every successful SetParent and reports rollback fail
             if (self.fail_restore) return error.RestoreFailed;
             self.parents[i] = false;
         }
-        fn validate(self: *@This()) !void {
+        pub fn validate(self: *@This()) !void {
             if (self.fail_validation) return error.OwnerChanged;
         }
     };

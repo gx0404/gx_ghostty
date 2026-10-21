@@ -84,7 +84,7 @@ pub const Endpoint = struct {
         var digest: [32]u8 = undefined;
         hash.final(&digest);
         var buffer: [128]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buffer, "\\\\.\\pipe\\ghostty-gx-drop-v1-{s}", .{std.fmt.bytesToHex(digest, .lower)});
+        const text = try std.mem.print(&buffer, "\\\\.\\pipe\\ghostty-gx-drop-v1-{s}", .{std.fmt.bytesToHex(digest, .lower)});
         var name: [160:0]u16 = @splat(0);
         _ = try std.unicode.utf8ToUtf16Le(&name, text);
         return .{ .name = name, .isolation = isolation, .host_epoch = host_epoch, .host = host };
@@ -97,7 +97,7 @@ fn verifyHello(bytes: *const [wire.hello_size]u8, local: security.Facts, peer: s
     if (epoch == 0) return error.InvalidEpoch;
     const claimed: policy.Process = .{ .pid = std.mem.readInt(u32, bytes[24..28], .little), .birth = std.mem.readInt(u64, bytes[28..36], .little) };
     var peer_domain: policy.Isolation = undefined;
-    inline for (std.meta.fields(policy.Isolation), 0..) |field, index| @memcpy(&@field(peer_domain, field.name), bytes[36 + index * 32 ..][0..32]);
+    inline for (@typeInfo(policy.Isolation).@"struct".field_names, 0..) |field, index| @memcpy(&@field(peer_domain, field), bytes[36 + index * 32 ..][0..32]);
     try contract.authenticate(local.identity, peer.identity, claimed, domain, peer_domain);
     try security.verifyImage(local, peer);
     return epoch;
@@ -107,8 +107,8 @@ fn response(buffer: *[response_size]u8, challenge: contract.Challenge, status: c
     @memset(buffer, 0);
     buffer[0] = 1;
     switch (status) {
-        .complete => |outcome| buffer[1] = @intFromEnum(outcome),
-        .pending => |phase| buffer[2] = @intFromEnum(phase),
+        .complete => |outcome| buffer[1] = @backingInt(outcome),
+        .pending => |phase| buffer[2] = @backingInt(phase),
     }
     std.mem.writeInt(u128, buffer[8..24], challenge.nonce, .little);
     std.mem.writeInt(u64, buffer[24..32], challenge.expires_ms, .little);
@@ -370,7 +370,7 @@ pub const Attempt = struct {
 };
 
 test "drop broker native pipe requires preview and final paste callback" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const domain: policy.Isolation = .{ .config_root = @splat(1), .build = @splat(2), .class = @splat(3), .install = @splat(4) };
     const epoch = try n.epoch();
     const broker = try Broker.create(std.testing.allocator, domain, epoch);

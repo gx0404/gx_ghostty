@@ -189,17 +189,17 @@ test "bufZ replaces invalid UTF-8" {
 test "bufZ fills a buffer exactly and cuts one unit more" {
     const testing = std.testing;
     var buf: [256]u16 = undefined;
-    const fits = "x" ** 255;
+    const fits = std.mem.asBytes(&@as([255]["x".len]u8, @splat("x".*)));
     try testing.expectEqual(@as(usize, 255), bufZ(&buf, fits).len);
     try testing.expectEqual(@as(u16, 0), buf[255]);
-    const over = "x" ** 256;
+    const over = std.mem.asBytes(&@as([256]["x".len]u8, @splat("x".*)));
     const out = bufZ(&buf, over);
     try testing.expectEqual(@as(usize, 255), out.len);
     try testing.expectEqual(@as(u16, 0), buf[255]);
     // A surrogate pair that would end one unit past the room is left out.
-    const pair_at_end = "x" ** 254 ++ "\u{1F47B}";
+    const pair_at_end = std.mem.asBytes(&@as([254]["x".len]u8, @splat("x".*))) ++ "\u{1F47B}";
     try testing.expectEqual(@as(usize, 254), bufZ(&buf, pair_at_end).len);
-    const pair_fits = "x" ** 253 ++ "\u{1F47B}";
+    const pair_fits = std.mem.asBytes(&@as([253]["x".len]u8, @splat("x".*))) ++ "\u{1F47B}";
     const pair_out = bufZ(&buf, pair_fits);
     try testing.expectEqual(@as(usize, 255), pair_out.len);
     try testing.expectEqual(@as(u16, 0xDC7B), pair_out[254]);
@@ -208,18 +208,18 @@ test "bufZ fills a buffer exactly and cuts one unit more" {
 test "bufZ keeps 200 CJK characters and cuts 300" {
     const testing = std.testing;
     var buf: [256]u16 = undefined;
-    const two_hundred = "\u{6C49}" ** 200;
+    const two_hundred = std.mem.asBytes(&@as([200]["\u{6C49}".len]u8, @splat("\u{6C49}".*)));
     const out = bufZ(&buf, two_hundred);
     try testing.expectEqual(@as(usize, 200), out.len);
     for (out) |unit| try testing.expectEqual(@as(u16, 0x6C49), unit);
-    try testing.expectEqual(@as(usize, 255), bufZ(&buf, "\u{6C49}" ** 300).len);
+    try testing.expectEqual(@as(usize, 255), bufZ(&buf, std.mem.asBytes(&@as([300]["\u{6C49}".len]u8, @splat("\u{6C49}".*)))).len);
 }
 
 test "bufZ into a small fixed buffer" {
     const testing = std.testing;
     // The title of a tray balloon (NOTIFYICONDATAW.szInfoTitle).
     var title: [64]u16 = undefined;
-    try testing.expectEqual(@as(usize, 63), bufZ(&title, "\u{6C49}" ** 100).len);
+    try testing.expectEqual(@as(usize, 63), bufZ(&title, std.mem.asBytes(&@as([100]["\u{6C49}".len]u8, @splat("\u{6C49}".*)))).len);
     try testing.expectEqual(@as(u16, 0), title[63]);
     try testing.expectEqual(@as(usize, 2), bufZ(&title, "a\xc3").len);
 }
@@ -233,7 +233,7 @@ test "allocZ" {
 
 test "allocZ converts a 5000 character URL" {
     const testing = std.testing;
-    const url = "https://example.com/?q=" ++ "a" ** (5000 - 23);
+    const url = "https://example.com/?q=" ++ std.mem.asBytes(&@as([(5000 - 23)]["a".len]u8, @splat("a".*)));
     try testing.expectEqual(@as(usize, 5000), url.len);
     const out = try allocZ(testing.allocator, url);
     defer testing.allocator.free(out);
@@ -258,11 +258,11 @@ test "truncate never splits a surrogate pair" {
 
 test "utf8Alloc converts long CJK text and surrogate pairs" {
     const testing = std.testing;
-    const units = [_]u16{0x6C49} ** 200;
+    const units = @as([200]u16, @splat(0x6C49));
     const out = try utf8Alloc(testing.allocator, &units);
     defer testing.allocator.free(out);
     try testing.expectEqual(@as(usize, 600), out.len);
-    try testing.expectEqualStrings("\u{6C49}" ** 200, out);
+    try testing.expectEqualStrings(std.mem.asBytes(&@as([200]["\u{6C49}".len]u8, @splat("\u{6C49}".*))), out);
 
     const ghost = try utf8Alloc(testing.allocator, &.{ 'a', 0xD83D, 0xDC7B });
     defer testing.allocator.free(ghost);
@@ -281,12 +281,13 @@ test "utf8Alloc through a stack fallback allocator" {
     const testing = std.testing;
     // `Surface.sendImeText` converts with 256 bytes on the stack; longer
     // IME results go to the heap.
-    var fallback = std.heap.stackFallback(256, testing.allocator);
-    const alloc = fallback.get();
-    const short = try utf8Alloc(alloc, &([_]u16{0x6C49} ** 10));
+    var buffer: [256]u8 = undefined;
+    var fallback: std.heap.BufferFirstAllocator = .init(&buffer, testing.allocator);
+    const alloc = fallback.allocator();
+    const short = try utf8Alloc(alloc, &(@as([10]u16, @splat(0x6C49))));
     defer alloc.free(short);
     try testing.expectEqual(@as(usize, 30), short.len);
-    const long = try utf8Alloc(alloc, &([_]u16{0x6C49} ** 200));
+    const long = try utf8Alloc(alloc, &(@as([200]u16, @splat(0x6C49))));
     defer alloc.free(long);
     try testing.expectEqual(@as(usize, 600), long.len);
 }

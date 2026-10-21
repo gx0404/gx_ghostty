@@ -78,7 +78,7 @@ Linux/macOS 直接调用脚本时用 `python3`。读完输出列出的每份领�
 
 ## 项目模型
 
-- Zig 0.16.0（`build.zig.zon` 的 `minimum_zig_version`）。共享核心在 `src/`；产品版本在 `build.zig.zon`，最终版本由 `src/build/Config.zig::init` 推导。
+- Zig 0.17.0（`build.zig.zon` 的 `minimum_zig_version`）。共享核心在 `src/`；产品版本在 `build.zig.zon`，最终版本由 `src/build/Config.zig::init` 推导。
 - 产物：Windows app（win32 apprt `src/apprt/win32/`，Windows 目标的默认 apprt，WGL 渲染、Direct2D 自绘界面）、GTK app（Linux/FreeBSD，`src/apprt/gtk`，GX 层在 `src/apprt/gtk/gx/`）、macOS Swift app（`macos/`，经 `include/ghostty.h`）、libghostty-vt（`src/lib_vt.zig` 与 `include/ghostty/`，可构建到 wasm32）。两个 GX apprt 共用 `src/gx/`：配置分层、界面语言、界面库（颜色、token、动效、模糊匹配）、启动配置、`gx:` 动作与进程判断。
 - 入口：`src/main.zig::entrypoint` 按 `exe_entrypoint` 分派；`src/main_ghostty.zig::main` 先 `global.init` 再 `App.create`；`src/apprt.zig::runtime` 编译期选定 apprt。
 - 数据流：pty → `src/termio/Exec.zig::ReadThread` → `src/termio/Termio.zig::processOutput` → `terminal.Stream` → `Terminal`/`Screen`/`PageList` → `src/renderer/generic.zig::Renderer.updateFrame` → `drawFrame`。每个 surface 有 termio 写线程、pty 读取线程（POSIX 另有 `io-gather`）与渲染线程，搜索时按需另起 search 线程。全貌见 `docs/ARCHITECTURE.md`。
@@ -99,7 +99,8 @@ zig 一律经 `scripts/zigw.py` 调用钉版 Zig（工具链与缓存在 gitigno
 | `just fmt` / `just fmt-check` / `just zig <a>` | 格式化 / 只检查 / 直通钉版 zig |
 | `just rules <p>` / `just rules-review <p>` / `just rules-check` | resolver |
 | `just version` / `just version-check` | fork 版本 / CHANGELOG 标题校验 |
-| `just framework-test` / `just framework-check` / `just ci-check` | 框架单测（`scripts/run_unittests.py` 并行）/ 框架聚合门 / 再加 fmt-check 与 test-vt（热缓存约 100 s） |
+| `just quick-prepare` / `just quick-check` | Windows 日常快速门：编译独立签收，检查与固定测试总预算 60 s；不代完整 CI |
+| `just framework-test` / `just framework-check` / `just ci-check` | 框架单测（`scripts/run_unittests.py` 并行）/ 框架聚合门 / 再加 fmt-check 与 test-vt（完整回归，不设 60 s 预算） |
 | `just graph` / `just graph-check` / `just graph-query <q>` | 图谱重建 / 新鲜度 / 查询 |
 | `just kb` / `just kb-check` / `just kb-query <q>` | 知识库构建 / 校验 / 检索 |
 | `just i18n` / `just i18n-check` | 由 `po/zh_CN.po` 与 `src/gx/i18n/gx.zh_CN.po` 重建 / 校验 GX 翻译表 |
@@ -108,7 +109,7 @@ zig 一律经 `scripts/zigw.py` 调用钉版 Zig（工具链与缓存在 gitigno
 | `just generated-check` | kb-check、i18n-check、pinyin-check、fluent-check 与 graph-check（同步后、发版前；framework-check 也含 pinyin-check） |
 | `just install-hooks` / `just commit-check <a>` | 启用 `.githooks` / 校验提交信息 |
 
-Windows 上 `just build` 产出 `zig-out/bin/ghostty.exe`，`just test` 构建同一组合（`-Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu`）的 `ghostty-test`，不含 POSIX 分支，Linux 侧用 `just wsl test` 或 gx-ci 的 `linux-main`；libghostty-internal（`-Dapp-runtime=none`）在 Windows 上仍链接失败。改过 Zig 源码后测试二进制要用 LLVM 重编约 2–4 min，属正常耗时（`docs/TESTING.md`）。Windows 未开开发者模式时，`src/lib/tinyio` 的符号链接用例报 `PermissionDenied`（`just test-vt` 4 处、`just test` 2 处）：这是环境前置，不是回归，记 FAIL 并写明原因，不跳过、不改用例。全表与副作用见 `docs/MAKE_COMMANDS.md`。
+Windows 的 `just build` 与 `just test` 使用 win32/windows-gnu；POSIX 用 WSL 或 CI。日常先 `just quick-prepare` 编译并签收，再 `just quick-check`，产物过期即拒绝。60 s 只计快速门，完整回归仍由同步、发版和 push CI 执行。符号链接用例缺权限时记 FAIL，不跳过。完整命令、覆盖与历史耗时见 `docs/TESTING.md`、`docs/MAKE_COMMANDS.md`。
 
 ## 跨域硬边界
 

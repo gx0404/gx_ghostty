@@ -118,7 +118,7 @@ pub fn apply(alloc: std.mem.Allocator, overlay: *Overlay, edit: Edit, policy: Po
     }
     if (edit == .put) {
         const change = edit.put;
-        try values.append(scratch, try std.fmt.allocPrint(scratch, "{s}={s}", .{ change.name, change.command }));
+        try values.append(scratch, try scratch.print("{s}={s}", .{ change.name, change.command }));
     }
     try overlay.setAll(profile_key, values.items);
 }

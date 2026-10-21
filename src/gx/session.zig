@@ -115,7 +115,7 @@ pub fn validate(document: Document) Error!void {
             if (!isLeaf(tab, tab.active)) return error.InvalidTree;
             if (tab.zoom) |zoom| if (!isLeaf(tab, zoom)) return error.InvalidTree;
             try title(tab.title_override);
-            var visited = [_]bool{false} ** max_nodes;
+            var visited = @as([max_nodes]bool, @splat(false));
             leaves += try visit(tab, tab.root, 0, &visited);
             for (visited[0..tab.nodes.len]) |seen| if (!seen) return error.InvalidTree;
             if (leaves > max_total_leaves) return error.LimitExceeded;
@@ -207,7 +207,7 @@ pub const Store = struct {
         errdefer allocator.free(name);
         const dir = try std.Io.Dir.cwd().createDirPathOpen(io, parent, .{});
         errdefer dir.close(io);
-        const lock_name = try std.fmt.allocPrint(allocator, "{s}.lock", .{name});
+        const lock_name = try allocator.print("{s}.lock", .{name});
         defer allocator.free(lock_name);
         const lock = dir.createFile(io, lock_name, .{
             .read = true,
@@ -262,7 +262,7 @@ pub const Store = struct {
     }
 };
 
-const private_permissions: std.Io.File.Permissions = if (@import("builtin").os.tag == .windows)
+const private_permissions: std.Io.File.Permissions = if (@import("builtin").target.os.tag == .windows)
     .default_file
 else
     .fromMode(0o600);

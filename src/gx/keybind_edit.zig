@@ -88,7 +88,7 @@ pub fn formatEntry(alloc: std.mem.Allocator, entry: Entry) ![]const []const u8 {
     if (entry.actions.len == 0) return error.InvalidFormat;
     try output.writer.print("={f}", .{entry.actions[0]});
     try values.append(alloc, try output.toOwnedSlice());
-    for (entry.actions[1..]) |action| try values.append(alloc, try std.fmt.allocPrint(alloc, "chain={f}", .{action}));
+    for (entry.actions[1..]) |action| try values.append(alloc, try alloc.print("chain={f}", .{action}));
     return values.toOwnedSlice(alloc);
 }
 
@@ -146,7 +146,7 @@ pub fn valuesText(alloc: std.mem.Allocator, values: []const []const u8) ![:0]u8 
         if (index != 0) try output.writer.writeByte('\n');
         try output.writer.writeAll(if (value.len == 0) "keybind =" else value);
     }
-    return try alloc.dupeZ(u8, output.written());
+    return try alloc.dupeSentinel(u8, output.written(), 0);
 }
 
 fn overlaps(a: Target, b: Target) bool {
@@ -365,7 +365,7 @@ pub fn apply(alloc: std.mem.Allocator, overlay: *Overlay, current: []const Entry
                 same = true;
                 break;
             };
-            if (!same) try values.append(scratch, try std.fmt.allocPrint(scratch, "{s}=unbind", .{try formatKey(scratch, entry.key)}));
+            if (!same) try values.append(scratch, try scratch.print("{s}=unbind", .{try formatKey(scratch, entry.key)}));
         }
         try values.appendSlice(scratch, intent.values);
         _ = try parseValues(scratch, values.items);

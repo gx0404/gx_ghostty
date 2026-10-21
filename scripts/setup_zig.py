@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""钉版 Zig 工具链：把 Zig 0.16.0 装进仓库内 .local/，不写任何用户全局状态。
+"""钉版 Zig 工具链：把 Zig 0.17.0 装进仓库内 .local/，不写任何用户全局状态。
 
-安装位置：<repo>/.local/toolchains/zig/zig-0.16.0/（gitignored）。设置
+安装位置：<repo>/.local/toolchains/zig/zig-0.17.0/（gitignored）。设置
 GX_GHOSTTY_ZIG_HOME 可把安装根整体改到别处（多 worktree 共享或测试）。
 scripts/zigw.py 按 $GX_GHOSTTY_ZIG > $ZIG > 本钉版目录 > PATH 解析 Zig。
 
@@ -12,7 +12,7 @@ scripts/zigw.py 按 $GX_GHOSTTY_ZIG > $ZIG > 本钉版目录 > PATH 解析 Zig�
 安装失败退出 2。
 
 下载源顺序：$GX_GHOSTTY_ZIG_MIRROR > https://pkg.machengine.org/zig/ > 官方
-https://ziglang.org/download/0.16.0/。每个源都按同一 sha256 校验；下载速度跌破
+https://ziglang.org/download/0.17.0/。每个源都按同一 sha256 校验；下载速度跌破
 速率地板或校验不符即切换下一个源。
 """
 
@@ -35,31 +35,31 @@ from pathlib import Path
 from typing import Mapping
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ZIG_VERSION = "0.16.0"
+ZIG_VERSION = "0.17.0"
 INSTALL_DIR_NAME = f"zig-{ZIG_VERSION}"
 HOME_ENV = "GX_GHOSTTY_ZIG_HOME"
 MIRROR_ENV = "GX_GHOSTTY_ZIG_MIRROR"
-# 官方 index.json 的 sha256 钉版（2026-09 获取，与 herdr 同一组值）。
+# 官方 index.json 的 sha256 钉版（2026-10-21 获取）。
 PINS: dict[str, dict[str, str]] = {
     "x86_64-linux": {
         "tarball": f"zig-x86_64-linux-{ZIG_VERSION}.tar.xz",
-        "sha256": "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
+        "sha256": "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026",
     },
     "aarch64-linux": {
         "tarball": f"zig-aarch64-linux-{ZIG_VERSION}.tar.xz",
-        "sha256": "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17",
+        "sha256": "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8",
     },
     "x86_64-macos": {
         "tarball": f"zig-x86_64-macos-{ZIG_VERSION}.tar.xz",
-        "sha256": "0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7",
+        "sha256": "4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6",
     },
     "aarch64-macos": {
         "tarball": f"zig-aarch64-macos-{ZIG_VERSION}.tar.xz",
-        "sha256": "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489",
+        "sha256": "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a",
     },
     "x86_64-windows": {
         "tarball": f"zig-x86_64-windows-{ZIG_VERSION}.zip",
-        "sha256": "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e",
+        "sha256": "b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428",
     },
 }
 DOWNLOAD_BASE = f"https://ziglang.org/download/{ZIG_VERSION}/"

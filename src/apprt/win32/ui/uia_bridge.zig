@@ -204,7 +204,7 @@ pub fn terminalRoot(title: []const u8, reference: refs.Reference, automation_id:
         .role = .pane,
         .localized_type = i18n.tr("Terminal"),
         // Unique among sibling panes for the whole life of the terminal.
-        .automation_id = std.fmt.bufPrint(automation_id, "gx-terminal-{d}", .{reference.generation}) catch unreachable,
+        .automation_id = std.mem.print(automation_id, "gx-terminal-{d}", .{reference.generation}) catch unreachable,
         .focusable = true,
         .host_state = true,
     };
@@ -1061,12 +1061,12 @@ pub const PopupBridge = struct {
                 },
                 .step => |step| {
                     if (step.row >= rows.len) continue;
-                    spec.name = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ rows[step.row].title, if (step.step == .plus) i18n.tr("Increase") else i18n.tr("Decrease") });
+                    spec.name = try alloc.print("{s}: {s}", .{ rows[step.row].title, if (step.step == .plus) i18n.tr("Increase") else i18n.tr("Decrease") });
                     spec.patterns.invoke = true;
                 },
                 .reset => |index| {
                     if (index >= rows.len) continue;
-                    spec.name = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ rows[index].title, i18n.tr("Reset") });
+                    spec.name = try alloc.print("{s}: {s}", .{ rows[index].title, i18n.tr("Reset") });
                     spec.patterns.invoke = true;
                 },
                 .group_button => |button_spec| {
@@ -1076,7 +1076,7 @@ pub const PopupBridge = struct {
                         .apply_theme => i18n.tr("Apply Theme"),
                         .apply_font => i18n.tr("Apply Font"),
                     };
-                    spec.name = try std.fmt.allocPrint(alloc, "{s}: {s}", .{ rows[button_spec.row].title, label });
+                    spec.name = try alloc.print("{s}: {s}", .{ rows[button_spec.row].title, label });
                     spec.patterns.invoke = true;
                 },
                 .item => |item| {
@@ -2102,8 +2102,8 @@ test "settings focus keys follow the hit target, not its position" {
     const Query = struct { search_query: std.ArrayList(u8) };
     var blank: [3]u8 = " \t ".*;
     var text: [4]u8 = "font".*;
-    try std.testing.expect(!settingsSearching(Query{ .search_query = .{ .items = &blank, .capacity = blank.len } }));
-    try std.testing.expect(settingsSearching(Query{ .search_query = .{ .items = &text, .capacity = text.len } }));
+    try std.testing.expect(!settingsSearching(Query{ .search_query = .{ .items = &blank, .capacity = blank.len, .pointer_stability = .{} } }));
+    try std.testing.expect(settingsSearching(Query{ .search_query = .{ .items = &text, .capacity = text.len, .pointer_stability = .{} } }));
     try std.testing.expect(!settingsSearching(Query{ .search_query = .empty }));
 }
 
@@ -2157,7 +2157,7 @@ test "menu focus is reported in the innermost open menu only" {
         }
     };
     var items = [_]Fake.Item{ .{ .label = "New Tab" }, .{ .label = "Split", .kind = .submenu } };
-    const list: Fake.List = .{ .items = .{ .items = &items, .capacity = items.len } };
+    const list: Fake.List = .{ .items = .{ .items = &items, .capacity = items.len, .pointer_stability = .{} } };
     const rows = [_]Fake.Row{ .{ .top = 0, .height = 20 }, .{ .top = 20, .height = 20 } };
     var view: Fake.PopupView = .{ .hwnd = @ptrFromInt(1) };
     var state: Fake.State = undefined;
@@ -2285,19 +2285,19 @@ const PopupBuilder = struct {
 /// 32e5faa36).
 fn settingsKey(page: anytype, searching: bool, target: anytype) u64 {
     const payload: u64 = switch (target) {
-        .section => |section| @intFromEnum(section),
+        .section => |section| @backingInt(section),
         .search, .close => 0,
         .row, .value, .field, .reset => |index| index,
         .chip => |chip| @as(u64, chip.row) << 8 | chip.index,
-        .step => |step| @as(u64, step.row) << 8 | @intFromEnum(step.step),
+        .step => |step| @as(u64, step.row) << 8 | @backingInt(step.step),
         .item => |item| @as(u64, item.row) << 32 | item.index,
-        .group_button => |group| @as(u64, group.row) << 8 | @intFromEnum(group.button),
+        .group_button => |group| @as(u64, group.row) << 8 | @backingInt(group.button),
     };
     const rows: u64 = switch (target) {
         .section, .search, .close => 0,
         else => settingsRows(page, searching),
     };
-    return (@as(u64, @intFromEnum(std.meta.activeTag(target))) + 1) << 56 | rows << 48 | payload;
+    return (@as(u64, @backingInt(std.meta.activeTag(target))) + 1) << 56 | rows << 48 | payload;
 }
 /// The chip list of a row; no hit target is a row's chip list.
 fn settingsGroupKey(section: anytype, searching: bool, row: u16) u64 {
@@ -2305,7 +2305,7 @@ fn settingsGroupKey(section: anytype, searching: bool, row: u16) u64 {
 }
 /// Which rows a row index names: those of `section`, or the results.
 fn settingsRows(section: anytype, searching: bool) u64 {
-    return (@as(u64, @intFromEnum(section)) << 1 | @intFromBool(searching)) & 0xff;
+    return (@as(u64, @backingInt(section)) << 1 | @intFromBool(searching)) & 0xff;
 }
 /// Whether Settings shows its search results instead of a section: the test
 /// of `Settings.searching` on the same query, read here so the bridge does

@@ -1117,7 +1117,7 @@ pub const Sheet = struct {
         }
         if (shown < entry.sequences.len) {
             var buf: [16]u8 = undefined;
-            const more = std.fmt.bufPrint(&buf, "+{d}", .{entry.sequences.len - shown}) catch "";
+            const more = std.mem.print(&buf, "+{d}", .{entry.sequences.len - shown}) catch "";
             const w: f32 = 28;
             canvas.drawText(more, .{ .x = right - w - style.space.xs, .y = center_y - 10, .w = w, .h = 20 }, .{
                 .size = style.font_size.caption,
@@ -1283,7 +1283,7 @@ fn rank(alloc: Allocator, out: *std.ArrayList(Match), entries: []const Entry, se
         fn lessThan(ctx: @This(), a: Match, b: Match) bool {
             const ca = ctx.entries[a.entry].category;
             const cb = ctx.entries[b.entry].category;
-            if (ca != cb) return @intFromEnum(ca) < @intFromEnum(cb);
+            if (ca != cb) return @backingInt(ca) < @backingInt(cb);
             if (a.score != b.score) return a.score > b.score;
             return a.entry < b.entry;
         }
@@ -1296,7 +1296,7 @@ fn rank(alloc: Allocator, out: *std.ArrayList(Match), entries: []const Entry, se
 /// its rows.
 fn listRows(alloc: Allocator, rows: *std.ArrayList(Row), entries: []const Entry, matches: []const Match) Allocator.Error!void {
     rows.clearRetainingCapacity();
-    var reasons: std.EnumSet(Reason) = .initEmpty();
+    var reasons: std.EnumSet(Reason) = .empty;
     for (matches) |match| {
         if (entries[match.entry].conflict) |reason| reasons.insert(reason);
     }
@@ -1522,9 +1522,9 @@ fn bindingForKey(set: *const Binding.Set, vk: u16, mods: input.Mods) ?*const Bin
 /// Whether `key` types a character: letters, digits and punctuation, whose
 /// character depends on the layout.
 fn typesCharacter(key: input.Key) bool {
-    const k = @intFromEnum(key);
-    if (k >= @intFromEnum(input.Key.key_a) and k <= @intFromEnum(input.Key.key_z)) return true;
-    if (k >= @intFromEnum(input.Key.digit_0) and k <= @intFromEnum(input.Key.digit_9)) return true;
+    const k = @backingInt(key);
+    if (k >= @backingInt(input.Key.key_a) and k <= @backingInt(input.Key.key_z)) return true;
+    if (k >= @backingInt(input.Key.digit_0) and k <= @backingInt(input.Key.digit_9)) return true;
     return switch (key) {
         .backquote,
         .minus,
@@ -1756,7 +1756,7 @@ fn isScreenReaderValue(value: []const u8) bool {
 fn listText(a: Allocator, entries: []const Entry, newline: []const u8) std.Io.Writer.Error![]const u8 {
     var out: std.Io.Writer.Allocating = .init(a);
     const w = &out.writer;
-    var reasons: std.EnumSet(Reason) = .initEmpty();
+    var reasons: std.EnumSet(Reason) = .empty;
     for (entries) |entry| {
         if (entry.conflict) |reason| reasons.insert(reason);
     }
@@ -2159,7 +2159,7 @@ fn describe(a: Allocator, entry: *Entry, commands: []const input.Command) !void 
             try titles.appendSlice(a, ", ");
             try titles_en.appendSlice(a, ", ");
         }
-        const formatted = try std.fmt.allocPrint(a, "{f}", .{action});
+        const formatted = try a.print("{f}", .{action});
         const named = shortcuts.title(action, commands) orelse {
             try titles.appendSlice(a, formatted);
             try titles_en.appendSlice(a, formatted);
@@ -2538,16 +2538,16 @@ test "the native list has one line per row under its category, notices first" {
         noticeText(.hotkey),
         "",
         i18n.trRuntime(shortcuts.Category.tabs.title()),
-        try std.fmt.allocPrint(a, "    {s} \u{2014} Ctrl+Shift+T", .{new_tab.title}),
+        try a.print("    {s} \u{2014} Ctrl+Shift+T", .{new_tab.title}),
         "",
         i18n.trRuntime(shortcuts.Category.splits.title()),
-        try std.fmt.allocPrint(a, "    {s} \u{2014} Ctrl+Shift+O ({s})", .{ split.title, split.conflict_note }),
+        try a.print("    {s} \u{2014} Ctrl+Shift+O ({s})", .{ split.title, split.conflict_note }),
         "",
         i18n.trRuntime(shortcuts.Category.windows.title()),
-        try std.fmt.allocPrint(a, "    {s} \u{2014} Ctrl+A \u{2192} N", .{new_window.title}),
+        try a.print("    {s} \u{2014} Ctrl+A \u{2192} N", .{new_window.title}),
         "",
         i18n.trRuntime(shortcuts.Category.clipboard.title()),
-        try std.fmt.allocPrint(a, "    {s} \u{2014} Ctrl+Insert, Ctrl+Shift+C", .{copy.title}),
+        try a.print("    {s} \u{2014} Ctrl+Insert, Ctrl+Shift+C", .{copy.title}),
         "",
     };
     const text = try listText(a, entries, "\r\n");

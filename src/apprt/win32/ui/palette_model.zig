@@ -457,7 +457,7 @@ test "Transpositions swaps neighbors within words" {
 
     var same: Transpositions = .init("aa");
     try testing.expectEqual(@as(?[]const u8, null), same.next());
-    var long: Transpositions = .init("x" ** 70);
+    var long: Transpositions = .init(std.mem.asBytes(&@as([70]["x".len]u8, @splat("x".*))));
     try testing.expectEqual(@as(?[]const u8, null), long.next());
 }
 

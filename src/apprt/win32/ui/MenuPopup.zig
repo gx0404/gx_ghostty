@@ -428,7 +428,7 @@ test "P4 a UI language change closes an open menu, other invalidations only reti
     defer app.config.deinit();
     var window: Window = .{ .app = &app };
     var windows = [_]*Window{&window};
-    app.windows = .{ .items = &windows, .capacity = windows.len };
+    app.windows = .{ .items = &windows, .capacity = windows.len, .pointer_stability = .{} };
     const language = i18n.current();
     defer i18n.setCurrent(language);
 
@@ -705,7 +705,7 @@ fn a11yOverride() bool {
 
 /// The keys that are down now, from the thread's keyboard state.
 fn heldKeys() std.StaticBitSet(256) {
-    var keys: std.StaticBitSet(256) = .initEmpty();
+    var keys: std.StaticBitSet(256) = .empty;
     var state: [256]u8 = undefined;
     if (w32.GetKeyboardState(&state) == 0) return keys;
     for (state, 0..) |value, vk| {
@@ -915,7 +915,7 @@ pub fn cueLabel(alloc: Allocator, label: []const u8, key: u8, suffix: bool) Allo
         }
     }
     const upper = std.ascii.toUpper(key);
-    const text = try std.fmt.allocPrint(alloc, "{s}({c}){s}", .{ head, upper, tail });
+    const text = try alloc.print("{s}({c}){s}", .{ head, upper, tail });
     return .{ .text = text, .underline = head.len + 1 };
 }
 
@@ -1172,7 +1172,7 @@ const Level = struct {
         self.releaseLayouts();
         var lead = false;
         self.chevron = false;
-        var used: AccessSet = .initEmpty();
+        var used: AccessSet = .empty;
         for (self.items()) |item| {
             if (item.icon != null or item.icon_text != null or item.mark != .none) lead = true;
             if (item.kind == .submenu) self.chevron = true;
@@ -1552,7 +1552,7 @@ test "UIA menu focus preserves Invoke unless revealing the row scrolls layout" {
         defer _ = abi.release(face);
         const action: uia.Action = .{ .attachment = attachment, .snapshot_id = snapshot.id, .node_id = 2, .kind = .invoke, .value = &.{}, .alloc = testing.allocator };
         var items = [_]Item{.{ .id = 42, .label = "Action" }};
-        var list: List = .{ .items = .{ .items = &items, .capacity = items.len } };
+        var list: List = .{ .items = .{ .items = &items, .capacity = items.len, .pointer_stability = .{} } };
         var rows = [_]Row{.{ .top = if (scrolls) 40 else 0, .height = 20 }};
         var state: State = undefined;
         state.levels[0] = .{
@@ -1604,7 +1604,7 @@ test "UIA a real UI Automation client hears the menu's arrow keys move the focus
     const owner = w32.CreateWindowExW(0, class, class, 0, -32000, -32000, 32, 32, null, null, null, null) orelse return error.TestWindowFailed;
     defer _ = w32.DestroyWindow(owner);
     var items = [_]Item{ .{ .id = 1, .label = "New Tab" }, .{ .id = 2, .label = "New Window" }, .{ .id = 3, .label = "Settings" } };
-    var list: List = .{ .items = .{ .items = &items, .capacity = items.len } };
+    var list: List = .{ .items = .{ .items = &items, .capacity = items.len, .pointer_stability = .{} } };
     var rows = [_]Row{ .{ .top = 0, .height = 20 }, .{ .top = 20, .height = 20 }, .{ .top = 40, .height = 20 } };
     var popup: Popup = .{};
     var state: State = undefined;
@@ -2302,7 +2302,7 @@ pub fn runNative(alloc: Allocator, owner: w32.HWND, root: *const List, options: 
 fn nativeMenu(alloc: Allocator, list: *const List) error{ Win32Error, OutOfMemory }!w32.HMENU {
     const menu = w32.CreatePopupMenu() orelse return error.Win32Error;
     errdefer _ = w32.DestroyMenu(menu);
-    var used: AccessSet = .initEmpty();
+    var used: AccessSet = .empty;
     for (list.items.items) |item| if (item.access) |key| if (accessBit(key)) |bit| used.set(bit);
     for (list.items.items) |item| {
         switch (item.kind) {
@@ -2492,20 +2492,20 @@ test "highlightPath lights the entries of the open submenus" {
 }
 
 test "pickAccessKey prefers word starts and skips taken keys" {
-    var used: AccessSet = .initEmpty();
+    var used: AccessSet = .empty;
     try testing.expectEqual(@as(?u8, 'N'), pickAccessKey("New Tab", used));
     used.set(accessBit('N').?);
     try testing.expectEqual(@as(?u8, 'T'), pickAccessKey("New Tab", used));
     used.set(accessBit('T').?);
     try testing.expectEqual(@as(?u8, 'E'), pickAccessKey("New Tab", used));
     try testing.expectEqual(@as(?u8, '7'), pickAccessKey("pwsh 7", blk: {
-        var s: AccessSet = .initEmpty();
+        var s: AccessSet = .empty;
         s.set(accessBit('P').?);
         break :blk s;
     }));
     // No ASCII letters: no key.
-    try testing.expectEqual(@as(?u8, null), pickAccessKey("简体中文", .initEmpty()));
-    try testing.expectEqual(@as(?u8, 'G'), pickAccessKey("新建 GX Zsh", .initEmpty()));
+    try testing.expectEqual(@as(?u8, null), pickAccessKey("简体中文", .empty));
+    try testing.expectEqual(@as(?u8, 'G'), pickAccessKey("新建 GX Zsh", .empty));
 }
 
 test "access keys in labels and the (K) suffix" {

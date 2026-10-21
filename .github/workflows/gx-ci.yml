@@ -135,7 +135,7 @@ jobs:
         run: python3 scripts/ci_cache.py snapshot --suite vt --phase finished --json "$RUNNER_TEMP/gx-zig-test/cache-finished.json"
       - name: Upload test and cache reports
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gx-zig-test-linux-vt
           path: ${{ runner.temp }}/gx-zig-test/
@@ -178,7 +178,7 @@ jobs:
         run: python3 scripts/ci_cache.py snapshot --suite main --phase finished --json "$RUNNER_TEMP/gx-zig-test/cache-finished.json"
       - name: Upload test and cache reports
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gx-zig-test-linux-main
           path: ${{ runner.temp }}/gx-zig-test/
@@ -274,7 +274,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload test and cache reports
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gx-zig-test-windows
           path: ${{ runner.temp }}/gx-zig-test/
@@ -337,7 +337,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload the test report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gx-zig-test-windows-app
           path: ${{ runner.temp }}/gx-zig-test/
@@ -390,7 +390,7 @@ jobs:
           if (-not (Select-String -LiteralPath (Join-Path $evidence 'ghostty.log') -SimpleMatch -Quiet 'loaded OpenGL 4.')) { throw 'the app log has no "loaded OpenGL 4." line' }
       - name: Upload smoke evidence
         if: always() && github.event_name == 'workflow_dispatch' && inputs.win_smoke
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: evidence-windows-smoke
           path: ${{ runner.temp }}/gx-windows-smoke/
@@ -435,7 +435,7 @@ jobs:
             exit 1
           fi
       - name: Build the GTK app
-        run: zig build -Doptimize=ReleaseFast -Dcpu=baseline
+        run: zig build -Doptimize=fast -Dcpu=baseline
       - name: ghostty +version
         run: |
           mkdir -p "$RUNNER_TEMP/gx-gtk-smoke"
@@ -468,7 +468,7 @@ jobs:
           xvfb-run --auto-servernum --server-args='-screen 0 1280x800x24' python3 scripts/zig_test.py --suite main -Dapp-runtime=gtk --filter apprt.gtk.gx --zig-arg=--summary --zig-arg=all --json "$RUNNER_TEMP/gx-gtk-smoke/zig-test.json"
       - name: Upload smoke evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: gx-gtk-smoke-evidence
           path: ${{ runner.temp }}/gx-gtk-smoke/

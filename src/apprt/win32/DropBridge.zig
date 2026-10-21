@@ -260,7 +260,7 @@ test "drop bridge close retains operation context until its own receipt" {
     var bridge: Self = .{};
     const allocator = std.testing.allocator;
     const pending = try allocator.create(Pending);
-    pending.* = .{ .bridge = &bridge, .allocator = allocator, .key = undefined, .text = try allocator.dupeZ(u8, "owned") };
+    pending.* = .{ .bridge = &bridge, .allocator = allocator, .key = undefined, .text = try allocator.dupeSentinel(u8, "owned", 0) };
     bridge.pending[0] = pending;
     const receipt = pending.receipt();
     bridge.beginClose();

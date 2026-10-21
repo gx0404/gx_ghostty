@@ -85,10 +85,10 @@ const Entry = struct {
 
     fn dupe(self: Entry, alloc: Allocator) Allocator.Error!Entry {
         return .{
-            .id = try alloc.dupeZ(u8, self.id),
-            .title = try alloc.dupeZ(u8, self.title),
-            .name = try alloc.dupeZ(u8, self.name),
-            .command = try alloc.dupeZ(u8, self.command),
+            .id = try alloc.dupeSentinel(u8, self.id, 0),
+            .title = try alloc.dupeSentinel(u8, self.title, 0),
+            .name = try alloc.dupeSentinel(u8, self.name, 0),
+            .command = try alloc.dupeSentinel(u8, self.command, 0),
             .owned = if (self.owned) |value| try alloc.dupe(u8, value) else null,
             .source = self.source,
             .is_default = self.is_default,
@@ -378,10 +378,10 @@ pub const Section = struct {
             const custom = std.mem.cutPrefix(u8, profile.id, "custom:");
             const owned: ?[]const u8 = if (source == .overlay) edit.owned(values, custom.?) else null;
             const command: [:0]const u8 = if (owned) |value|
-                try alloc.dupeZ(u8, value)
+                try alloc.dupeSentinel(u8, value, 0)
             else
                 profileCommand(alloc, profile) catch "";
-            const name: [:0]const u8 = if (custom) |value| try alloc.dupeZ(u8, value) else profile.name;
+            const name: [:0]const u8 = if (custom) |value| try alloc.dupeSentinel(u8, value, 0) else profile.name;
             entry.* = try (Entry{
                 .id = profile.id,
                 .title = profile.name,
@@ -730,7 +730,7 @@ pub const Section = struct {
         self.refresh();
         // Back on the list, on the row of the profile just changed.
         const id: ?[]u8 = switch (intent) {
-            .put => |change| std.fmt.allocPrint(self.alloc, "custom:{s}", .{change.name}) catch null,
+            .put => |change| self.alloc.print("custom:{s}", .{change.name}) catch null,
             .default => if (self.draft_entry) |entry| self.alloc.dupe(u8, entry.id) catch null else null,
             .remove => null,
         };
@@ -829,7 +829,7 @@ fn currentPolicy(alloc: Allocator, overlay: *const gx.gui_settings.Overlay) !edi
 /// The command a launch profile runs, as the overlay writes it.
 fn profileCommand(alloc: Allocator, profile: launch.Item) ![:0]const u8 {
     if (profile.args.len == 0) return error.InvalidProfile;
-    if (std.mem.cutPrefix(u8, profile.args[0], "--command=")) |command| return try alloc.dupeZ(u8, command);
+    if (std.mem.cutPrefix(u8, profile.args[0], "--command=")) |command| return try alloc.dupeSentinel(u8, command, 0);
     if (!std.mem.eql(u8, profile.args[0], "-e")) return error.InvalidProfile;
     return try gx.settings_map.profileCommand(alloc, .{
         .id = profile.id,
@@ -908,8 +908,8 @@ test "launch profile save failures name a translated reason" {
     try testing.expectEqualStrings(text.invalid, Section.errorText(error.InvalidProfile));
     try testing.expectEqualStrings(text.readonly, Section.errorText(error.ReadOnly));
     try testing.expectEqualStrings(text.failed, Section.errorText(error.AccessDenied));
-    inline for (@typeInfo(text).@"struct".decls) |decl| {
-        const msgid: [:0]const u8 = @field(text, decl.name);
+    inline for (@typeInfo(text).@"struct".decl_names) |decl_name| {
+        const msgid: [:0]const u8 = @field(text, decl_name);
         try testing.expect(gx.i18n.lookup(.zh_CN, msgid) != null);
     }
 }

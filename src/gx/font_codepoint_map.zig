@@ -267,7 +267,7 @@ fn legacyBatch(alloc: Allocator, discover: anytype, descriptor: Descriptor, styl
     var deferred = (try it.next()) orelse return result;
     errdefer deferred.deinit();
     var buffer: [1024]u8 = undefined;
-    result.family = try alloc.dupeZ(u8, try deferred.familyName(&buffer));
+    result.family = try alloc.dupeSentinel(u8, try deferred.familyName(&buffer), 0);
     try result.candidates.append(alloc, .{ .source = .{ .deferred = deferred }, .traits = .{}, .load = legacyLoad });
     return result;
 }
@@ -349,9 +349,9 @@ const FixtureProvider = struct {
             return error.OutOfMemory;
         }
         if (self.mask == 0) return .{};
-        var result: Batch = .{ .family = try alloc.dupeZ(u8, family orelse "Fixture") };
+        var result: Batch = .{ .family = try alloc.dupeSentinel(u8, family orelse "Fixture", 0) };
         errdefer result.deinit(alloc);
-        if (self.mask & (@as(u4, 1) << @intCast(@intFromEnum(style))) == 0) return result;
+        if (self.mask & (@as(u4, 1) << @intCast(@backingInt(style))) == 0) return result;
         if (self.missing_first) {
             var first = try ft.fromMemory(alloc, library, font.embedded.arabic, &.{});
             errdefer first.deinit(alloc);
@@ -567,7 +567,7 @@ test "gx.font_codepoint_map: descriptor equality checks content even on hash col
     try testing.expectEqual(@as(u32, 3), map.count());
     try testing.expectEqual(@as(u8, 1), map.get(x).?);
     try testing.expectEqual(@as(u8, 2), map.get(y).?);
-    const duplicated = try testing.allocator.dupeZ(u8, "Fixture");
+    const duplicated = try testing.allocator.dupeSentinel(u8, "Fixture", 0);
     defer testing.allocator.free(duplicated);
     var copy = x;
     copy.descriptor.family = duplicated;
@@ -738,7 +738,7 @@ test "gx.font_codepoint_map: SharedGrid uncached unmapped source stays unchanged
 
 fn fileDeferred(alloc: Allocator, library: font.Library, path: [:0]const u8) !font.DeferredFace {
     if (comptime font.options.backend == .freetype_windows) {
-        const owned = try alloc.dupeZ(u8, path);
+        const owned = try alloc.dupeSentinel(u8, path, 0);
         errdefer alloc.free(owned);
         return .{ .win = .{ .path = owned, .face_index = 0, .variations = &.{}, .peek = try font.Face.initFile(library, path, 0, .{ .size = .{ .points = 12 } }), .presentation = .text, .alloc = alloc } };
     } else {
@@ -791,9 +791,9 @@ test "gx.font_codepoint_map: deferred files own native and synthetic size at non
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "bold.ttf", .data = font.embedded.bold });
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
     defer alloc.free(root);
-    const regular_path = try std.fmt.allocPrintSentinel(alloc, "{s}/regular.ttf", .{root}, 0);
+    const regular_path = try alloc.printSentinel("{s}/regular.ttf", .{root}, 0);
     defer alloc.free(regular_path);
-    const bold_path = try std.fmt.allocPrintSentinel(alloc, "{s}/bold.ttf", .{root}, 0);
+    const bold_path = try alloc.printSentinel("{s}/bold.ttf", .{root}, 0);
     defer alloc.free(bold_path);
     for ([_]u16{ 96, 144 }) |dpi| {
         var collection = font.Collection.init();
@@ -869,7 +869,7 @@ test "gx.font_codepoint_map: fromDeferred file allocation failures release physi
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "regular.ttf", .data = font.embedded.regular });
     const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
     defer alloc.free(root);
-    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/regular.ttf", .{root}, 0);
+    const path = try alloc.printSentinel("{s}/regular.ttf", .{root}, 0);
     defer alloc.free(path);
     try testing.checkAllAllocationFailures(alloc, deferredAllocationScenario, .{path});
 }

@@ -261,7 +261,7 @@ fn sameActions(a: []const Action, b: []const Action) bool {
 }
 
 fn rowLessThan(_: void, a: Row, b: Row) bool {
-    if (a.category != b.category) return @intFromEnum(a.category) < @intFromEnum(b.category);
+    if (a.category != b.category) return @backingInt(a.category) < @backingInt(b.category);
     if (a.rank != b.rank) return a.rank < b.rank;
     return naturalOrder(a.text, b.text) == .lt;
 }
@@ -289,7 +289,7 @@ fn triggerOrder(a: Trigger, b: Trigger) std.math.Order {
 fn keyOrder(key: Trigger.Key) u64 {
     return switch (key) {
         .unicode => |cp| cp,
-        .physical => |k| (1 << 32) + @as(u64, @intCast(@intFromEnum(k))),
+        .physical => |k| (1 << 32) + @as(u64, @intCast(@backingInt(k))),
         .catch_all => 1 << 40,
     };
 }
@@ -413,7 +413,7 @@ pub const Style = enum {
     gtk,
 
     /// The style of the apprt this is built for.
-    pub const native: Style = if (builtin.os.tag == .windows) .windows else .gtk;
+    pub const native: Style = if (builtin.target.os.tag == .windows) .windows else .gtk;
 };
 
 pub const Modifier = enum(u2) {
@@ -435,7 +435,7 @@ pub const Modifier = enum(u2) {
     }
 
     fn bit(self: Modifier) u4 {
-        return @as(u4, 1) << @intFromEnum(self);
+        return @as(u4, 1) << @backingInt(self);
     }
 };
 
@@ -499,9 +499,9 @@ const numpad_digits = blk: {
 };
 
 fn offset(key: input.Key, first: input.Key, last: input.Key) ?usize {
-    const k = @intFromEnum(key);
-    if (k < @intFromEnum(first) or k > @intFromEnum(last)) return null;
-    return @intCast(k - @intFromEnum(first));
+    const k = @backingInt(key);
+    if (k < @backingInt(first) or k > @backingInt(last)) return null;
+    return @intCast(k - @backingInt(first));
 }
 
 /// The display name of a physical key, or null when it has none (media
@@ -720,7 +720,7 @@ fn fitName(name: []const u8, word: []const u8, mode: Mode) Fit {
 }
 
 fn better(a: Fit, b: Fit) Fit {
-    return if (@intFromEnum(b) > @intFromEnum(a)) b else a;
+    return if (@backingInt(b) > @backingInt(a)) b else a;
 }
 
 /// A search of key sequences (see the file header).
@@ -977,12 +977,12 @@ pub fn titleForName(name: []const u8) ?[:0]const u8 {
     if (std.mem.startsWith(u8, name, "gx:")) {
         const GxAction = @import("action.zig").Action;
         const gx_name = name["gx:".len..];
-        inline for (@typeInfo(GxAction).@"union".fields) |field| {
-            if (std.mem.eql(u8, field.name, gx_name)) {
-                const value = @unionInit(GxAction, field.name, switch (@typeInfo(field.type)) {
+        inline for (@typeInfo(GxAction).@"union".field_names) |field| {
+            if (std.mem.eql(u8, field, gx_name)) {
+                const value = @unionInit(GxAction, field, switch (@typeInfo(@FieldType(GxAction, field))) {
                     .void => {},
-                    .@"enum" => std.enums.values(field.type)[0],
-                    else => if (field.type == []const u8) "" else return null,
+                    .@"enum" => std.enums.values(@FieldType(GxAction, field))[0],
+                    else => if (@FieldType(GxAction, field) == []const u8) "" else return null,
                 });
                 return value.title();
             }
@@ -1181,7 +1181,7 @@ test "title matches configured free-form arguments exactly" {
         .{ .title = "Another Greeting", .action = try Action.parse("text:hello") },
     };
     for (commands[0 .. commands.len - 1]) |command| {
-        const text = try std.fmt.allocPrint(testing.allocator, "{f}", .{command.action});
+        const text = try testing.allocator.print("{f}", .{command.action});
         defer testing.allocator.free(text);
         const action = try Action.parse(text);
         try testing.expect(action.equal(command.action));

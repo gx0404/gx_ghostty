@@ -285,7 +285,7 @@ text_field: ?Field = null,
 changes: settings_map.Changes,
 /// Failed saves in a row (`model.saveRetryDelayMs`).
 save_attempts: u32 = 0,
-timers: std.EnumSet(Timer) = .initEmpty(),
+timers: std.EnumSet(Timer) = .empty,
 reset_all: model.Confirm = .{},
 measurements: draw.Measurements = .{},
 
@@ -1075,7 +1075,7 @@ const GroupFocusProbe = struct {
             try testing.expectEqual(snapshot_id, self.popup.uia_view.publisher.current.?.id);
             try testing.expect(self.focus_visible);
             const label = if (index == 0) i18n.tr("Reset") else if (section == .appearance) i18n.tr("Apply Theme") else i18n.tr("Apply Font");
-            const name = try std.fmt.allocPrint(testing.allocator, "{s}: {s}", .{ row.title, label });
+            const name = try testing.allocator.print("{s}: {s}", .{ row.title, label });
             defer testing.allocator.free(name);
             if (step % 2 == 0) try client.expect(&fixture.app, .focus, name);
             client.settle(&fixture.app, 100);
@@ -1485,14 +1485,14 @@ fn loadShells(self: *Settings) void {
         for (list.profiles) |profile| {
             const command = settings_map.profileCommand(arena, profile, .native) catch continue;
             const exe: ?[:0]const u8 = switch (profile.command) {
-                .argv => |argv| if (argv.len > 0) arena.dupeZ(u8, argv[0]) catch null else null,
+                .argv => |argv| if (argv.len > 0) arena.dupeSentinel(u8, argv[0], 0) catch null else null,
                 .command_line => null,
             };
             if (profile.kind == .herdr) self.herdr_exe = exe;
             shells.append(arena, .{
                 .command = command,
-                .name = arena.dupeZ(u8, profile.name) catch continue,
-                .name_arg = if (profile.name_arg) |arg| arena.dupeZ(u8, arg) catch null else null,
+                .name = arena.dupeSentinel(u8, profile.name, 0) catch continue,
+                .name_arg = if (profile.name_arg) |arg| arena.dupeSentinel(u8, arg, 0) catch null else null,
                 .kind = if (profile.kind == .custom) .custom_profile else .profile,
                 .gx_zsh = if (profile.kind == .gx_zsh) exe else null,
             }) catch break;
@@ -1504,7 +1504,7 @@ fn loadShells(self: *Settings) void {
 
     if (selected == null) {
         // A command the settings did not write.
-        const command = arena.dupeZ(u8, overlay_command.?) catch "";
+        const command = arena.dupeSentinel(u8, overlay_command.?, 0) catch "";
         shells.append(arena, .{ .command = command, .name = command, .kind = .custom_command }) catch {};
         selected = shells.items.len - 1;
     }
@@ -2013,7 +2013,7 @@ fn detailFor(self: *Settings, keys: []const []const u8, hint: []const u8) Detail
     var source: ?gx.config_layers.Layer = null;
     for (keys) |key| {
         const layer = layers.provenance(key) orelse continue;
-        if (source == null or @intFromEnum(layer) > @intFromEnum(source.?)) source = layer;
+        if (source == null or @backingInt(layer) > @backingInt(source.?)) source = layer;
     }
     return switch (source orelse return .{ .text = hint }) {
         .cli => .{ .text = i18n.trRuntime(settings_map.provenanceLabel(.cli)), .warning = true },
@@ -2136,7 +2136,7 @@ fn appendSearchRows(out: *RowList, section: Section, section_title: []const u8, 
             out.add(.{ .kind = .group, .title = section_title });
         }
         const where = if (group.len > 0 and !std.mem.eql(u8, group, title))
-            std.fmt.allocPrint(alloc, "{s} \u{203A} {s}", .{ section_title, group }) catch section_title
+            alloc.print("{s} \u{203A} {s}", .{ section_title, group }) catch section_title
         else
             section_title;
         out.add(.{
@@ -2398,10 +2398,10 @@ fn pairDetail(self: *Settings, alloc: Allocator, pair: settings_map.ThemePair, h
     // Sentences ending in a full-width stop (Chinese) need no space.
     const space: []const u8 = if (pair_hint.len > 0 and pair_hint[pair_hint.len - 1] < 0x80) " " else "";
     const explained = if (hint.len > 0)
-        std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ pair_hint, space, hint }) catch hint
+        alloc.print("{s}{s}{s}", .{ pair_hint, space, hint }) catch hint
     else
         pair_hint;
-    return std.fmt.allocPrint(alloc, "{s}\n{s}", .{ summary, explained }) catch summary;
+    return alloc.print("{s}\n{s}", .{ summary, explained }) catch summary;
 }
 
 /// The accent color: a group with the chips of `accents`, or a color of its
@@ -2426,7 +2426,7 @@ fn addAccentRows(self: *Settings, rows: *RowList, scratch: Allocator) void {
         // it comes from.
         const color = self.values.accent_color;
         const layer: ?gx.config_layers.Layer = if (self.layersPtr()) |layers| layers.provenance(settings_map.Accent.key) else null;
-        group.detail = std.fmt.allocPrint(scratch, "#{x:0>2}{x:0>2}{x:0>2} \u{00B7} {s}", .{
+        group.detail = scratch.print("#{x:0>2}{x:0>2}{x:0>2} \u{00B7} {s}", .{
             color.r,
             color.g,
             color.b,
@@ -2465,7 +2465,7 @@ fn materialNote(self: *Settings, alloc: Allocator) []const u8 {
     } else true;
     if (!all) return i18n.fill(alloc, i18n.tr("Dimmed materials are not supported on this system (build {build})."), .{ .build = self.build }) catch "";
     if (!self.app.alpha_frames and self.values.material != .solid) {
-        return switch (self.app.core_app.device.alphaFrames()) {
+        return switch (self.app.core_app.device.?.alphaFrames()) {
             .software => i18n.tr("The material shows in the title bar only: the terminals are drawn by software rendering."),
             .supported, .no_alpha_channel => i18n.tr("The material shows in the title bar only: the graphics driver draws the terminals without transparency."),
         };
@@ -2475,7 +2475,7 @@ fn materialNote(self: *Settings, alloc: Allocator) []const u8 {
 
 /// The OpenGL implementation that draws the terminals (`wgl.Device`).
 fn graphicsDetail(self: *Settings, alloc: Allocator) []const u8 {
-    const device = &self.app.core_app.device;
+    const device = self.app.core_app.device orelse return "OpenGL";
     device.wait() catch return "OpenGL";
     const backend = device.backend();
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -2550,7 +2550,7 @@ fn enterSection(self: *Settings, section: Section) void {
 fn cycleSection(self: *Settings, delta: isize) void {
     const sections = std.enums.values(Section);
     const count: isize = @intCast(sections.len);
-    const current: isize = @intCast(@intFromEnum(self.section));
+    const current: isize = @intCast(@backingInt(self.section));
     self.enterSection(sections[@intCast(@mod(current + delta, count))]);
 }
 
@@ -2836,7 +2836,7 @@ fn themeName(self: *Settings, index: u32) ?[:0]const u8 {
 /// or dark mode is still followed. Owned by `alloc`.
 fn themeValue(self: *Settings, alloc: Allocator, index: u32) ?[:0]u8 {
     const name = self.themeName(index) orelse return null;
-    const pair = self.themePair() orelse return alloc.dupeZ(u8, name) catch null;
+    const pair = self.themePair() orelse return alloc.dupeSentinel(u8, name, 0) catch null;
     return self.theme_half.replace(pair, name).value(alloc) catch null;
 }
 
@@ -3163,13 +3163,13 @@ const Timer = enum(usize) {
 
 fn startTimer(self: *Settings, timer: Timer, ms: u32) void {
     const hwnd = self.popup.hwnd orelse return;
-    if (w32.SetTimer(hwnd, @intFromEnum(timer), ms, @ptrCast(&timerProc)) != 0) self.timers.insert(timer);
+    if (w32.SetTimer(hwnd, @backingInt(timer), ms, @ptrCast(&timerProc)) != 0) self.timers.insert(timer);
 }
 
 fn stopTimer(self: *Settings, timer: Timer) void {
     if (!self.timers.contains(timer)) return;
     self.timers.remove(timer);
-    if (self.popup.hwnd) |hwnd| _ = w32.KillTimer(hwnd, @intFromEnum(timer));
+    if (self.popup.hwnd) |hwnd| _ = w32.KillTimer(hwnd, @backingInt(timer));
 }
 
 fn timerProc(hwnd: ?w32.HWND, _: u32, id: usize, _: u32) callconv(.winapi) void {
@@ -3650,7 +3650,7 @@ fn press(self: *Settings, popup: *Popup, target: Target, double: bool) void {
             self.focusRow(step.row);
             self.stepFontSize(step.step);
             self.pressed = target;
-            popup.startRepeat(@intFromEnum(step.step));
+            popup.startRepeat(@backingInt(step.step));
         },
         else => {
             self.pressed = target;

@@ -13,14 +13,14 @@ pub const max_connections = 4;
 pub const queue_capacity = 32;
 pub fn nativeOffer(mapping: protocol.Mapping) channel.Offer {
     var result: channel.Offer = undefined;
-    inline for (std.meta.fields(channel.Offer)) |field| @field(result, field.name) = @field(mapping, field.name);
+    inline for (@typeInfo(channel.Offer).@"struct".field_names) |field| @field(result, field) = @field(mapping, field);
     return result;
 }
 pub fn mappingOffer(surface: @import("../../../gx/ui_ref.zig").Reference, offer_id: u64, offer: channel.Offer) protocol.Mapping {
     var result: protocol.Mapping = undefined;
     result.surface = surface;
     result.offer_id = offer_id;
-    inline for (std.meta.fields(channel.Offer)) |field| @field(result, field.name) = @field(offer, field.name);
+    inline for (@typeInfo(channel.Offer).@"struct".field_names) |field| @field(result, field) = @field(offer, field);
     return result;
 }
 pub const Endpoint = struct {
@@ -39,7 +39,7 @@ pub const Endpoint = struct {
         var digest: [32]u8 = undefined;
         hash.final(&digest);
         var ascii: [120]u8 = undefined;
-        const text = try std.fmt.bufPrint(&ascii, "\\\\.\\pipe\\ghostty-gx-remote-v1-{s}", .{std.fmt.bytesToHex(digest, .lower)});
+        const text = try std.mem.print(&ascii, "\\\\.\\pipe\\ghostty-gx-remote-v1-{s}", .{std.fmt.bytesToHex(digest, .lower)});
         var result: Endpoint = .{ .name = @splat(0), .isolation = isolation, .target = target };
         _ = try std.unicode.utf8ToUtf16Le(&result.name, text);
         return result;

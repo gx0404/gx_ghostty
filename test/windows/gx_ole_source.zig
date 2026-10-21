@@ -96,7 +96,7 @@ const TraceBudget = struct {
     suppressed: usize = 0,
 
     fn admit(self: *TraceBudget, class: TraceClass) bool {
-        const index = @intFromEnum(class);
+        const index = @backingInt(class);
         if (self.counts[index] >= limits[index]) {
             self.suppressed +|= 1;
             return false;
@@ -112,9 +112,9 @@ fn trace(comptime event: []const u8, comptime fields: []const u8, args: anytype,
     if (!trace_budget.admit(class)) return;
     const now = GetTickCount64();
     var detail: [512]u8 = undefined;
-    const extra = std.fmt.bufPrint(&detail, fields, args) catch return;
+    const extra = std.mem.print(&detail, fields, args) catch return;
     var buffer: [768]u8 = undefined;
-    const line = std.fmt.bufPrint(&buffer, "{{\"event\":\"{s}\",\"class\":\"{s}\",\"tick_ms\":{d},\"thread_id\":{d},\"suppressed\":{d}{s}}}\n", .{ event, @tagName(class), now, GetCurrentThreadId(), trace_budget.suppressed, extra }) catch return;
+    const line = std.mem.print(&buffer, "{{\"event\":\"{s}\",\"class\":\"{s}\",\"tick_ms\":{d},\"thread_id\":{d},\"suppressed\":{d}{s}}}\n", .{ event, @tagName(class), now, GetCurrentThreadId(), trace_budget.suppressed, extra }) catch return;
     var written: u32 = 0;
     _ = WriteFile(file, line.ptr, @intCast(line.len), &written, null);
 }
@@ -200,7 +200,7 @@ fn verifyTarget(init: std.process.Init, opts: Options) !Target {
     if (QueryFullProcessImageNameW(process, 0, &actual, &count) == 0) return error.TargetImageFailed;
     const expected = try std.unicode.utf8ToUtf16LeAllocZ(alloc, opts.exe);
     // Canonicalize both file paths via handles to reject path spelling tricks.
-    const actual_z = try alloc.dupeZ(u16, actual[0..count]);
+    const actual_z = try alloc.dupeSentinel(u16, actual[0..count], 0);
     var expected_path: [32768]u16 = undefined;
     var actual_path: [32768]u16 = undefined;
     const a = try canonical(actual_z, &actual_path);
@@ -680,7 +680,7 @@ fn run(init: std.process.Init) !u8 {
     const opts = try parse(arguments);
     const target = try verifyTarget(init, opts);
     defer _ = CloseHandle(target.process);
-    const folder = try std.fmt.allocPrint(alloc, "gx-ole-{d}-{d}", .{ GetCurrentProcessId(), GetTickCount64() });
+    const folder = try alloc.print("gx-ole-{d}-{d}", .{ GetCurrentProcessId(), GetTickCount64() });
     var parent = try std.Io.Dir.openDirAbsolute(init.io, opts.work_dir, .{});
     defer parent.close(init.io);
     try parent.createDir(init.io, folder, .default_dir);
@@ -696,12 +696,12 @@ fn run(init: std.process.Init) !u8 {
         _ = CloseHandle(trace_handle);
     }
     trace("fixture_verified", ",\"target_pid\":{d},\"target_hwnd\":{d}", .{ opts.pid, opts.hwnd }, .final);
-    const marker = try std.fmt.allocPrint(alloc, "GX_OLE_FIXTURE_{d}", .{GetCurrentProcessId()});
+    const marker = try alloc.print("GX_OLE_FIXTURE_{d}", .{GetCurrentProcessId()});
     var format: u16 = 13;
     const bytes: []const u8 = switch (opts.case) {
         .text => try widePayload(alloc, marker, true),
-        .unicode => try widePayload(alloc, try std.fmt.allocPrint(alloc, "{s} 中文 café 🧪", .{marker}), true),
-        .multiline => try widePayload(alloc, try std.fmt.allocPrint(alloc, "# {s}\r\n# second-line", .{marker}), true),
+        .unicode => try widePayload(alloc, try alloc.print("{s} 中文 café 🧪", .{marker}), true),
+        .multiline => try widePayload(alloc, try alloc.print("# {s}\r\n# second-line", .{marker}), true),
         .unterminated => try widePayload(alloc, marker, false),
         .text_limit => try widePayload(alloc, try alloc.dupe(u8, &(@as([1024 * 1024 + 1]u8, @splat('x')))), true),
         .single_file, .files, .shell_metachar_files, .quoted_path, .too_many_files, .uri, .bad_uri => blk: {
@@ -826,8 +826,8 @@ test "fixture trace reserves releases and final results after probe and medium f
     }
     try std.testing.expect(budget.admit(.release));
     try std.testing.expect(budget.admit(.final));
-    try std.testing.expectEqual(@as(usize, 128), budget.counts[@intFromEnum(TraceClass.probe)]);
-    try std.testing.expectEqual(@as(usize, 48), budget.counts[@intFromEnum(TraceClass.medium)]);
+    try std.testing.expectEqual(@as(usize, 128), budget.counts[@backingInt(TraceClass.probe)]);
+    try std.testing.expectEqual(@as(usize, 48), budget.counts[@backingInt(TraceClass.medium)]);
     try std.testing.expectEqual(@as(usize, 20000 - 128 - 48), budget.suppressed);
 }
 

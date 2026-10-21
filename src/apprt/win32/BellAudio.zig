@@ -142,7 +142,7 @@ fn Worker(comptime Backend: type) type {
             if (kind == 7) {
                 log.warn("cannot load bell audio (mono/stereo PCM8/16/24/32 or float32/64 WAV, at most 16 MiB/30 s) err={}", .{@as(anyerror, @errorFromInt(@as(u16, @intCast(code))))});
             } else {
-                const operation: Operation = @enumFromInt(kind - 1);
+                const operation: Operation = @fromBackingInt(@intCast(kind - 1));
                 log.warn("bell audio WinMM {s} failed code={}; player disabled", .{ @tagName(operation), code });
             }
         }
@@ -226,7 +226,7 @@ fn Worker(comptime Backend: type) type {
             const failure = self.state.backend.failure();
             if (failure.code == 0) return;
             if (self.faulted.load(.acquire)) return;
-            self.issue.store((@as(u64, @intFromEnum(failure.operation)) + 1) << 32 | failure.code, .release);
+            self.issue.store((@as(u64, @backingInt(failure.operation)) + 1) << 32 | failure.code, .release);
             self.faulted.store(true, .release);
         }
 
@@ -400,7 +400,7 @@ const Native = struct {
     prepared: bool = false,
     first_failure: Failure = .{},
 
-    fn setCancel(self: *Native, cancel: Cancel) void {
+    pub fn setCancel(self: *Native, cancel: Cancel) void {
         self.cancel = cancel;
     }
 
@@ -416,7 +416,7 @@ const Native = struct {
         return self.prepared;
     }
 
-    fn failure(self: *const Native) Failure {
+    pub fn failure(self: *const Native) Failure {
         return self.first_failure;
     }
 
@@ -779,7 +779,7 @@ fn awaitNativeCountWithWait(player: *Player, counter: *std.atomic.Value(usize), 
             const issue = player.issue.load(.acquire);
             const kind = issue >> 32;
             const code: u32 = @truncate(issue);
-            if (kind == @as(u64, @intFromEnum(Operation.open)) + 1 and
+            if (kind == @as(u64, @backingInt(Operation.open)) + 1 and
                 (code == 2 or code == 6) and // MMSYSERR_BADDEVICEID / MMSYSERR_NODRIVER
                 player.started.load(.acquire) == 0)
                 return error.SkipZigTest;
@@ -816,7 +816,7 @@ const AudioService = struct {
         return .{ .state = status.state, .pid = status.pid };
     }
     fn failed() Result {
-        return .{ .query_error = @intFromEnum(std.os.windows.GetLastError()) };
+        return .{ .query_error = @backingInt(std.os.windows.GetLastError()) };
     }
     extern "advapi32" fn OpenSCManagerW(?[*:0]const u16, ?[*:0]const u16, u32) callconv(.winapi) ?*anyopaque;
     extern "advapi32" fn OpenServiceW(*anyopaque, [*:0]const u16, u32) callconv(.winapi) ?*anyopaque;
@@ -919,7 +919,7 @@ const Script = struct {
     }
 
     fn enter(self: *Script, operation: Operation) u32 {
-        const i = @intFromEnum(operation);
+        const i = @backingInt(operation);
         _ = self.calls[i].fetchAdd(1, .release);
         if (self.blocked.load(.acquire) == i + 1) {
             self.entered.store(i + 1, .release);
@@ -986,7 +986,7 @@ const Script = struct {
     }
 
     fn awaitCalls(self: *Script, operation: Operation, count: usize) !void {
-        try Observer.awaitCount(&self.calls[@intFromEnum(operation)], count);
+        try Observer.awaitCount(&self.calls[@backingInt(operation)], count);
     }
 };
 
@@ -1008,7 +1008,7 @@ test "bell audio native wait skips only initial no-device open failures and work
         .{ .operation = .write, .code = 6, .expected = error.NativeAudioFailed },
     }) |case| {
         var script: Script = .{};
-        script.errors[@intFromEnum(case.operation)].store(case.code, .release);
+        script.errors[@backingInt(case.operation)].store(case.code, .release);
         const player = try Player.create(t.allocator, .{ .api = script.api() });
         player.retain();
         defer {
@@ -1028,7 +1028,7 @@ test "bell audio native wait skips only initial no-device open failures and work
         try t.expectEqual(@as(usize, 0), player.started.load(.acquire));
         try t.expectEqual(@as(usize, 0), player.completed.load(.acquire));
         try t.expectError(error.PlayerFaulted, player.request(path, 1));
-        try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.open)].load(.acquire));
+        try t.expectEqual(@as(usize, 1), script.calls[@backingInt(Operation.open)].load(.acquire));
         try t.expectError(case.expected, awaitNativeCount(player, &player.completed, 1));
     }
 }
@@ -1049,7 +1049,7 @@ test "bell audio native wait does not skip device loss after successful playback
     }
     try player.request(path, 1);
     try awaitNativeCount(player, &player.completed, 1);
-    script.errors[@intFromEnum(Operation.open)].store(2, .release);
+    script.errors[@backingInt(Operation.open)].store(2, .release);
     try player.request(path, 1);
     try t.expect(w32.WaitForSingleObject(player.thread.getHandle(), 5000) == w32.WAIT_OBJECT_0);
     try t.expectEqual(@as(usize, 1), player.started.load(.acquire));
@@ -1064,7 +1064,7 @@ test "bell audio permanent close after unprepare must not block Worker destroy" 
     const path = try tmp.dir.realPathFileAlloc(t.io, "bell.wav", t.allocator);
     defer t.allocator.free(path);
     var script: Script = .{};
-    script.errors[@intFromEnum(Operation.close)].store(6, .release);
+    script.errors[@backingInt(Operation.close)].store(6, .release);
     const player = try Player.create(t.allocator, .{ .api = script.api() });
     player.retain();
     try player.request(path, 0.5);
@@ -1080,7 +1080,7 @@ test "bell audio permanent close after unprepare must not block Worker destroy" 
     try t.expect(w32.WaitForSingleObject(destroyer.getHandle(), 5000) == w32.WAIT_OBJECT_0);
     destroyer.join();
     try t.expect(!player.cache_present.load(.acquire));
-    script.errors[@intFromEnum(Operation.close)].store(0, .release);
+    script.errors[@backingInt(Operation.close)].store(0, .release);
     try player.flushRetained();
     try t.expect(bounded);
 }
@@ -1117,7 +1117,7 @@ test "bell audio native failure matrix isolates every stage without repeated pla
     for (std.enums.values(Operation)) |operation| {
         for ([_]u32{ 5, 6, 7 }) |code| {
             var script: Script = .{};
-            script.errors[@intFromEnum(operation)].store(code, .release);
+            script.errors[@backingInt(operation)].store(code, .release);
             if (operation == .reset) script.done.store(false, .release);
             const player = try Player.create(t.allocator, .{ .api = script.api() });
             player.retain();
@@ -1135,7 +1135,7 @@ test "bell audio native failure matrix isolates every stage without repeated pla
             try script.awaitCalls(operation, 1);
             try awaitFlag(&player.faulted, true);
             for (0..100) |_| try t.expectError(error.PlayerFaulted, player.request(path, 0.75));
-            try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.open)].load(.acquire));
+            try t.expectEqual(@as(usize, 1), script.calls[@backingInt(Operation.open)].load(.acquire));
             try t.expectEqual(player.issue.load(.acquire), player.reported.load(.acquire));
             try destroyWithinBudget(player);
             destroyed = true;
@@ -1165,7 +1165,7 @@ test "bell audio blocked native API matrix retains stable execution context afte
         const gate = w32.CreateEventW(null, 1, 0, null) orelse return error.AudioEventFailed;
         defer _ = w32.CloseHandle(gate);
         script.gate = gate;
-        script.blocked.store(@as(u32, @intFromEnum(operation)) + 1, .release);
+        script.blocked.store(@as(u32, @backingInt(operation)) + 1, .release);
         if (operation == .reset) script.done.store(false, .release);
         const player = try Player.create(t.allocator, .{ .api = script.api() });
         player.retain();
@@ -1184,7 +1184,7 @@ test "bell audio blocked native API matrix retains stable execution context afte
             if (script.entered.load(.acquire) != 0) break;
             try std.Io.sleep(t.io, .fromMilliseconds(10), .awake);
         }
-        try t.expectEqual(@as(u32, @intFromEnum(operation)) + 1, script.entered.load(.acquire));
+        try t.expectEqual(@as(u32, @backingInt(operation)) + 1, script.entered.load(.acquire));
         const original_pcm = player.state.cache.?.wave.samples().ptr;
         const original_header = &player.state.backend.header;
         try destroyWithinBudget(player);
@@ -1228,10 +1228,10 @@ test "bell audio early and absent completion retain loan until unprepare succeed
     script.complete();
     try Observer.awaitCount(&player.completed, 1);
     try t.expect(!script.loan.load(.acquire));
-    try t.expect(script.calls[@intFromEnum(Operation.unprepare)].load(.acquire) >= 2);
+    try t.expect(script.calls[@backingInt(Operation.unprepare)].load(.acquire) >= 2);
     try player.request("not-a-file.wav", 0);
     try awaitFlag(&player.cache_present, false);
-    try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.open)].load(.acquire));
+    try t.expectEqual(@as(usize, 1), script.calls[@backingInt(Operation.open)].load(.acquire));
 }
 
 test "bell audio absent callback and buffer return retain quarantine until the driver releases" {
@@ -1267,8 +1267,8 @@ test "bell audio absent callback and buffer return retain quarantine until the d
     try t.expectEqual(&player.state.backend.header, header);
     try t.expectEqual(@as(i16, 10000), std.mem.readInt(i16, header.data[0..2], .little));
     for (0..100) |_| try t.expectError(error.PlayerStopped, player.request(path, 1));
-    try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.open)].load(.acquire));
-    try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.write)].load(.acquire));
+    try t.expectEqual(@as(usize, 1), script.calls[@backingInt(Operation.open)].load(.acquire));
+    try t.expectEqual(@as(usize, 1), script.calls[@backingInt(Operation.write)].load(.acquire));
     // Successful unprepare is the ownership fence; no callback is required.
     script.done.store(true, .release);
     player.signal();
@@ -1277,7 +1277,7 @@ test "bell audio absent callback and buffer return retain quarantine until the d
     try t.expect(!player.cache_present.load(.acquire));
     try t.expect(player.state.backend.handle == null);
     try t.expect(player.state.backend.event == null);
-    try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.close)].load(.acquire));
+    try t.expectEqual(@as(usize, 1), script.calls[@backingInt(Operation.close)].load(.acquire));
 }
 
 test "bell audio new serial while prepare blocks does not submit the obsolete gain" {
@@ -1291,7 +1291,7 @@ test "bell audio new serial while prepare blocks does not submit the obsolete ga
     const gate = w32.CreateEventW(null, 1, 0, null) orelse return error.AudioEventFailed;
     defer _ = w32.CloseHandle(gate);
     script.gate = gate;
-    script.blocked.store(@as(u32, @intFromEnum(Operation.prepare)) + 1, .release);
+    script.blocked.store(@as(u32, @backingInt(Operation.prepare)) + 1, .release);
     const player = try Player.create(t.allocator, .{ .api = script.api() });
     player.retain();
     defer {
@@ -1306,8 +1306,8 @@ test "bell audio new serial while prepare blocks does not submit the obsolete ga
     unrelated_io.deinit();
     _ = w32.SetEvent(gate);
     try Observer.awaitCount(&player.completed, 1);
-    try t.expectEqual(@as(usize, 2), script.calls[@intFromEnum(Operation.open)].load(.acquire));
-    try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.write)].load(.acquire));
+    try t.expectEqual(@as(usize, 2), script.calls[@backingInt(Operation.open)].load(.acquire));
+    try t.expectEqual(@as(usize, 1), script.calls[@backingInt(Operation.write)].load(.acquire));
     try t.expectEqual(@as(i16, 6000), script.sample.load(.acquire));
 }
 
@@ -1322,7 +1322,7 @@ test "bell audio requests racing destroy cannot reopen a quarantined player" {
     const gate = w32.CreateEventW(null, 1, 0, null) orelse return error.AudioEventFailed;
     defer _ = w32.CloseHandle(gate);
     script.gate = gate;
-    script.blocked.store(@as(u32, @intFromEnum(Operation.write)) + 1, .release);
+    script.blocked.store(@as(u32, @backingInt(Operation.write)) + 1, .release);
     const player = try Player.create(t.allocator, .{ .api = script.api() });
     player.retain();
     var destroyed = false;
@@ -1347,7 +1347,7 @@ test "bell audio requests racing destroy cannot reopen a quarantined player" {
     destroyed = true;
     producer.join();
     try t.expectError(error.PlayerStopped, player.request(path, 1));
-    try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.open)].load(.acquire));
-    try t.expectEqual(@as(usize, 1), script.calls[@intFromEnum(Operation.write)].load(.acquire));
+    try t.expectEqual(@as(usize, 1), script.calls[@backingInt(Operation.open)].load(.acquire));
+    try t.expectEqual(@as(usize, 1), script.calls[@backingInt(Operation.write)].load(.acquire));
     try t.expect(script.loan.load(.acquire));
 }

@@ -198,7 +198,7 @@ pub fn appendBusyNames(
 
 /// Windows helpers for the termio backend, which only knows the child
 /// process by its handle.
-pub const windows = if (builtin.os.tag == .windows) struct {
+pub const windows = if (builtin.target.os.tag == .windows) struct {
     const win = std.os.windows;
 
     extern "kernel32" fn GetProcessId(Process: win.HANDLE) callconv(.winapi) win.DWORD;
@@ -274,8 +274,8 @@ test "terminalNeedsConfirm without a process" {
 
 test "terminalNeedsConfirm for the test process" {
     const testing = std.testing;
-    if (builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
-    const self_pid: u64 = switch (builtin.os.tag) {
+    if (builtin.target.os.tag != .windows and builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const self_pid: u64 = switch (builtin.target.os.tag) {
         .windows => std.os.windows.GetCurrentProcessId(),
         else => @intCast(std.os.linux.getpid()),
     };
@@ -287,8 +287,8 @@ test "terminalNeedsConfirm for the test process" {
 
 test "a scope reads one process table for every question" {
     const testing = std.testing;
-    if (builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
-    const self_pid: u64 = switch (builtin.os.tag) {
+    if (builtin.target.os.tag != .windows and builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const self_pid: u64 = switch (builtin.target.os.tag) {
         .windows => std.os.windows.GetCurrentProcessId(),
         else => @intCast(std.os.linux.getpid()),
     };
@@ -335,7 +335,7 @@ test "ending a scope again does nothing" {
     const testing = std.testing;
     var outer: Scope = undefined;
     outer.begin(testing.allocator, testing.io);
-    if (builtin.os.tag == .windows or builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .windows or builtin.target.os.tag == .linux) {
         // A captured table is freed once.
         _ = terminalNeedsConfirm(testing.allocator, testing.io, 1, &.{});
         try testing.expect(outer.table != null or outer.failed);

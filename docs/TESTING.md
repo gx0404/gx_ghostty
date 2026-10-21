@@ -2,6 +2,14 @@
 
 每一层都要写清楚能证明什么、不能代证什么。不同层不能互相顶替，Windows 本机的结果也不能顶替 Linux 或 macOS。命令细节见 [MAKE_COMMANDS.md](MAKE_COMMANDS.md)，九步闭环见 [DEVELOPMENT.md](DEVELOPMENT.md)，测试相关的领域规则见 `docs/AGENT_RULES/testing.md`。
 
+## Windows 日常快速验证
+
+源码或构建输入变化后运行 `just quick-prepare`，构建完整 main、vt、vt_c 产物并记录内容摘要。随后以 `just quick-check` 运行固定快速清单，编译不计入 60 秒。过期、缺失或被替换的产物会失败并提示重新准备；测试期间改动源码同样使结论无效。
+
+快速门覆盖规则、版本、格式、diff、九组框架模块，以及 Windows/GX 和 VT Parser/C ABI 固定用例；完整清单以 `scripts/quick_check.py::FRAMEWORK` / `FILTERS` 为真源。执行预算 55 秒，预留 5 秒终止进程树和保存报告。失败、超时、零命中与未完成不得算通过。记录在 `.local/quick-check/`。
+
+这取代旧的日常全量耗时目标；`test`、`test-vt`、`framework-check`、`ci-check` 和每次 push 的完整 CI 保持原意。上游同步、发版与跨平台/GUI验收仍执行相应完整检查。60 秒需在当前工具链和当前源码上连续三次实际验收，历史缓存和计数不能代证。
+
 ## 分层
 
 | 层 | 命令 | 前置 | 能证明 | 不能代证 |
@@ -22,7 +30,7 @@
 | 交叉构建 | `just build-vt -Dtarget=<triple>` | Zig | 该目标能编译、链接 | 在该目标上的运行结果 |
 | wasm | `just vt-wasm`，再 `node test/wasm-alloc.mjs zig-out/bin/ghostty-vt.wasm` | Zig；冒烟需要 Node | wasm32-freestanding 的 ReleaseSmall 构建；导出的分配接口可用 | 浏览器集成与性能 |
 | 源码包 | `just dist-vt`；完整校验 `just zig build distcheck -Demit-lib-vt=true` | Zig、Git；distcheck 的内层命令另需 PATH 上的 `zig`（0.16.x）、`tar` 与 `cmake` | dist：用 `git archive` 打包 HEAD 生成源码 tarball；distcheck：解包后 `test-lib-vt` 通过，且 CMake 能从 tarball 构建 | 工作树里未提交的改动（不进 tarball）；二进制发布包 |
-| Windows app 构建 | `just build`（可加 `-Doptimize=ReleaseFast`） | Windows、钉版 Zig；首次构建联网拉依赖 | win32 app 能以 GNU ABI 编译链接，`zig-out\bin\ghostty.exe` 与 `share\` 安装成功 | 运行行为；不经 `just` 时的 MSVC ABI 构建（未验证） |
+| Windows app 构建 | `just build`（可加 `-Doptimize=fast`） | Windows、钉版 Zig；首次构建联网拉依赖 | win32 app 能以 GNU ABI 编译链接，`zig-out\bin\ghostty.exe` 与 `share\` 安装成功 | 运行行为；不经 `just` 时的 MSVC ABI 构建（未验证） |
 | Windows GUI 验证 | `just win-gui run --out <目录> [W01 …]` 回放 `test/gui/win32/` 的场景，或启动 `zig-out\bin\ghostty.exe`（或解压的便携包）用其他桌面自动化操作并截图，见下文「Windows GUI 验证」 | Windows 10/11 的交互式桌面会话 | 截图里看得到的界面状态，加上日志里对应的行 | 其他 Windows 版本、显卡驱动与显示缩放；没截图覆盖的交互；Linux 与 macOS |
 | Windows 打包 | `just package-windows`（`--skip-installer` 只出 zip） | Windows；安装包要 `just setup --innosetup`；首次要联网下载钉版组件 | ReleaseFast 构建；zip 与安装包的名字、目录布局、必需文件与最小体积符合 `scripts/gx_release.py::expected_assets`；每个钉版下载与包内文件的 sha256 一致 | 安装、升级、卸载在真实系统上的行为（要另外装一遍验证）；签名（资产没有 Authenticode 签名） |
 | GTK 冒烟（CI） | 手动触发 `gx-ci`，打开 `gtk_smoke` 输入 | fork 已启用 Actions，提交已 push | debian:13 容器里 GTK app 能以 ReleaseFast 构建，`ghostty +version` 能运行，在 Xvfb（1280x800，X11 后端、软件渲染）下启动 20 秒后仍在运行并完成截图；artifact `gx-gtk-smoke-evidence` 必须下载并实际读图 | 渲染内容是否正确（以读图结论为准）、Wayland、IME、真实桌面交互与其他发行版 |
@@ -30,11 +38,11 @@
 | WSL 本机 Linux | `just wsl test`（主套件，`-Dapp-runtime=none`）、`just wsl test --gtk`、`just wsl test --suite vt`、`just wsl build --gtk` 后 `just wsl smoke --out <目录>`、`just wsl scenario --out <目录>`（`test/gui/gtk/` 的 G 场景）与 `just wsl smoke --perf`（见 MAKE_COMMANDS.md「WSL」） | Windows 与 WSL2 Ubuntu 24.04，`just wsl setup` 装好钉版 Zig、blueprint-compiler 0.16.0 与 Zig 包 | 该 Ubuntu 24.04（GTK 4.14.5、libadwaita 1.5.0）上完整单测（含 GTK apprt 时也含 `src/apprt/gtk/gx/`）与 lib-vt 单测通过；GTK app 能构建，以与 `gtk-smoke` 相同的 Xvfb 参数启动并截图，`--lang` 切换 locale，xdotool 脚本可以驱动键盘输入；G 场景的日志里没有 CSS 解析错误；`--perf` 给出吞吐负载下各线程的 CPU 时间；截图须实际读图 | gx-ci 的 debian:13 容器与 ReleaseFast 构建；有合成器的真实桌面（Xvfb 里没有窗口管理器与合成器）、Wayland 与 IME；WSLg 交互（本机截不到 WSLg 窗口内容，只能确认窗口出现） |
 | GX Shell deb stage（Ubuntu 24.04） | 本机：WSL 里用 podman 起全新 `ubuntu:24.04` 容器，照 `scripts/gx_package.py` 模块文档「Consumer contract」的 deb 命令运行，再在另一个全新容器 `apt-get install` `test-deb` 打出的包并截图；CI：运行 `gx-release`，看 `linux-gtk-noble` | 本机需 WSL2 与 podman（或 docker）；CI 需 fork 已启用 Actions | 文档里的命令能在只装了 `ca-certificates`、`git`、`python3` 的 Ubuntu 24.04（GTK 4.14.5、libadwaita 1.5.0）上装好依赖、以 ReleaseFast 构建并生成通过 `verify-stage` 的 stage；随包的 `libgtk4-layer-shell.so` 经 RUNPATH `$ORIGIN/../lib` 加载；测试包的 Depends 在全新系统上能解析，`ghostty-gx +version` 等于 `$VS`，Xvfb 截图须实际读图 | CI 在构建容器里安装测试包，开发包已在，所以不证明 Depends 完整（本机第二个全新容器才证明）；GX Shell 的正式 deb、Wayland 与真实桌面 |
 | macOS lib-vt | 手动触发 `gx-ci`，打开 `macos` 输入 | 同上 | macos-15 上 `zig build test-lib-vt` 通过 | macOS app 构建（Xcode）、签名、公证与 app 交互 |
-| macOS app 构建 | 手动运行 `gx-release`，打开 `macos` 输入（`publish=false` 只构建不发布） | 同上 | macos-26 上 `zig build -Doptimize=ReleaseFast` 产出只做 ad-hoc 签名的 `Ghostty.app`，以 artifact 形式保留 | GUI 行为、正式签名与公证；没有自动化的 macOS GUI 冒烟 |
+| macOS app 构建 | 手动运行 `gx-release`，打开 `macos` 输入（`publish=false` 只构建不发布） | 同上 | macos-26 上 `zig build -Doptimize=fast` 产出只做 ad-hoc 签名的 `Ghostty.app`，以 artifact 形式保留 | GUI 行为、正式签名与公证；没有自动化的 macOS GUI 冒烟 |
 | valgrind | `just zig build test-valgrind`、`just zig build run-valgrind` | Linux 与 valgrind，手动执行 | 单测或运行期没有 valgrind 能发现的内存错误（已知误报由 `valgrind.supp` 抑制） | 其他平台 |
 | fuzz | 在 `test/fuzz-libghostty` 下 `zig build` 构建 harness（需要 `afl-cc`），再按该目录的 `AGENTS.md` 用 `zig build run-<name>` 跑 AFL++ | Linux 或 macOS 与 AFL++，手动执行 | 在给定语料和时长内没有发现崩溃 | 不存在崩溃的普遍结论 |
 | esctest | 在 `test/esctest` 下 `zig build run`，比较输出里的通过计数 | Linux 或 macOS（运行器用 `forkpty` 拉起 `python3`），手动执行 | 同一环境下改动前后的一致性计数变化 | 不是通过门：上游许多用例本来就失败 |
-| benchmark | `just build -Demit-bench -Doptimize=ReleaseFast`，用 hyperfine 对比（见 `src/benchmark/AGENTS.md`） | 手动执行，同一台机器、同一份输入；Linux 或 macOS（Windows 上 GNU ABI 能构建这些工具，见 `docs/AGENT_RULES/build-system.md`「平台」，但没有在 Windows 上做过基准） | 声明条件下的耗时对比 | 普遍性能结论 |
+| benchmark | `just build -Demit-bench -Doptimize=fast`，用 hyperfine 对比（见 `src/benchmark/AGENTS.md`） | 手动执行，同一台机器、同一份输入；Linux 或 macOS（Windows 上 GNU ABI 能构建这些工具，见 `docs/AGENT_RULES/build-system.md`「平台」，但没有在 Windows 上做过基准） | 声明条件下的耗时对比 | 普遍性能结论 |
 | GUI 耗时 | `just perf win32 --exe <旧> --exe <新> --out <目录>`、`just perf gtk --clone <克隆> --out <目录>`；已有样本用 `just perf summarize` / `just perf compare`（见下文「耗时度量与基线」） | ReleaseFast 构建；Windows 交互式桌面或 WSL；机器空闲 | 同一台机器、同一负载下，两个构建的启动、新标签、分屏、resize 与 GTK 吞吐负载 CPU 时间的中位数与 p90 之差 | 其他机器、驱动与显示设置；绝对性能结论；正确性 |
 | NixOS VM | 按 `HACKING.md` 运行 `nix run .#checks.<system>.<test-name>.driver`，全部用 `nix flake check` | Nix，手动执行 | `nix/tests.nix` 定义的 GUI 与集成场景 | 非 NixOS 环境 |
 | 上游 lint | 按 `HACKING.md`「Linting」一节运行 prettier、alejandra、shellcheck、swiftlint | 对应工具，本机均未安装 | 文档、Nix、shell、Swift 符合上游 lint 规则 | fork CI 不跑这些检查；没实际跑过就不能声称通过 |
@@ -49,7 +57,7 @@
 
 做法：
 
-1. 构建：`just build`；看性能或发布形态时用 `-Doptimize=ReleaseFast`，或解压 `just package-windows` 的便携 zip。
+1. 构建：`just build`；看性能或发布形态时用 `-Doptimize=fast`，或解压 `just package-windows` 的便携 zip。
 2. 隔离：把 `LOCALAPPDATA` 与 `XDG_CONFIG_HOME` 都指向 `.local/evidence/<任务>/env/<场景>`，配置写在其下的 `ghostty\config.ghostty`，日志落在 `ghostty\logs\ghostty.log`，不读写用户真实的配置与日志。隔离后，只装在真实 `%LOCALAPPDATA%\Programs` 下、不在 `PATH` 上的 GX Zsh 探测不到，默认 shell 会退到 PowerShell，需要时在配置里写 `command`。agent 的 shell 常带 `NO_COLOR=1`，启动前去掉它，否则 pwsh 等不输出颜色与粗斜体。`just win-gui` 自动做这些隔离。
 3. 操作：优先用 `just win-gui`（见下文）回放场景或逐条发命令；临时探查也可用其他桌面自动化（如 kimi-cu 对 `GhosttyWindow` 的截图、点击与按键），或 PowerShell 的 `CopyFromScreen` 截图脚本。执行要验证的操作：点击、按键、输入法输入、拖动改尺寸、切换语言或主题等。
 4. 截图与读图：在每个要证明的状态截图，图片存到 `.local/evidence/<任务>/`（gitignored，不入库），逐张打开读图、对照预期写结论；同时读日志里相关的行（如 `loaded OpenGL … software=`、`ConPTY: …`、确认与菜单的日志）。结论写明提交、构建类型、Windows 版本号、显示缩放、显卡或 Mesa（日志里的 `renderer=` 与 `software=`）。
@@ -151,8 +159,8 @@ C7 将发现、索引展开及预绑定放在窗口外，保存 `pdh-prepare.jso
 
 - **样本**：`src/gx/perf.zig::record` 只写微秒时间 `info(gx_perf): <指标> <值>us`；解析器兼容 ns、ms、s 的历史时间行。计数必须另用无单位的 `metric <名> <值>`，同名 time/count 冲突拒绝。另收集 `metric <名> <值> [s|ms|us]`、Debug 的 `window shown after <n>ms`、`gx_win_gui.py` 的 `startup_ms`，以及 Windows 时间戳日志里的首次 OpenGL 探测、配置、字体、子进程与渲染上下文里程碑。时间换算为毫秒，p90 取最近秩；递归路径归一去重，父子目录重叠不会增加 n，跳过隔离配置目录中的日志原件。普通 `summarize` 仍可汇总任意指标，但不是性能通过门。
 - **Windows**：`just perf win32 --exe <旧> --exe <新> --out <目录> [--runs 10] [--resizes 6] [--env 名=值]`。每个构建一个隔离配置，先跑一轮丢弃的预热，此后都是热启动；两个构建按 A B、B A 交替，让机器状态的漂移同时作用于两边。每轮记录进程创建到主窗口创建、可见、取消 cloak 的时间（`startup.created`、`startup.visible`、`startup.shown`，1 ms 轮询），Ctrl+Shift+T 与 Ctrl+Shift+O 到新终端子窗口可见的时间（`new_tab.terminal_visible`、`split.terminal_visible`），`SetWindowPos` 改尺寸的同步耗时（`resize.setwindowpos`），以及窗口是否仍响应消息。每轮写 `<目录>/<标签>/run-NN.txt` 与日志副本，最后写 `SUMMARY.txt`。
-- **GTK**：先 `just wsl build --gtk -Doptimize=ReleaseFast`，再 `just perf gtk --clone <克隆> [--clone <克隆>] --out <新目录> [--runs 10] [--env 名=值]`。GTK 没有自动预热；默认 AB/BA 各 10 轮，每轮都是新的私有配置和 Xvfb 会话。正常负载仍是 `seq 1 3000000`，不缩样本、不补跑失败轮。窗口出现及 done 文件都每 50 ms 轮询；新采集的 elapsed 与超时都使用 monotonic，elapsed 按原始 `monotonic_ns` 整数差转秒，realtime 仅作溯源；CPU 窗口含结束后的 1 秒排空尾巴，不是与 workload_seconds 完全相同的区间。DMABUF 警告按匹配行计数，一行多个关键词只计一次。`llvmpipe-N` 合组，实际出现但未耗 CPU 的线程组仍记零；缺失不补零。
-- **GTK 有效性**：实际 held exe 的 `+version` 验证 ReleaseFast，普通非 perf GUI smoke 仍可用 Debug。性能前先精确提交源树，经正常 `just wsl build --gtk -Doptimize=ReleaseFast` 生成 `.local/gx-wsl/gtk-build-receipt.json`（`gx-gtk-build-v1`）：构建 argv/退出、构建前后 commit/tree/dirty、实际 exe SHA/版本。argv 按钉版 Zig 0.16 `lib/compiler/build_runner.zig` 的选项消耗方式分类：默认目标或唯一 `install` 才能签收；允许 `--summary all`、`--color off` 等已登记带值选项及 `-j4`。该版本 `-j 4` 实测为 InvalidCharacter，不替使用者偷偷改写。`gx_wsl.py --help` 显示工具帮助，`gx_wsl.py build --help/-h` 则进入正常 Zig query，不被子命令 argparse 提前截走。help/list、test/custom step、`--`、prefix/target/emit、skip-oom 或未知 flag 都不签收性能；普通命令仍透传 Zig 输出/退出，即使查询退出 0，receipt 也只有 ineligible attempt，不探测旧映像。脏树、源树变化及不符的 version override 同样拒绝；不能手写 receipt 代 build。smoke 与 collector 交叉核对 receipt、实际映像身份、原始 version/version_exit、干净源树及 cleanup/child_exit。正常受控 pidfd SIGTERM 后 child_exit 为 -15（或正常 0）允许，崩溃 -11 等拒绝。
+- **GTK**：先 `just wsl build --gtk -Doptimize=fast`，再 `just perf gtk --clone <克隆> [--clone <克隆>] --out <新目录> [--runs 10] [--env 名=值]`。GTK 没有自动预热；默认 AB/BA 各 10 轮，每轮都是新的私有配置和 Xvfb 会话。正常负载仍是 `seq 1 3000000`，不缩样本、不补跑失败轮。窗口出现及 done 文件都每 50 ms 轮询；新采集的 elapsed 与超时都使用 monotonic，elapsed 按原始 `monotonic_ns` 整数差转秒，realtime 仅作溯源；CPU 窗口含结束后的 1 秒排空尾巴，不是与 workload_seconds 完全相同的区间。DMABUF 警告按匹配行计数，一行多个关键词只计一次。`llvmpipe-N` 合组，实际出现但未耗 CPU 的线程组仍记零；缺失不补零。
+- **GTK 有效性**：实际 held exe 的 `+version` 验证 ReleaseFast，普通非 perf GUI smoke 仍可用 Debug。性能前先精确提交源树，经正常 `just wsl build --gtk -Doptimize=fast` 生成 `.local/gx-wsl/gtk-build-receipt.json`（`gx-gtk-build-v1`）：构建 argv/退出、构建前后 commit/tree/dirty、实际 exe SHA/版本。argv 按钉版 Zig 0.16 `lib/compiler/build_runner.zig` 的选项消耗方式分类：默认目标或唯一 `install` 才能签收；允许 `--summary all`、`--color off` 等已登记带值选项及 `-j4`。该版本 `-j 4` 实测为 InvalidCharacter，不替使用者偷偷改写。`gx_wsl.py --help` 显示工具帮助，`gx_wsl.py build --help/-h` 则进入正常 Zig query，不被子命令 argparse 提前截走。help/list、test/custom step、`--`、prefix/target/emit、skip-oom 或未知 flag 都不签收性能；普通命令仍透传 Zig 输出/退出，即使查询退出 0，receipt 也只有 ineligible attempt，不探测旧映像。脏树、源树变化及不符的 version override 同样拒绝；不能手写 receipt 代 build。smoke 与 collector 交叉核对 receipt、实际映像身份、原始 version/version_exit、干净源树及 cleanup/child_exit。正常受控 pidfd SIGTERM 后 child_exit 为 -15（或正常 0）允许，崩溃 -11 等拒绝。
 - **进程与线程**：启动、采样前后、xdotool、清理核对 PID/字段 22/实际 exe；持有未回收直接 Popen child 与 pidfd，信号只发受控 pidfd。pidfd 不可用启动前拒绝；打开失败只清自己的未回收 child。端点 TID/字段 22、统计完整性、负增量、main/renderer、负载/退出继续严格守门；两端相同不证明窗口内没有线程出生/退出。
 - **CPU 观测与诊断**：每个端点用 `/proc/<pid>/stat` 前后夹住 task 遍历，保存原始 stat 与 monotonic ns 的读序/持续时间。`cpu.total` 取进程 post_stat 的累计 tick 增量（真实短线程试验证实包含已退出线程）；`cpu.endpoint_threads` 与各组是端点仍存活线程的量化计数，不保证相加等于进程 total。旧样本进程 1611 与端点 1571、残差 U/S=16/24、候选界 284 仅是观测，不证明 Linux adjusted CPU counters 的舍入逻辑满足 `n_before+n_after+2`。该公式及夹读增长只保留为 `diagnostic_only` 的候选界，明确 proof=unproved；不再用 `comparable=True`、超界或 50 ms 候选预算决定样本有效性，也不把残差说成精确 transient CPU/未归属区间。source identity、稳定 TID birth、完整 workload、计数非负和合法读序仍 fail-closed。比较仅在相同声明时钟/负载/环境及完整计划下统计这些观测 tick，不保证全人口、精确计量或优化收益。零组与原 comm 保存，token 碰撞拒绝。
 - **证据合同**：新采集保存 `*-meta.json`（`gx-gtk-perf-v2`，`clock_schema=gx-gtk-monotonic-ns-v1`、`clock_unit=ns`）、唯一 capture_id、raw tasks/process/status/times、build receipt、退出/finished、身份检查点、实际软件相关环境与制品哈希；collector 从 raw 重算对账与 metric，不只信 valid/errors。同名前缀在排他锁内复查，复制使用独占创建，冲突非零且保留未复制 raw。GTK out 必须新/空；`gtk-runs.json` 核对唯一 `(label,run,path)`、完整 canonical AB/BA 顺序、路径不逃出 owned out、不经 symlink、每轮实际 manifest SHA 和唯一 capture。`RESULT.json` 保留原 planned_runs 与失败原因，不补跑缩 n。渲染日志保留，但 Xvfb/Mesa/env 不证明 EGL/硬件/CPU fallback，未知为 unknown。
@@ -174,6 +182,12 @@ C7 将发现、索引展开及预绑定放在窗口外，保存 `pdh-prepare.jso
 | `log.renderer_context` | 251.0 / 266.0 | 303.5 / 321.0 |
 
 同日 GTK（WSL Ubuntu 24.04 的 Xvfb，ReleaseFast，10 轮，中位数 / p90）：窗口出现 497 / 552 ms；负载墙钟 3152 / 3250 ms；负载期间 CPU 时间 main 635 / 660 ms、renderer 1060 / 1080 ms、io-reader 320 / 330 ms、io-gather 1355 / 1400 ms、llvmpipe 14.1 / 14.4 s；DMABUF 警告约 620 条（当时日志报告导出失败与 CPU 呈现）。这组历史 GTK 数字没有当前进程/线程身份合同，按 unverified 保留参考，不补认成新性能门证据。
+
+## 本次工具链迁移验证
+
+2026-10-21：Windows 主套件 5308 通过、75 跳过；Windows VT 两套合计 6822 通过、66 跳过；Ubuntu 24.04 的 GTK 主套件在 Xvfb 中 4688 通过、59 跳过。Windows W01/W03/W17/W19 已执行并读回 22 张截图；GTK G02/G05 截图由同轮视觉检查验收。快速门首轮实际墙钟 33.28 秒（编译独立），最终连续三次结果以本轮证据记录为准，不能据此承诺任意硬件/负载都成功。
+
+`just wsl test --gtk` 自动使用 Xvfb、X11 与软件 GL，避免依赖当前 WSLg 的 GPU 状态。普通 POSIX 与 VT 测试不启动显示服务。Zig 0.17 预取的缓存归档可能多套一层根目录；WSL 预取器在隔离缓存重算并精确核对原包哈希后原子修复，哈希声明不变。
 
 ## 并行运行器与耗时
 

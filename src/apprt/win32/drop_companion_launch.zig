@@ -139,8 +139,8 @@ pub fn acceptableChildToken(elevated: u32, integrity_rid: u32) bool {
 pub fn buildCommandLine(alloc: std.mem.Allocator, exe: []const u8, pid: u32, birth: u64) ![:0]u16 {
     var pid_buf: [64]u8 = undefined;
     var birth_buf: [64]u8 = undefined;
-    const pid_arg = try std.fmt.bufPrint(&pid_buf, "--gx-drop-target-pid={d}", .{pid});
-    const birth_arg = try std.fmt.bufPrint(&birth_buf, "--gx-drop-target-birth={d}", .{birth});
+    const pid_arg = try std.mem.print(&pid_buf, "--gx-drop-target-pid={d}", .{pid});
+    const birth_arg = try std.mem.print(&birth_buf, "--gx-drop-target-birth={d}", .{birth});
     return windows_argv.encode(alloc, &.{
         exe,
         Identity.action_switch ++ "drop-companion",
@@ -409,7 +409,7 @@ test "only the shell token of this elevated token's own logon pair is trusted" {
 }
 
 test "companion command line round-trips the launching identity through parseStartup" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
     const exe = "C:\\Program Files\\Ghostty GX\\ghostty.exe";
     const command = try buildCommandLine(testing.allocator, exe, 4242, 133_000_000_000_000_001);

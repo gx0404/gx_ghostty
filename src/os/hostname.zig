@@ -92,7 +92,7 @@ test "isLocal returns true for an empty hostname" {
 }
 
 test "isLocal ignores case on Windows" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
     const windows = @import("windows.zig");
     var buf: [256:0]u8 = undefined;
     var nSize: windows.DWORD = buf.len;

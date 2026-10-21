@@ -170,9 +170,9 @@ pub fn format(
             continue;
         }
 
-        inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |field| {
-            if (std.mem.eql(u8, name, field.name)) {
-                try writeValue(writer, @field(args, field.name));
+        inline for (@typeInfo(@TypeOf(args)).@"struct".field_names) |field| {
+            if (std.mem.eql(u8, name, field)) {
+                try writeValue(writer, @field(args, field));
                 rest = rest[close + 1 ..];
                 continue :outer;
             }
@@ -272,7 +272,7 @@ test "parseLanguage rejects unsupported languages" {
         "zhx",
         "-en",
         ".UTF-8",
-        "en" ** 40,
+        std.mem.asBytes(&@as([40]["en".len]u8, @splat("en".*))),
     }) |value| {
         try testing.expectEqual(@as(?Language, null), parseLanguage(value));
     }
@@ -331,7 +331,7 @@ test "trRuntime looks up runtime msgids" {
     defer setCurrent(saved);
 
     var buf: [32]u8 = undefined;
-    const msgid = try std.fmt.bufPrintSentinel(&buf, "{s} {s}", .{ "Close", "Tab" }, 0);
+    const msgid = try std.mem.printSentinel(&buf, "{s} {s}", .{ "Close", "Tab" }, 0);
 
     setCurrent(.zh_CN);
     try testing.expectEqualStrings("关闭标签页", trRuntime(msgid));

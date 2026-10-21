@@ -168,7 +168,7 @@ fn logFn(
 
     // fork(gx): GX-0003 begin: the win32 GUI app has no console, so also log to a file
     if (comptime build_config.app_runtime == .win32 and
-        (builtin.mode == .Debug or level != .debug))
+        (builtin.mode == .debug or level != .debug))
     {
         apprt.win32.file_log.write(level, scope, format, args);
     }

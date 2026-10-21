@@ -334,6 +334,12 @@ pub fn init(
     const hinstance = w32.GetModuleHandleW(null) orelse
         return error.Win32Error;
 
+    // Start the probe while configuration and native UI initialize. The core
+    // app owns the device and releases it after all surfaces are gone.
+    if (core_app.device == null) {
+        core_app.device = try @import("../../renderer.zig").Device.init(core_app.alloc, .{});
+    }
+
     // The Ghostty GX defaults give a window material a background opacity
     // only where the material can show behind the terminals, which the
     // OpenGL device decides once its probe is done (`settleDevice`); until
@@ -667,11 +673,12 @@ fn expectAlphaFrames(alloc: Allocator) bool {
 /// creating any surface or taking renderer locks. Reports missing OpenGL;
 /// returns true when the window must be rebuilt with the settled opacity.
 fn settleDevice(self: *App) !bool {
-    self.core_app.device.wait() catch |err| {
+    const device = self.core_app.device.?;
+    device.wait() catch |err| {
         reportOpenGLUnavailable();
         return err;
     };
-    const supported = Backdrop.alphaFramesSupported(&self.core_app.device);
+    const supported = Backdrop.alphaFramesSupported(device);
     if (supported == self.alpha_frames) return false;
     log.info("per-pixel translucency={} unlike guessed, loading the configuration again", .{supported});
     self.alpha_frames = supported;
@@ -1350,7 +1357,7 @@ fn syncColorScheme(self: *App) void {
 pub const SimulatedSystemTheme = packed struct(usize) {
     scheme: enum(u2) { system = 0, light = 1, dark = 2, _ } = .system,
     high_contrast: enum(u2) { system = 0, on = 1, off = 2, _ } = .system,
-    reserved: std.meta.Int(.unsigned, @bitSizeOf(usize) - 4) = 0,
+    reserved: @Int(.unsigned, @bitSizeOf(usize) - 4) = 0,
 };
 
 /// Test hook (`Window.WM_GHOSTTY_SIMULATE_SYSTEM_THEME`, GUI thread): act
@@ -2318,7 +2325,7 @@ pub fn performAction(
                         else
                             i18n.tr("Command finished");
                         var duration_buf: [32]u8 = undefined;
-                        const duration = std.fmt.bufPrint(
+                        const duration = std.mem.print(
                             &duration_buf,
                             "{f}",
                             .{value.duration.round(std.time.ns_per_ms)},
@@ -2514,7 +2521,7 @@ fn deferGx(self: *App, kind: DeferredGx, window: *Window) bool {
     const hwnd = self.msg_hwnd orelse return false;
     if (window.closing) return false;
     if (window.activePane() == null) return false;
-    return w32.PostMessageW(hwnd, WM_APP_DEFERRED_GX, @intFromEnum(kind), @bitCast(window.ui_reference.id)) != 0;
+    return w32.PostMessageW(hwnd, WM_APP_DEFERRED_GX, @backingInt(kind), @bitCast(window.ui_reference.id)) != 0;
 }
 
 /// Handle `WM_APP_DEFERRED_GX` (`deferGx`), if the terminal is still there.
@@ -3179,7 +3186,7 @@ fn holdOpaque(self: *App, config: *Config) void {
 
 fn setBackgroundOpacity(self: *App, config: *Config, opacity: f64) void {
     var buf: [64]u8 = undefined;
-    const arg = std.fmt.bufPrintZ(&buf, "--background-opacity={d}", .{opacity}) catch return;
+    const arg = std.mem.printSentinel(&buf, "--background-opacity={d}", .{opacity}, 0) catch return;
     gx.config_layers.applyArg(config, self.core_app.alloc, arg) catch |err| {
         log.err("error setting the background opacity err={}", .{err});
     };
@@ -3205,12 +3212,7 @@ fn openConfigInNewWindow(self: *App, path: [:0]const u8) !bool {
 
     // Windows paths cannot contain a double quote, so quoting the path is
     // sufficient while leaving editor arguments supplied by the user intact.
-    const command_text = try std.fmt.allocPrintSentinel(
-        alloc,
-        "{s} \"{s}\"",
-        .{ editor, path },
-        0,
-    );
+    const command_text = try alloc.printSentinel("{s} \"{s}\"", .{ editor, path }, 0);
     defer alloc.free(command_text);
     const command: configpkg.Command = .{ .shell = command_text };
 
@@ -3218,7 +3220,7 @@ fn openConfigInNewWindow(self: *App, path: [:0]const u8) !bool {
         .path = path,
     });
     defer alloc.free(title_text);
-    const title = try alloc.dupeZ(u8, title_text);
+    const title = try alloc.dupeSentinel(u8, title_text, 0);
     defer alloc.free(title);
 
     const window = try alloc.create(Window);
@@ -3662,7 +3664,7 @@ fn showKeySequence(surface: *Surface, value: apprt.action.KeySequence) void {
             surface.key_sequence_len += writer.buffered().len;
             var toast_buf: [160]u8 = undefined;
             const keys = surface.key_sequence[0..surface.key_sequence_len];
-            const toast_text = std.fmt.bufPrint(&toast_buf, "{s} \u{2026}", .{keys}) catch keys;
+            const toast_text = std.mem.print(&toast_buf, "{s} \u{2026}", .{keys}) catch keys;
             window.postToast(.{ .text = toast_text, .icon = d2d.icons.keyboard, .duration_ms = null, .owner = owner });
         },
         .end => {
@@ -3740,7 +3742,7 @@ fn copyTitle(self: *App, surface: *Surface) bool {
     }
     const title: []const u8 = if (override) |text| text else (surface.getTitle() orelse return false);
     if (title.len == 0) return false;
-    const text = alloc.dupeZ(u8, title) catch return false;
+    const text = alloc.dupeSentinel(u8, title, 0) catch return false;
     defer alloc.free(text);
     surface.setClipboard(.standard, &.{.{ .mime = "text/plain", .data = text }}, false) catch return false;
     return true;
@@ -5071,7 +5073,7 @@ test "D-29 a terminal HWND is its own named pane for an external UIA client" {
             try testing.expectEqual(@as(i32, 50033), probe.control_type);
             try testing.expectEqualStrings(i18n.tr("Terminal"), probe.localized[0..probe.localized_len]);
             var id_buffer: [64]u8 = undefined;
-            try testing.expectEqualStrings(try std.fmt.bufPrint(&id_buffer, "gx-terminal-{d}", .{surface.ui_reference.generation}), probe.automation_id[0..probe.automation_id_len]);
+            try testing.expectEqualStrings(try std.mem.print(&id_buffer, "gx-terminal-{d}", .{surface.ui_reference.generation}), probe.automation_id[0..probe.automation_id_len]);
             try testing.expectEqual(@as(i32, @bitCast(@as(u32, @truncate(@intFromPtr(child))))), probe.native);
             try testing.expectEqual(UiaClient.element_not_available, probe.after_destroy);
         }
@@ -5175,7 +5177,7 @@ test "D-29 a terminal HWND that gets the keyboard focus raises its focus event f
 
             const probe = try alloc.create(Probe);
             probe.* = .{ .child = child };
-            probe.id_len = (try std.fmt.bufPrint(&probe.id_buffer, "gx-terminal-{d}", .{surface.ui_reference.generation})).len;
+            probe.id_len = (try std.mem.print(&probe.id_buffer, "gx-terminal-{d}", .{surface.ui_reference.generation})).len;
             const thread = try std.Thread.spawn(.{}, Probe.client, .{probe});
             var joined = false;
             // After a timeout the client may still be inside UIA: it keeps its
@@ -5206,7 +5208,7 @@ test "D-29 a terminal HWND that gets the keyboard focus raises its focus event f
             if (!probe.watch.heard(probe.expected())) {
                 var wanted: [160]u8 = undefined;
                 var senders: [1024]u8 = undefined;
-                const want = try std.fmt.bufPrint(&wanted, "|{s}@0x{x} (parent 0x{x})", .{ probe.expected(), @intFromPtr(child) & 0xffffffff, @intFromPtr(parent) & 0xffffffff });
+                const want = try std.mem.print(&wanted, "|{s}@0x{x} (parent 0x{x})", .{ probe.expected(), @intFromPtr(child) & 0xffffffff, @intFromPtr(parent) & 0xffffffff });
                 try testing.expectEqualStrings(want, probe.watch.senders(&senders));
             }
         }

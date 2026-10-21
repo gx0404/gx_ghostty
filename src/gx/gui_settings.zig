@@ -232,14 +232,14 @@ fn validateValue(value: []const u8) Error!void {
 /// otherwise change it (surrounding whitespace or quotes). An empty value
 /// is written as `key =`, which resets the key to its default.
 fn formatLine(alloc: Allocator, key: []const u8, value: []const u8) Allocator.Error![]u8 {
-    if (value.len == 0) return try std.fmt.allocPrint(alloc, "{s} =", .{key});
+    if (value.len == 0) return try alloc.print("{s} =", .{key});
     const needs_quotes = std.mem.indexOfScalar(u8, whitespace, value[0]) != null or
         std.mem.indexOfScalar(u8, whitespace, value[value.len - 1]) != null or
         (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"');
     return if (needs_quotes)
-        try std.fmt.allocPrint(alloc, "{s} = \"{s}\"", .{ key, value })
+        try alloc.print("{s} = \"{s}\"", .{ key, value })
     else
-        try std.fmt.allocPrint(alloc, "{s} = {s}", .{ key, value });
+        try alloc.print("{s} = {s}", .{ key, value });
 }
 
 fn expectContent(overlay: *const Overlay, expected: []const u8) !void {
@@ -490,7 +490,7 @@ test "getAll missing or differently cased keys require no allocation" {
 }
 
 fn getAllAllocationScenario(alloc: Allocator) !void {
-    const source = "keybind = ctrl+a=copy_to_clipboard\n" ** 20;
+    const source = std.mem.asBytes(&@as([20]["keybind = ctrl+a=copy_to_clipboard\n".len]u8, @splat("keybind = ctrl+a=copy_to_clipboard\n".*)));
     var overlay = try Overlay.parse(std.testing.allocator, source);
     defer overlay.deinit();
     const values = overlay.getAll(alloc, "keybind") catch |err| {

@@ -24,12 +24,12 @@ pub fn discover(config: *fontconfig.Config, alloc: Allocator, library: font.Libr
     defer sorted.fs.destroy();
     var result: mapped.Batch = .{};
     errdefer result.deinit(alloc);
-    if (family) |locked| result.family = try alloc.dupeZ(u8, locked);
+    if (family) |locked| result.family = try alloc.dupeSentinel(u8, locked, 0);
     var base_traits: ?mapped.Traits = null;
     for (sorted.fs.fonts()) |raw| {
         const metadata = (try rawMetadata(raw)) orelse continue;
         if (result.family == null) {
-            result.family = try alloc.dupeZ(u8, metadata.family);
+            result.family = try alloc.dupeSentinel(u8, metadata.family, 0);
             base_traits = metadata.traits;
         }
         if (!try hasFamily(raw, result.family.?)) continue;
@@ -81,11 +81,11 @@ fn rawMetadata(pattern: *fontconfig.Pattern) !?RawMetadata {
     const index = pattern.get(.index, 0) catch |err| return if (err == error.OutOfMemory) err else null;
     if (family != .string or family.string.len == 0 or file != .string or file.string.len == 0 or index != .integer or index.integer < 0 or slant != .integer) return null;
     const bold = switch (weight) {
-        .integer => weight.integer >= @intFromEnum(fontconfig.Weight.demibold),
-        .double => weight.double >= @as(f64, @floatFromInt(@intFromEnum(fontconfig.Weight.demibold))),
+        .integer => weight.integer >= @backingInt(fontconfig.Weight.demibold),
+        .double => weight.double >= @as(f64, @floatFromInt(@backingInt(fontconfig.Weight.demibold))),
         else => return null,
     };
-    return .{ .family = family.string, .file = file.string, .index = index.integer, .traits = .{ .bold = bold, .italic = slant.integer != @intFromEnum(fontconfig.Slant.roman) } };
+    return .{ .family = family.string, .file = file.string, .index = index.integer, .traits = .{ .bold = bold, .italic = slant.integer != @backingInt(fontconfig.Slant.roman) } };
 }
 
 fn hasFamily(pattern: *fontconfig.Pattern, family: []const u8) !bool {
@@ -116,8 +116,8 @@ test "gx.font_codepoint_map: Fontconfig raw metadata rejects regular and foreign
     try testing.expect(raw.add(.family, .{ .string = "Fixture" }, false));
     try testing.expect(raw.add(.file, .{ .string = "regular.ttf" }, false));
     try testing.expect(raw.add(.index, .{ .integer = 0 }, false));
-    try testing.expect(raw.add(.weight, .{ .integer = @intFromEnum(fontconfig.Weight.regular) }, false));
-    try testing.expect(raw.add(.slant, .{ .integer = @intFromEnum(fontconfig.Slant.roman) }, false));
+    try testing.expect(raw.add(.weight, .{ .integer = @backingInt(fontconfig.Weight.regular) }, false));
+    try testing.expect(raw.add(.slant, .{ .integer = @backingInt(fontconfig.Slant.roman) }, false));
     try testing.expect(!(try rawMetadata(raw)).?.traits.bold);
     try testing.expect(!try hasFamily(raw, "Other"));
     try testing.expect(raw.add(.family, .{ .string = "本地族名" }, true));
@@ -147,7 +147,7 @@ test "gx.font_codepoint_map: isolated Fontconfig four embedded faces alias and m
         try testing.expect(fontconfig.c.FcConfigParseAndLoadFromMemory(config.cval(), alias, 1) != 0);
         for ([_]usize{ 4, 0, 1, 2, 3 }) |i| {
             if (i != 4 and mask & (@as(u4, 1) << @intCast(i)) == 0) continue;
-            const path = try std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ root, names[i] }, 0);
+            const path = try alloc.printSentinel("{s}/{s}", .{ root, names[i] }, 0);
             defer alloc.free(path);
             try testing.expect(fontconfig.c.FcConfigAppFontAddFile(config.cval(), path) != 0);
         }
@@ -196,7 +196,7 @@ test "gx.font_codepoint_map: Fontconfig variable named instances keep file index
     defer config.destroy();
     for ([_][]const u8{ "variable.ttf", "variable-italic.ttf" }, [_][:0]const u8{ font.embedded.variable, font.embedded.variable_italic }) |name, bytes| {
         try tmp.dir.writeFile(testing.io, .{ .sub_path = name, .data = bytes });
-        const path = try std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ root, name }, 0);
+        const path = try alloc.printSentinel("{s}/{s}", .{ root, name }, 0);
         defer alloc.free(path);
         try testing.expect(fontconfig.c.FcConfigAppFontAddFile(config.cval(), path) != 0);
     }
@@ -223,7 +223,7 @@ test "gx.font_codepoint_map: Fontconfig variable named instances keep file index
 
 fn addFixtureFile(config: *fontconfig.Config, alloc: Allocator, directory: std.Io.Dir, root: []const u8, name: []const u8, bytes: [:0]const u8) !void {
     try directory.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
-    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/{s}", .{ root, name }, 0);
+    const path = try alloc.printSentinel("{s}/{s}", .{ root, name }, 0);
     defer alloc.free(path);
     try std.testing.expect(fontconfig.c.FcConfigAppFontAddFile(config.cval(), path) != 0);
 }
@@ -250,8 +250,8 @@ test "gx.font_codepoint_map: Fontconfig foreign real bold sorts first but target
             const index = (try pattern.get(.index, 0)).integer;
             const weight = try pattern.get(.weight, 0);
             const regular_weight = switch (weight) {
-                .integer => weight.integer == @intFromEnum(fontconfig.Weight.regular),
-                .double => weight.double == @as(f64, @floatFromInt(@intFromEnum(fontconfig.Weight.regular))),
+                .integer => weight.integer == @backingInt(fontconfig.Weight.regular),
+                .double => weight.double == @as(f64, @floatFromInt(@backingInt(fontconfig.Weight.regular))),
                 else => false,
             };
             if (index != 0 or !regular_weight) {

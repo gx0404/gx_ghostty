@@ -32,17 +32,17 @@ SCRIPT = SCRIPTS / "ci_cache.py"
 class MetadataTests(unittest.TestCase):
     def test_zig_env_selects_only_top_level_whitelisted_fields(self):
         expected = {"zig_exe": r"C:\tools\zig.exe", "lib_dir": r"C:\tools\lib",
-                    "version": "0.16.0", "global_cache_dir": r"C:\cache"}
+                    "version": "0.17.0", "global_cache_dir": r"C:\cache"}
         lines = [f"    .{key} = {json.dumps(value)}," for key, value in expected.items()]
         lines += ['    .env = .{', '        .SECRET = "do-not-report",', '    },']
         self.assertEqual(ci_cache.parse_zig_env(".{\r\n" + "\r\n".join(lines) + "\r\n}"), expected)
         with self.assertRaises(ValueError):
-            ci_cache.parse_zig_env('.{ .version = "0.16.0" }')
+            ci_cache.parse_zig_env('.{ .version = "0.17.0" }')
 
     def test_zig_info_uses_wrapper_environment_and_normalizes_relative_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fields = {"zig_exe": "tools/zig", "lib_dir": "tools/lib", "version": "0.16.0",
+            fields = {"zig_exe": "tools/zig", "lib_dir": "tools/lib", "version": "0.17.0",
                       "global_cache_dir": "cache"}
             output = ".{\n" + "\n".join(f"    .{key} = {json.dumps(value)}," for key, value in fields.items()) + "\n}"
             with mock.patch.object(zigw, "require_zig", return_value=zigw.ResolvedZig("zig", "PATH")), \
@@ -133,7 +133,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(result["ghostty-test"]["status"], "missing")
 
     def test_snapshot_deduplicates_cache_paths_and_fails_incomplete_evidence(self):
-        zig = {"exe": "zig", "lib": "lib", "version": "0.16.0", "global_cache": str(self.root),
+        zig = {"exe": "zig", "lib": "lib", "version": "0.17.0", "global_cache": str(self.root),
                "local_cache": str(self.root)}
         with mock.patch.object(ci_cache, "zig_info", return_value=zig), \
                 mock.patch.object(ci_cache, "cpu_info", return_value={"model": "test"}), \

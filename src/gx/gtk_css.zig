@@ -330,8 +330,8 @@ pub fn linkColor(colors: Colors) Color {
 pub fn write(writer: *std.Io.Writer, colors: Colors) std.Io.Writer.Error!void {
     const named: Named = .fromColors(colors);
     try writer.writeAll("/* Ghostty GX colors derived from the terminal theme */\n");
-    inline for (@typeInfo(Named).@"struct".fields) |field| {
-        try writer.print("@define-color " ++ field.name ++ " {f};\n", .{css(@field(named, field.name))});
+    inline for (@typeInfo(Named).@"struct".field_names) |field| {
+        try writer.print("@define-color " ++ field ++ " {f};\n", .{css(@field(named, field))});
     }
 
     const bars = colors.chrome;
@@ -540,8 +540,8 @@ fn writeTint(
 pub fn writeVariables416(writer: *std.Io.Writer, colors: Colors) std.Io.Writer.Error!void {
     const named: Named = .fromColors(colors);
     try writer.writeAll(":root,\nwindow {\n");
-    inline for (@typeInfo(Named).@"struct".fields) |field| {
-        try writer.print("  --" ++ comptime dashed(field.name) ++ ": {f};\n", .{css(@field(named, field.name))});
+    inline for (@typeInfo(Named).@"struct".field_names) |field| {
+        try writer.print("  --" ++ comptime dashed(field) ++ ": {f};\n", .{css(@field(named, field))});
     }
     try writer.writeAll("}\n");
 }
@@ -666,7 +666,7 @@ test "the selected tab stands out of the strip" {
     const out = try written(plain, false);
     defer testing.allocator.free(out);
     var buf: [128]u8 = undefined;
-    try testing.expect(has(out, try std.fmt.bufPrint(&buf, "tabbox:not(.single-tab) tab:selected {{\n  background-color: {f};", .{css(selected)})));
+    try testing.expect(has(out, try std.mem.print(&buf, "tabbox:not(.single-tab) tab:selected {{\n  background-color: {f};", .{css(selected)})));
 
     // A foreground as dark as the background still gets a visible tab.
     config.foreground = config.background;
@@ -751,9 +751,9 @@ test "the bars are frosted only over a blurred translucent background" {
     var buf: [128]u8 = undefined;
     // The bars and the selected tab let the blur through; the tab being
     // dragged, a window of its own, stays opaque.
-    try testing.expect(has(out, try std.fmt.bufPrint(&buf, ".bottom-bar {{\n  background-color: rgba({d},{d},{d},0.90);", .{ strip.r, strip.g, strip.b })));
+    try testing.expect(has(out, try std.mem.print(&buf, ".bottom-bar {{\n  background-color: rgba({d},{d},{d},0.90);", .{ strip.r, strip.g, strip.b })));
     try testing.expect(has(out, "tab:selected {\n  background-color: rgba(31,31,40,0.90);"));
-    try testing.expect(has(out, try std.fmt.bufPrint(&buf, "dnd tab {{\n  background-color: rgb({d},{d},{d});", .{ strip.r, strip.g, strip.b })));
+    try testing.expect(has(out, try std.mem.print(&buf, "dnd tab {{\n  background-color: rgb({d},{d},{d});", .{ strip.r, strip.g, strip.b })));
 }
 
 test "frosted popovers retain an opacity floor and leave dialog headers opaque" {
@@ -779,8 +779,8 @@ test "frosted popovers retain an opacity floor and leave dialog headers opaque" 
         const variables = try written(colors, true);
         defer testing.allocator.free(variables);
         var buf: [128]u8 = undefined;
-        try testing.expect(has(out, try std.fmt.bufPrint(&buf, "@define-color popover_bg_color {f};\n", .{css(named.popover_bg_color)})));
-        try testing.expect(has(variables, try std.fmt.bufPrint(&buf, "  --popover-bg-color: {f};\n", .{css(named.popover_bg_color)})));
+        try testing.expect(has(out, try std.mem.print(&buf, "@define-color popover_bg_color {f};\n", .{css(named.popover_bg_color)})));
+        try testing.expect(has(variables, try std.mem.print(&buf, "  --popover-bg-color: {f};\n", .{css(named.popover_bg_color)})));
     }
 }
 
@@ -806,13 +806,13 @@ test "write scopes the window chrome to gx-chrome and parses on GTK 4.14" {
     try testing.expect(has(out, "@define-color accent_bg_color rgb(137,180,250);\n"));
     try testing.expect(has(out, "@define-color accent_fg_color rgb(0,0,0);\n"));
     for ([_][]const u8{ "window_bg_color", "popover_bg_color", "headerbar_bg_color", "dialog_bg_color" }) |name| {
-        try testing.expect(has(out, try std.fmt.bufPrint(&buf, "@define-color {s} {f};\n", .{ name, css(colors.tokens.surface_raised) })));
+        try testing.expect(has(out, try std.mem.print(&buf, "@define-color {s} {f};\n", .{ name, css(colors.tokens.surface_raised) })));
     }
-    try testing.expect(has(out, try std.fmt.bufPrint(&buf, "@define-color card_bg_color {f};\n", .{css(colors.tokens.surface)})));
+    try testing.expect(has(out, try std.mem.print(&buf, "@define-color card_bg_color {f};\n", .{css(colors.tokens.surface)})));
 
-    const bar = try std.fmt.bufPrint(&buf, "toolbarview.gx-chrome > .bottom-bar {{\n  background-color: {f};\n  color: rgb(255,255,255);\n}}", .{css(colors.chrome.title_bar)});
+    const bar = try std.mem.print(&buf, "toolbarview.gx-chrome > .bottom-bar {{\n  background-color: {f};\n  color: rgb(255,255,255);\n}}", .{css(colors.chrome.title_bar)});
     try testing.expect(has(out, bar));
-    const dragged = try std.fmt.bufPrint(&buf, "dnd tab {{\n  background-color: {f};\n  color: rgb(255,255,255);\n}}", .{css(colors.chrome.title_bar)});
+    const dragged = try std.mem.print(&buf, "dnd tab {{\n  background-color: {f};\n  color: rgb(255,255,255);\n}}", .{css(colors.chrome.title_bar)});
     try testing.expect(has(out, dragged));
     // The selected tab joins the terminal; hover and press are overlays,
     // pressed fainter than hovered; a single tab draws nothing.
@@ -863,14 +863,14 @@ test "writeVariables416 writes the same colors as libadwaita variables" {
     try testing.expect(has(out, "  --window-bg-color: rgb(53,53,62);\n"));
     try testing.expect(has(out, "  --secondary-sidebar-backdrop-color: "));
     try testing.expect(!has(out, "_color"));
-    try testing.expectEqual(@typeInfo(Named).@"struct".fields.len, std.mem.count(u8, out, "\n  --"));
+    try testing.expectEqual(@typeInfo(Named).@"struct".field_names.len, std.mem.count(u8, out, "\n  --"));
     try testing.expectEqualStrings("window-bg-color", comptime dashed("window_bg_color"));
 }
 
 test "Css formats opaque and translucent colors" {
     var buf: [64]u8 = undefined;
-    try testing.expectEqualStrings("rgb(137,180,250)", try std.fmt.bufPrint(&buf, "{f}", .{css(Color.hex(0x89b4fa))}));
-    try testing.expectEqualStrings("rgba(255,255,255,0.08)", try std.fmt.bufPrint(&buf, "{f}", .{css(Color.white.withAlpha(0.08))}));
+    try testing.expectEqualStrings("rgb(137,180,250)", try std.mem.print(&buf, "{f}", .{css(Color.hex(0x89b4fa))}));
+    try testing.expectEqualStrings("rgba(255,255,255,0.08)", try std.mem.print(&buf, "{f}", .{css(Color.white.withAlpha(0.08))}));
 }
 
 fn gxLatteConfig() !Config {
@@ -908,7 +908,7 @@ fn ruleBody(out: []const u8, selectors: []const u8) ?[]const u8 {
 fn declared(body: []const u8, property: []const u8, buf: []u8) ![]const u8 {
     const at = std.mem.indexOf(u8, body, property) orelse return error.TestUnexpectedResult;
     const end = std.mem.indexOfScalarPos(u8, body, at, ';') orelse return error.TestUnexpectedResult;
-    return std.fmt.bufPrint(buf, "{s}", .{body[at + property.len .. end]});
+    return std.mem.print(buf, "{s}", .{body[at + property.len .. end]});
 }
 
 test "the signature bar marks the selected tab at 3:1 in every state" {
@@ -984,7 +984,7 @@ test "the terminal overlays take the interface tokens" {
         \\toolbarview.gx-chrome .key-state-overlay,
         \\toolbarview.gx-chrome label.resize-overlay
     ) orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "  background-color: {f};\n  color: {f};\n  outline-color: {f};\n", .{
+    try testing.expectEqualStrings(try std.mem.print(&buf, "  background-color: {f};\n  color: {f};\n  outline-color: {f};\n", .{
         css(t.surface_raised), css(t.text), css(t.border),
     }), overlays);
     // Light themes lift the overlay surface toward white.
@@ -992,14 +992,14 @@ test "the terminal overlays take the interface tokens" {
 
     var color: [64]u8 = undefined;
     const bell = ruleBody(out, "toolbarview.gx-chrome .surface .bell-overlay") orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{f}", .{css(t.caution.withAlpha(overlay_tint_opacity))}), try declared(bell, "border-color: ", &color));
+    try testing.expectEqualStrings(try std.mem.print(&buf, "{f}", .{css(t.caution.withAlpha(overlay_tint_opacity))}), try declared(bell, "border-color: ", &color));
     try testing.expect(!has(bell, "border-width"));
     const exited = ruleBody(out, "toolbarview.gx-chrome .child-exited.normal revealer widget") orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{f}", .{css(t.success.withAlpha(0.5))}), try declared(exited, "background-color: ", &color));
+    try testing.expectEqualStrings(try std.mem.print(&buf, "{f}", .{css(t.success.withAlpha(0.5))}), try declared(exited, "background-color: ", &color));
     const failed = ruleBody(out, "toolbarview.gx-chrome .child-exited.abnormal revealer widget") orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{f}", .{css(t.critical.withAlpha(0.5))}), try declared(failed, "background-color: ", &color));
+    try testing.expectEqualStrings(try std.mem.print(&buf, "{f}", .{css(t.critical.withAlpha(0.5))}), try declared(failed, "background-color: ", &color));
     const progress = ruleBody(out, "toolbarview.gx-chrome .surface progressbar.error trough progress") orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{f}", .{css(t.critical)}), try declared(progress, "background-color: ", &color));
+    try testing.expectEqualStrings(try std.mem.print(&buf, "{f}", .{css(t.critical)}), try declared(progress, "background-color: ", &color));
     // Upstream's fixed gray outline and colors are gone from the GX output.
     try testing.expect(!has(out, "#555555"));
     try testing.expect(!has(out, "rgba(192,28,40"));
@@ -1023,16 +1023,16 @@ test "links keep 4.5:1, banners and badges stay neutral" {
             const out = try written(colors, false);
             defer testing.allocator.free(out);
             var buf: [128]u8 = undefined;
-            try testing.expect(has(out, try std.fmt.bufPrint(&buf, ".gx-dialog button.link > label {{\n  color: {f};", .{css(link)})));
+            try testing.expect(has(out, try std.mem.print(&buf, ".gx-dialog button.link > label {{\n  color: {f};", .{css(link)})));
             try testing.expect(has(out, "toolbarview.gx-chrome *:link,\ntoolbarview.gx-chrome *:visited,"));
             const banner = ruleBody(out, ".gx-dialog banner > revealer > widget") orelse return error.TestUnexpectedResult;
-            try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "  background-color: {f};\n  color: {f};\n", .{ css(t.control_fill), css(t.text) }), banner);
+            try testing.expectEqualStrings(try std.mem.print(&buf, "  background-color: {f};\n  color: {f};\n", .{ css(t.control_fill), css(t.text) }), banner);
             // The badges use no accent or status color.
             const first = std.mem.indexOf(u8, out, ".gx-dialog .gx-badge") orelse return error.TestUnexpectedResult;
             const tints = std.mem.indexOfPos(u8, out, first, ".gx-superuser") orelse return error.TestUnexpectedResult;
             const badges = out[first..tints];
             for ([_]Color{ t.accent, t.accent_text, t.caution, t.success, t.critical }) |colorful| {
-                try testing.expect(!has(badges, try std.fmt.bufPrint(&buf, "{f};", .{css(colorful)})));
+                try testing.expect(!has(badges, try std.mem.print(&buf, "{f};", .{css(colorful)})));
             }
             try testing.expect(has(badges, ".gx-dialog .gx-badge.gx-mark:not(.gx-accent) {"));
         }

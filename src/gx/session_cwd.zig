@@ -96,9 +96,9 @@ test "guest cwd rejects traversal device paths credentials ports and malformed U
 
 test "guest cwd bounds decoded bytes without allocation on every platform" {
     var output: [max_path_bytes]u8 = undefined;
-    const exact = "file:///" ++ "a" ** (max_path_bytes - 1);
+    const exact = "file:///" ++ std.mem.asBytes(&@as([(max_path_bytes - 1)]["a".len]u8, @splat("a".*)));
     try std.testing.expectEqual(@as(usize, max_path_bytes), (try parse("wsl:Ubuntu", exact, true, &output)).?.path.len);
     try std.testing.expectError(error.TooLong, parse("wsl:Ubuntu", exact ++ "a", true, &output));
-    const oversized = "file:///" ++ "a" ** max_uri_bytes;
+    const oversized = "file:///" ++ std.mem.asBytes(&@as([max_uri_bytes]["a".len]u8, @splat("a".*)));
     try std.testing.expectError(error.TooLong, parse("wsl:Ubuntu", oversized, true, &output));
 }

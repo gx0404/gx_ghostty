@@ -210,7 +210,7 @@ test "bell audio PCM8 zero midpoint and unsigned extrema" {
 test "bell audio signed PCM16 PCM24 PCM32 boundaries and gains" {
     const alloc = std.testing.allocator;
     inline for (.{ @as(u16, 16), @as(u16, 24), @as(u16, 32) }) |bits| {
-        const T = std.meta.Int(.signed, bits);
+        const T = @Int(.signed, bits);
         var data: [6 * (bits / 8)]u8 = undefined;
         const values = [_]T{ std.math.minInt(T), std.math.maxInt(T), 0, 1 << (bits - 2), -(1 << (bits - 2)), -1 };
         for (values, 0..) |v, i| std.mem.writeInt(T, data[i * (bits / 8) ..][0 .. bits / 8], v, .little);
@@ -230,7 +230,7 @@ test "bell audio signed PCM16 PCM24 PCM32 boundaries and gains" {
 test "bell audio float gain precedes clipping and nonfinite is rejected" {
     const alloc = std.testing.allocator;
     inline for (.{ f32, f64 }) |T| {
-        const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const U = @Int(.unsigned, @bitSizeOf(T));
         var data: [5 * @sizeOf(T)]u8 = undefined;
         for ([_]T{ -1, 0, 0.5, 1, 1.5 }, 0..) |v, i|
             std.mem.writeInt(U, data[i * @sizeOf(T) ..][0..@sizeOf(T)], @bitCast(v), .little);

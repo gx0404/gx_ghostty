@@ -2073,12 +2073,12 @@ fn execCommand(
                             try alloc.dupe(u8, v)
                     else
                         try alloc.dupe(u8, v);
-                    try args.append(alloc, try alloc.dupeSentinel(u8, argv0), 0);
+                    try args.append(alloc, try alloc.dupeSentinel(u8, argv0, 0));
                 } else {
                     // fork(gx): GX-0005 Windows quoting rules instead of whitespace
                     var it = try windowsArgIterator(alloc, v);
                     while (it.next()) |tok| {
-                        try args.append(alloc, try alloc.dupeSentinel(u8, tok), 0);
+                        try args.append(alloc, try alloc.dupeSentinel(u8, tok, 0));
                     }
                 }
                 break :shell try args.toOwnedSlice(alloc);

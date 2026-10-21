@@ -148,7 +148,7 @@ pub fn encode(buffer: []u8, frame: Frame) Error![]u8 {
             break :value request.profile();
         },
         .acknowledgement => |outcome| value: {
-            outcome_byte[0] = @intFromEnum(outcome);
+            outcome_byte[0] = @backingInt(outcome);
             break :value &outcome_byte;
         },
     };
@@ -156,7 +156,7 @@ pub fn encode(buffer: []u8, frame: Frame) Error![]u8 {
     if (buffer.len < size) return error.BufferTooSmall;
     @memcpy(buffer[0..4], magic);
     std.mem.writeInt(u16, buffer[4..6], version, .little);
-    std.mem.writeInt(u16, buffer[6..8], @intFromEnum(kind), .little);
+    std.mem.writeInt(u16, buffer[6..8], @backingInt(kind), .little);
     std.mem.writeInt(u32, buffer[8..12], @intCast(payload.len), .little);
     std.mem.writeInt(u128, buffer[12..28], frame.key.sender_epoch, .little);
     std.mem.writeInt(u128, buffer[28..44], frame.key.host_epoch, .little);
@@ -196,7 +196,7 @@ test "gx.ipc.protocol rejects malformed header before body allocation" {
     buffer[4] = 1;
     buffer[6] = 0;
     try std.testing.expectError(error.InvalidKind, decode(bytes));
-    buffer[6] = @intFromEnum(Kind.new_window);
+    buffer[6] = @backingInt(Kind.new_window);
     std.mem.writeInt(u32, buffer[8..12], max_profile_bytes + 1, .little);
     try std.testing.expectError(error.InvalidLength, frameSize(bytes));
     std.mem.writeInt(u32, buffer[8..12], 0, .little);
@@ -212,7 +212,7 @@ test "gx.ipc.protocol rejects trailing bytes truncated text and control characte
     try std.testing.expectError(error.TrailingData, frameSize(bytes));
     for ([_][]const u8{ "custom:a\n", "custom:a\x00", "\xff", "\x7f" }) |invalid|
         try std.testing.expectError(error.InvalidProfile, validateProfile(invalid));
-    const too_long = [_]u8{'a'} ** (max_profile_bytes + 1);
+    const too_long = @as([(max_profile_bytes + 1)]u8, @splat('a'));
     try std.testing.expectError(error.InvalidProfile, validateProfile(&too_long));
     try std.testing.expectError(error.BufferTooSmall, encode(buffer[0..1], .{ .key = test_key, .message = .{ .request = .activate } }));
     const ack = try encode(&buffer, .{ .key = test_key, .message = .{ .acknowledgement = .completed } });

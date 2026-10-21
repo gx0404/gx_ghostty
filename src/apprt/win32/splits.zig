@@ -197,8 +197,8 @@ test "focusAfterClose picks the previous leaf, else the next" {
 test "zoomAfterFocus" {
     const testing = std.testing;
     const H = enum(u16) { root = 0, _ };
-    const a: H = @enumFromInt(1);
-    const b: H = @enumFromInt(2);
+    const a: H = @fromBackingInt(1);
+    const b: H = @fromBackingInt(2);
     try testing.expectEqual(@as(?H, null), zoomAfterFocus(H, null, a, true));
     try testing.expectEqual(@as(?H, a), zoomAfterFocus(H, a, a, false));
     try testing.expectEqual(@as(?H, null), zoomAfterFocus(H, a, b, false));
@@ -236,7 +236,7 @@ test "detachPane moves one view without changing the source on allocation failur
             try std.testing.expect(!detached.moved.isSplit());
             try std.testing.expectError(error.OnlyPane, detachPane(Tree, alloc, &ta, .root));
             try std.testing.expectError(error.InvalidPane, detachPane(Tree, alloc, &tree, .root));
-            try std.testing.expectError(error.InvalidPane, detachPane(Tree, alloc, &tree, @enumFromInt(60)));
+            try std.testing.expectError(error.InvalidPane, detachPane(Tree, alloc, &tree, @fromBackingInt(60)));
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Helper.run, .{});

@@ -199,7 +199,7 @@ pub fn pangoLanguages(
     };
     const ui = gettextLanguages(lang);
     if (std.mem.eql(u8, preferred, ui)) return null;
-    return std.fmt.bufPrintZ(buf, "{s}:{s}", .{ ui, preferred }) catch null;
+    return std.mem.printSentinel(buf, "{s}:{s}", .{ ui, preferred }, 0) catch null;
 }
 
 /// A common Han character (中) that every Chinese font has.

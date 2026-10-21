@@ -13,6 +13,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const gobject = @import("gobject");
+const adw = @import("adw");
 const gtk = @import("gtk");
 
 const global = @import("../../../global.zig");
@@ -22,7 +23,6 @@ const Application = @import("../class/application.zig").Application;
 const close_confirmation_dialog = @import("../class/close_confirmation_dialog.zig");
 const CloseConfirmationDialog = close_confirmation_dialog.CloseConfirmationDialog;
 const Target = close_confirmation_dialog.Target;
-const Dialog = @import("../class/dialog.zig").Dialog;
 const SplitTree = @import("../class/split_tree.zig").SplitTree;
 const Surface = @import("../class/surface.zig").Surface;
 const Tab = @import("../class/tab.zig").Tab;
@@ -56,7 +56,7 @@ pub fn listProcesses(dialog: *CloseConfirmationDialog, target: Target, parent: ?
         log.warn("cannot show the running processes err={}", .{err});
         return;
     };
-    dialog.as(Dialog.Parent).setExtraChild(list);
+    dialog.as(adw.AlertDialog).setExtraChild(list);
 }
 
 /// The busy processes of the terminals to close, each name once.
@@ -147,7 +147,7 @@ fn processList(arena: Allocator, names: []const []const u8) Allocator.Error!*gtk
 }
 
 fn row(arena: Allocator, text: []const u8, dim: bool) Allocator.Error!*gtk.Widget {
-    const label = gtk.Label.new((try arena.dupeZ(u8, text)).ptr);
+    const label = gtk.Label.new((try arena.dupeSentinel(u8, text, 0)).ptr);
     label.setXalign(0);
     label.setEllipsize(.end);
     const widget = label.as(gtk.Widget);

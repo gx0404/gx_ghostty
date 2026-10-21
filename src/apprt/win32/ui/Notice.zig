@@ -673,7 +673,7 @@ test "notice targets and content storage" {
     try testing.expectEqualStrings("Reload", notice.slice(notice.actions[1]));
     try testing.expectEqual(@as(?u32, null), notice.duration_ms);
     // Long texts are cut on a character boundary.
-    notice.store(.{ .title = "\u{6C49}" ** 200 });
+    notice.store(.{ .title = std.mem.asBytes(&@as([200]["\u{6C49}".len]u8, @splat("\u{6C49}".*))) });
     try testing.expect(notice.title.len <= 256);
     try testing.expect(std.unicode.utf8ValidateSlice(notice.slice(notice.title)));
 }

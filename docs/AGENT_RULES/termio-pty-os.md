@@ -71,7 +71,7 @@
 - 无名测试（`src/pty.zig` 的 open 与 resize、`src/termio/message.zig` 的尺寸锁）随完整 `just test` 运行；Windows 上 `pty.test` 经同一入口走系统 ConPTY。
 - 平台分支各自验证：Windows 分支（ConPTY、`threadMainWindows`、`Command` 的 Windows 路径、`execCommand windows:` 用例）用本机 `just build` 与 `just test --filter execCommand --filter pty.test --filter gx.conpty --filter gx.osc7`；POSIX 分支用 `just wsl test --filter <名>` 或 gx-ci 的 `linux-main`。运行行为（输出刷新、`exit` 后关窗、ConPTY 日志行）按 `apprt-win32.md` 启动 app 检查。
 - 改 lib-vt 闭包里的 `os` 文件：`just test-vt`、`just build-vt`、`just vt-wasm`。
-- 改读管线或 StreamHandler 热路径：按 `src/benchmark/AGENTS.md` 的流程对比前后吞吐，用 `just build -Demit-bench -Doptimize=ReleaseFast` 构建 `ghostty-bench`，`+terminal-stream` 近似 IO 线程的解析负载；真实 pty 下的读线程收益没有基准覆盖，记 PENDING。
+- 改读管线或 StreamHandler 热路径：按 `src/benchmark/AGENTS.md` 的流程对比前后吞吐，用 `just build -Demit-bench -Doptimize=fast` 构建 `ghostty-bench`，`+terminal-stream` 近似 IO 线程的解析负载；真实 pty 下的读线程收益没有基准覆盖，记 PENDING。
 - 改 Zig 后跑 `just fmt-check`。
 
 ## 上游指令

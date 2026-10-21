@@ -496,7 +496,7 @@ const TestSource = struct {
 };
 
 test "OLE medium releases its owned IUnknown exactly once after copying" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     var context: TestContext = .{};
     defer if (context.payload) |*payload| payload.deinit();
     var target: Target = .{ .alloc = std.testing.allocator, .hwnd = @ptrFromInt(1), .attachment = testAttachment(), .callbacks = context.callbacks() };
@@ -510,7 +510,7 @@ test "OLE medium releases its owned IUnknown exactly once after copying" {
 }
 
 test "OLE malformed quoted HDROP rejects COPY and releases its medium" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
     const path = std.unicode.utf8ToUtf16LeStringLiteral("C:\\owned\\bad\"&echo GX_MUST_NOT_EXECUTE.txt");
     var bytes: [20 + (path.len + 2) * @sizeOf(u16)]u8 = @splat(0);
@@ -547,7 +547,7 @@ test "OLE QueryGetData reentrancy revokes acceptance before GetData" {
 }
 
 test "OLE detached target outlives its owner with inert callbacks" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     var context: TestContext = .{};
     const target = try std.testing.allocator.create(Target);
     target.* = .{ .alloc = std.testing.allocator, .hwnd = @ptrFromInt(1), .attachment = testAttachment(), .callbacks = context.callbacks() };
@@ -559,7 +559,7 @@ test "OLE detached target outlives its owner with inert callbacks" {
 }
 
 test "OLE old Drop never upgrades to a renewed attachment during GetData or medium release" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     for ([_]bool{ false, true }) |during_release| {
         var context: TestContext = .{};
         defer if (context.payload) |*payload| payload.deinit();
@@ -601,7 +601,7 @@ test "OLE invalidation is pure and preserves native resources for deferred retir
 }
 
 test "OLE deferred retirement revokes before its registered HWND is destroyed" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     var apartment = ComApartment.init();
     defer apartment.deinit() catch {};
     const hwnd = w32.CreateWindowExW(0, std.unicode.utf8ToUtf16LeStringLiteral("STATIC"), std.unicode.utf8ToUtf16LeStringLiteral("GX owned OLE retirement test"), 0, 0, 0, 0, 0, w32.HWND_MESSAGE, null, null, null) orelse return error.TestWindowFailed;

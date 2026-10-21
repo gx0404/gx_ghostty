@@ -159,7 +159,7 @@ const Group = enum(u8) {
 };
 
 comptime {
-    std.debug.assert(@typeInfo(Group).@"enum".fields.len <= model.max_groups);
+    std.debug.assert(@typeInfo(Group).@"enum".field_names.len <= model.max_groups);
 }
 
 /// What the palette lists.
@@ -659,7 +659,7 @@ fn refreshItemCache(self: *Palette) !void {
 }
 
 fn configStamp(config: *const Config, hints_: trigger.Hints) u64 {
-    var hasher: std.hash.Wyhash = .init(@intFromEnum(i18n.current()));
+    var hasher: std.hash.Wyhash = .init(@backingInt(i18n.current()));
     for (config.@"command-palette-entry".value.items) |command| {
         hashText(&hasher, command.title);
         hashText(&hasher, command.description);
@@ -811,7 +811,7 @@ fn addCommands(self: *Palette, a: Allocator) !void {
                 try a.dupe(u8, i18n.trRuntime(command.description))
             else
                 "",
-            .key = try std.fmt.allocPrint(a, "{f}", .{action}),
+            .key = try a.print("{f}", .{action}),
             .shortcut = self.hints().lookup(action),
             .target = .{ .command = action },
         });
@@ -907,7 +907,7 @@ fn addProfiles(self: *Palette, a: Allocator) !void {
     var list = try self.ownerWindow().app.cachedLaunchProfiles();
     defer list.deinit();
     for (list.profiles) |profile| {
-        const id = try a.dupeZ(u8, profile.id);
+        const id = try a.dupeSentinel(u8, profile.id, 0);
         const name = try gx.profiles.displayName(a, profile);
         const name_en = if (profile.kind == .custom)
             name
@@ -927,7 +927,7 @@ fn addProfiles(self: *Palette, a: Allocator) !void {
             .name_en = name_en,
             .description = try commandText(a, profile.command),
             .detail = try a.dupe(u8, detail),
-            .key = try std.fmt.allocPrint(a, "gx:new_tab_profile:{s}", .{id}),
+            .key = try a.print("gx:new_tab_profile:{s}", .{id}),
             .shortcut = self.hints().lookup(.{ .gx = .{ .new_tab_profile = id } }),
             .target = .{ .profile = id },
         });
@@ -967,7 +967,7 @@ fn addThemes(self: *Palette, a: Allocator, which: enum { recent, all }) !void {
     var key_buf: [320]u8 = undefined;
     for (names, 0..) |theme, i| {
         if (which == .recent) {
-            const key = std.fmt.bufPrint(&key_buf, "theme:{s}", .{theme}) catch continue;
+            const key = std.mem.print(&key_buf, "theme:{s}", .{theme}) catch continue;
             if (history.rank(key) == 0) continue;
         }
         const name = try a.dupe(u8, theme);
@@ -980,7 +980,7 @@ fn addThemes(self: *Palette, a: Allocator, which: enum { recent, all }) !void {
             .name = name,
             .name_en = name,
             .detail = if (is_current) i18n.tr("Current Theme") else "",
-            .key = try std.fmt.allocPrint(a, "theme:{s}", .{name}),
+            .key = try a.print("theme:{s}", .{name}),
             .current = is_current,
             .target = .{ .theme = .{ .name = name, .index = @intCast(i) } },
         });
@@ -1130,7 +1130,7 @@ fn listMatches(self: *Palette, gpa: Allocator, text: []const u8) !void {
     var group: ?u8 = null;
     for (matches.items) |m| {
         if (headers and group != m.group) {
-            try self.rows.append(gpa, .{ .kind = .{ .header = @enumFromInt(m.group) } });
+            try self.rows.append(gpa, .{ .kind = .{ .header = @fromBackingInt(m.group) } });
             group = m.group;
         }
         try self.rows.append(gpa, .{ .kind = .{ .item = m.index } });
@@ -1164,7 +1164,7 @@ fn collectMatches(self: *Palette, gpa: Allocator, query: *const fuzzy.Query, out
         try out.append(gpa, .{
             .index = @intCast(i),
             .order = if (self.page == .tabs) std.math.maxInt(u64) - item.recency else i,
-            .group = @intFromEnum(item.group),
+            .group = @backingInt(item.group),
             .score = item.score,
             .len = if (by_english) len_en else len,
         });
@@ -1440,7 +1440,7 @@ fn run(self: *Palette, index: usize, how: model.EnterAction) void {
 fn cloneTarget(target: Target, allocator: Allocator) !Target {
     return switch (target) {
         .command => |action| .{ .command = try action.clone(allocator) },
-        .profile => |id| .{ .profile = try allocator.dupeZ(u8, id) },
+        .profile => |id| .{ .profile = try allocator.dupeSentinel(u8, id, 0) },
         .theme => |theme| .{ .theme = .{ .name = try allocator.dupe(u8, theme.name), .index = theme.index } },
         else => target,
     };
@@ -1516,10 +1516,10 @@ test "D13: a theme saved with the palette open shows on the root like a new sess
     // "Change Theme…" naming it and the other recent picks, the current
     // theme left out like the current tab.
     var fresh = [_]Item{ T.page("Nord Light"), T.theme("Nord", 0, 0, false), T.theme("Nord Light", 1, 3, true), T.theme("Dracula", 2, 1, false) };
-    var after: Palette = .{ .items = .{ .items = &session, .capacity = session.len } };
+    var after: Palette = .{ .items = .{ .items = &session, .capacity = session.len, .pointer_stability = .{} } };
     defer after.rows.deinit(testing.allocator);
     try after.listRoot(testing.allocator);
-    var reopened: Palette = .{ .items = .{ .items = &fresh, .capacity = fresh.len } };
+    var reopened: Palette = .{ .items = .{ .items = &fresh, .capacity = fresh.len, .pointer_stability = .{} } };
     defer reopened.rows.deinit(testing.allocator);
     try reopened.listRoot(testing.allocator);
     try testing.expectEqual(reopened.rows.items.len, after.rows.items.len);
@@ -1550,7 +1550,7 @@ test "D13: a reused palette host rebuilds its entries for a changed theme" {
     // A configuration change also retires the hidden host and its cache.
     var palette: Palette = .{};
     palette.item_cache.stamp = nord;
-    palette.preparation.pending = .initEmpty();
+    palette.preparation.pending = .empty;
     palette.invalidateHost();
     try testing.expect(palette.item_cache.stamp == null);
     try testing.expect(palette.popup.reuse_invalid and palette.preparation.isPending());
@@ -1641,7 +1641,7 @@ fn selectedTheme(self: *Palette) ?[]const u8 {
 test "root theme search previews the selection but empty opening does not" {
     var items = [_]Item{.{ .group = .themes, .icon = 0, .title = "Nord", .title_en = "Nord", .name = "Nord", .name_en = "Nord", .target = .{ .theme = .{ .name = "Nord", .index = 0 } } }};
     var rows = [_]Row{.{ .kind = .{ .item = 0 }, .y = 0, .h = 20 }};
-    var palette: Palette = .{ .page = .root, .selected = 0, .items = .{ .items = &items, .capacity = 1 }, .rows = .{ .items = &rows, .capacity = 1 } };
+    var palette: Palette = .{ .page = .root, .selected = 0, .items = .{ .items = &items, .capacity = 1, .pointer_stability = .{} }, .rows = .{ .items = &rows, .capacity = 1, .pointer_stability = .{} } };
     palette.preview_gate.filtered(true);
     try std.testing.expect(palette.wantedTheme() == null);
     palette.preview_gate.filtered(false);
@@ -2836,8 +2836,8 @@ test "UIA a real UI Automation client hears the palette's arrow keys select anot
         .active = true,
         .selected = 0,
         .uia_attachment = attachment,
-        .items = .{ .items = &items, .capacity = items.len },
-        .rows = .{ .items = &rows, .capacity = rows.len },
+        .items = .{ .items = &items, .capacity = items.len, .pointer_stability = .{} },
+        .rows = .{ .items = &rows, .capacity = rows.len, .pointer_stability = .{} },
     };
     const Source = struct {
         fn paint(_: *anyopaque, _: *Popup, _: *d2d.Canvas) void {}

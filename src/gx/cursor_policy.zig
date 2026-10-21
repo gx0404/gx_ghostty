@@ -162,7 +162,7 @@ fn expectCursor(t: anytype, style: Style, blink: bool) !void {
     var expected: [32]u8 = undefined;
     const query: terminal.dcs.Command.DECRQSS = .decscusr;
     try testing.expectEqualStrings(
-        try std.fmt.bufPrint(&expected, "\x1bP1$r{d} q\x1b\\", .{code}),
+        try std.mem.print(&expected, "\x1bP1$r{d} q\x1b\\", .{code}),
         try query.encode(t, &response),
     );
 }

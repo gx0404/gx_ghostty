@@ -401,7 +401,7 @@ fn runNativeThread(mode: @FieldType(NativeScenario, "mode"), require_implicit_mt
 }
 
 fn runNativeScenario(mode: @FieldType(NativeScenario, "mode")) !void {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
     // Reject explicit STA/MTA, neutral apartments, and non-S_OK queries even
     // when their output fields happen to resemble an implicit MTA.
     for ([_]NativeApartmentState{

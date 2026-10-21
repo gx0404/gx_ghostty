@@ -406,8 +406,8 @@ pub fn initWithOptions(
 
     // A window's pixel format can only be set once; the renderer creates
     // its context for this DC later, on the render thread.
-    try app.core_app.device.wait();
-    try app.core_app.device.setPixelFormat(self.hdc.?);
+    try app.core_app.device.?.wait();
+    try app.core_app.device.?.setPixelFormat(self.hdc.?);
 
     // Query the initial DPI and size
     self.updateDpiScale();
@@ -442,7 +442,7 @@ pub fn initWithOptions(
     defer config.deinit();
     if (options.session_restore) config.@"initial-command" = null;
     if (options.working_directory) |directory| {
-        config.@"working-directory" = .{ .path = try config.arenaAlloc().dupeZ(u8, directory) };
+        config.@"working-directory" = .{ .path = try config.arenaAlloc().dupeSentinel(u8, directory, 0) };
     }
     const inherited_font_size: ?f32 = if (options.font_size) |points|
         points
@@ -467,9 +467,9 @@ pub fn initWithOptions(
         self.launch_command = null;
     };
     if (options.title) |title| {
-        config.title = try config.arenaAlloc().dupeZ(u8, title);
+        config.title = try config.arenaAlloc().dupeSentinel(u8, title, 0);
     }
-    if (config.title) |title| self.session_title = try alloc.dupeZ(u8, title);
+    if (config.title) |title| self.session_title = try alloc.dupeSentinel(u8, title, 0);
     errdefer if (self.session_title) |title| {
         alloc.free(title);
         self.session_title = null;
@@ -608,6 +608,11 @@ fn updateClientSize(self: *Surface) void {
 
 pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
     return .{ .x = self.scale, .y = self.scale };
+}
+
+pub fn renderDeviceOptions(self: *const Surface) !@import("../../renderer.zig").Device.Options {
+    _ = self;
+    return .{};
 }
 
 pub fn getSize(self: *const Surface) !apprt.SurfaceSize {
@@ -979,7 +984,7 @@ fn readClipboard(self: *Surface, state: apprt.ClipboardRequest) !apprt.Clipboard
             const paths = (try hdropPathsToUtf8(alloc, @ptrCast(hdrop_handle), quoting)) orelse
                 break :hdrop;
             defer alloc.free(paths);
-            break :blk try alloc.dupeZ(u8, paths);
+            break :blk try alloc.dupeSentinel(u8, paths, 0);
         }
 
         const hglobal = w32.GetClipboardData(w32.CF_UNICODETEXT) orelse
@@ -991,10 +996,7 @@ fn readClipboard(self: *Surface, state: apprt.ClipboardRequest) !apprt.Clipboard
             return .unavailable;
         };
         defer alloc.free(utf8);
-        break :blk try alloc.dupeZ(
-            u8,
-            normalizeWindowsClipboardNewlines(utf8),
-        );
+        break :blk try alloc.dupeSentinel(u8, normalizeWindowsClipboardNewlines(utf8), 0);
     };
     defer alloc.free(utf8z);
 
@@ -1667,7 +1669,7 @@ test "broker paste confirmation rejects moved hidden reopened and closing target
     surface.ui_reference = try issuer.surface(9);
     const original = try issuer.attach(surface.ui_reference, window.ui_reference);
     var surfaces = [_]*Surface{&surface};
-    core_app.surfaces = .{ .items = &surfaces, .capacity = surfaces.len };
+    core_app.surfaces = .{ .items = &surfaces, .capacity = surfaces.len, .pointer_stability = .{} };
     var tracker: Tracker = .{};
     const pending: ClipboardConfirm = .{
         .kind = .unsafe_paste,
@@ -2878,8 +2880,9 @@ fn updateImePreedit(self: *Surface) void {
 fn sendImeText(self: *Surface, utf16: []const u16) void {
     // Convert UTF-16LE to UTF-8 on the stack when it fits (each CJK
     // character takes 3 bytes in UTF-8), on the heap when it does not.
-    var fallback = std.heap.stackFallback(256, self.app.core_app.alloc);
-    const alloc = fallback.get();
+    var buffer: [256]u8 = undefined;
+    var fallback: std.heap.BufferFirstAllocator = .init(&buffer, self.app.core_app.alloc);
+    const alloc = fallback.allocator();
     const utf8 = wstr.utf8Alloc(alloc, utf16) catch |err| {
         log.warn("IME utf16→utf8 error: {}", .{err});
         return;
@@ -2993,7 +2996,7 @@ test "IME positions count UTF16 pairs and wide cells without truncating long com
     try testing.expectEqual(@as(usize, 3), imeColumns(&text, 3));
     try testing.expectEqual(@as(usize, 5), imeColumns(&text, 4));
     try testing.expectEqual(@as(usize, 5), imeColumns(&text, 5));
-    const long = [_]u16{0x4E2D} ** 512;
+    const long = @as([512]u16, @splat(0x4E2D));
     try testing.expectEqual(@as(usize, 1024), imeColumns(&long, long.len));
     try testing.expectEqual(@as(usize, 1), imeColumns(&.{0xD800}, 1));
     const cell: w32.RECT = .{ .left = 20, .top = 20, .right = 30, .bottom = 40 };
@@ -3384,7 +3387,7 @@ pub fn installDropTarget(self: *Surface) void {
 }
 
 fn testOleLegacyDropFlag(block_registration: bool, legacy_enabled: bool) !void {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
     const alloc = testing.allocator;
     var core_app: @import("../../App.zig") = undefined;
@@ -3691,7 +3694,7 @@ pub fn recoverGpuResources(self: *Surface) void {
     const state = &self.core_surface.renderer_state;
     state.mutex.lockUncancelable(global.io());
     var screens = state.terminal.screens.all.iterator();
-    while (screens.next()) |entry| entry.value.*.kitty_images.dirty = true;
+    while (screens.next()) |entry| entry.value.*.kitty_images.markDirty();
     state.mutex.unlock(global.io());
     log.warn("the GPU context was reset, rebuilding the renderer resources", .{});
     self.core_surface.renderer_thread.wakeup.notify() catch {};

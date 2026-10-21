@@ -29,12 +29,12 @@ Consumer contract (GX Shell release.yml)
   gx-release's linux-gtk-noble job runs exactly these two deb commands. To build without downloading
   blueprint-compiler, start from the gx-release asset ghostty-$VS.tar.gz of the same commit instead:
     python3 scripts/gx_package.py deb --build --install-deps --source-tarball "ghostty-$VS.tar.gz" --stage-dir "$RUNNER_TEMP/ghostty-gx-stage" --version-string "$VS"
-  Tools: Python 3.10+ and Git. Zig 0.16.0 is the zig on PATH when it reports that version (for example
+  Tools: Python 3.10+ and Git. Zig 0.17.0 is the zig on PATH when it reports that version (for example
   mlugg/setup-zig), else scripts/setup_zig.py --install puts the sha256-pinned one into
   .local/toolchains/zig. windows needs neither MSVC nor Inno Setup (only gx_windows_package.py's
   installer does); Windows' System32\\tar.exe extracts the Mesa .7z. deb --install-deps apt-installs the
   package list of scripts/gx_linux_build.py (as root, else through sudo); a checkout build also installs
-  the sha256-pinned blueprint-compiler 0.16.0 into .local/tools/ with meson.
+  the sha256-pinned blueprint-compiler 0.17.0 into .local/tools/ with meson.
   Network: Zig and its packages (pkg.machengine.org, else ziglang.org; deps.files.ghostty.org,
   github.com, codeberg.org, gitlab.freedesktop.org; Zig's own fetcher ignores HTTP proxies), the pinned
   downloads (windows: api.nuget.org, github.com, raw.githubusercontent.com; deb: github.com,
@@ -42,7 +42,7 @@ Consumer contract (GX Shell release.yml)
   Optional environment: ZIG_GLOBAL_CACHE_DIR and ZIG_LOCAL_CACHE_DIR (Zig caches, by default inside the
   checkout: .local/zig-cache/global, plus .zig-cache for windows or .local/zig-cache/gx-linux-build for
   deb), GX_GHOSTTY_PACKAGE_CACHE or --cache-dir (pinned downloads, default .local/cache/gx-package),
-  ZIG or GX_GHOSTTY_ZIG (a Zig 0.16.0 to use instead).
+  ZIG or GX_GHOSTTY_ZIG (a Zig 0.17.0 to use instead).
   Output: DIR alone (besides those caches), and exit code 0 only after DIR passed verify-stage. What a
   build adds to the checkout is ignored by Git, so source_dirty only reports changes made by the caller.
   --build installs into a temporary prefix next to DIR and removes it afterwards; an explicit --prefix is
@@ -50,8 +50,8 @@ Consumer contract (GX Shell release.yml)
   package's file tree and deb_depends its Depends; fonts/ is for GX Shell to install.
 
 --build runs, for windows, gx_windows_package.run_build (zig build -Dapp-runtime=win32
--Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast -Dversion-string=VS --prefix PREFIX) once Zig is
-there; for deb, the Ubuntu 24.04 recipe scripts/gx_linux_build.py build (ReleaseFast, baseline CPU, PIE,
+-Dtarget=x86_64-windows-gnu -Doptimize=fast -Dversion-string=VS --prefix PREFIX) once Zig is
+there; for deb, the Ubuntu 24.04 recipe scripts/gx_linux_build.py build (fast, baseline CPU, PIE,
 -fno-sys=gtk4-layer-shell with libgtk4-layer-shell.so bundled in PREFIX/lib, RUNPATH $ORIGIN/../lib
 through -Dpatch-rpath and patchelf 0.18.0), whose check-prefix also runs `bin/ghostty +version` without
 LD_LIBRARY_PATH. Without --build, PREFIX (default zig-out) must already hold such a build.
@@ -790,7 +790,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("platform", choices=PLATFORMS)
     parser.add_argument("--stage-dir", type=Path, required=True, help="new directory for the stage")
     parser.add_argument("--build", action="store_true",
-                        help="first build the app into the prefix (windows: win32 ReleaseFast; deb: gx_linux_build.py)")
+                        help="first build the app into the prefix (windows: win32 fast; deb: gx_linux_build.py)")
     parser.add_argument("--prefix", type=Path,
                         help="install prefix (default zig-out; with --build a temporary directory removed afterwards)")
     parser.add_argument("--source-tarball", type=Path, help="deb --build only: build from this ghostty-VS.tar.gz")

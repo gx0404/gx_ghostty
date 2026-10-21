@@ -541,7 +541,7 @@ fn key(self: *Self, wparam: usize, lparam: isize, pressed: bool) void {
             .repeat => .repeat,
             .release => .release,
         },
-        .physical = @intCast(@intFromEnum(decoded.event.key)),
+        .physical = @intCast(@backingInt(decoded.event.key)),
         .unicode = unicode,
         .modifiers = @intCast(decoded.event.mods.int()),
         .consumed_modifiers = @intCast(decoded.event.consumed_mods.int()),
@@ -713,7 +713,7 @@ pub fn query(self: *const Self, field: usize) isize {
         6 => @bitCast(@as(usize, @intCast(self.ticket.transaction))),
         7 => @bitCast(@as(usize, @intCast(self.ticket.generation))),
         8 => @bitCast(@as(usize, @intCast(self.ui_reference.id))),
-        9 => @intFromEnum(if (self.closed) View.State.closed else if (self.unavailable) View.State.unavailable else if (self.allFrames()) View.State.live else View.State.waiting),
+        9 => @backingInt(if (self.closed) View.State.closed else if (self.unavailable) View.State.unavailable else if (self.allFrames()) View.State.live else View.State.waiting),
         10 => self.ui.queryResult(),
         else => 0,
     };

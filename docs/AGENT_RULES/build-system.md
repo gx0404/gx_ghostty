@@ -47,7 +47,7 @@ fork 发布版本串与 tag 见 `ci-release.md`，GX-0001 的原因与移除条�
 
 ### Zig 版本与依赖
 
-- Zig 版本真源是 `build.zig.zon` 的 `.minimum_zig_version`；`build.zig` 编译期调用 `src/build/zig.zig::requireZig`，主次版本必须相同、补丁号不得更低，即只接受 0.16.x。同一版本号还硬编码在 `flake.nix`、`nix/package.nix`、`nix/libghostty-vt.nix`（`zig_0_16`）、`snap/snapcraft.yaml`、`flatpak/dependencies.yml`（以上随上游同步更新），以及 fork 的 `scripts/setup_zig.py::ZIG_VERSION` 与各平台 sha256 钉版 `PINS`（同步时手动升级，步骤见 `development.md`）。
+- Zig 版本真源是 `build.zig.zon` 的 `.minimum_zig_version`；`build.zig` 编译期调用 `src/build/zig.zig::requireZig`，主次版本必须相同、补丁号不得更低，即只接受 0.17.x。同一版本号还硬编码在 `flake.nix`、`nix/package.nix`、`nix/libghostty-vt.nix`（`zig_0_17`）、`snap/snapcraft.yaml`、`flatpak/dependencies.yml`（以上随上游同步更新），以及 fork 的 `scripts/setup_zig.py::ZIG_VERSION` 与各平台 sha256 钉版 `PINS`（同步时手动升级，步骤见 `development.md`）。
 - 根 `build.zig.zon` 的 URL 依赖都带 `.hash`，大多取自上游镜像 `deps.files.ghostty.org`；`pkg/*/build.zig.zon` 再各自引入 C 源码包。完整清单（含传递依赖）是生成的 `build.zig.zon.txt`，少数来自 GitHub、Codeberg 与 freedesktop GitLab。
 - 经 zigw 运行时全局缓存默认在 `.local/zig-cache/global`；Zig 0.16 把依赖解包副本放在项目根 `zig-pkg/`，它与 `.zig-cache/`、`zig-out/` 都被上游 `.gitignore` 忽略，不入库。
 - `pkg/<名>/` 是独立 Zig 包（自带 `build.zig` 与 `build.zig.zon`），根清单以 `.path` 引用、大多为 lazy，由 `src/build/SharedDeps.zig::add` 统一挂到 exe、lib 与测试上；`override/` 放构建期配置头，`pkg/breakpad/vendor/`、`pkg/simdutf/vendor/` 是第三方源码副本；部分包有自己的 `test` 步骤（上游 CI 只跑 `pkg/wuffs`）。
@@ -83,7 +83,7 @@ fork 发布版本串与 tag 见 `ci-release.md`，GX-0001 的原因与移除条�
 - `test` 不依赖 `test-lib-vt`（`build.zig::build` 中那条依赖被注释掉），二者是独立的门，互不代证。
 - 产品版本只随上游同步变化：fork 不改 `build.zig.zon` 的 `.version` 与 `nix/package.nix` 等处的硬编码版本；fork 版本只体现在 `CHANGELOG.md` 与发布时的 `-Dversion-string`。
 - 上游构建文件上的 fork 改动都带 `fork(gx)` 标记并登记在 `docs/FORK_PATCHES.md`：`src/build/Config.zig` 的 GX-0001，`build.zig` 的 GX-0002（三个纯新增块），`src/build/SharedDeps.zig` 的 GX-0003（`posix_c` 守卫与 win32 系统库）；再改上游构建文件须按 GX-NNNN 登记（`development.md`），不顺手重排或重格式化。
-- fork 内经 just 配方调用钉版 Zig。`CMakeLists.txt` 的 `find_program`、`distcheck` 的内层命令与 CMake 示例都从 PATH 找 `zig`；PATH 上没有 0.16.x 时这些路径记 PENDING。
+- fork 内经 just 配方调用钉版 Zig。`CMakeLists.txt` 的 `find_program`、`distcheck` 的内层命令与 CMake 示例都从 PATH 找 `zig`；PATH 上没有 0.17.x 时这些路径记 PENDING。
 
 ## 禁止项
 

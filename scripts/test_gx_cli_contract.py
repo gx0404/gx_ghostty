@@ -76,7 +76,7 @@ class ContractTests(unittest.TestCase):
                                                 + action + '\n```\n\n' for action in self.actions)}
         for name, text in mdx.items():
             (self.web / (name + '.mdx')).write_bytes(text.encode('utf-8'))
-        self.version = 'Ghostty fixture\nBuild Config\n  - build mode : .ReleaseFast\n'
+        self.version = 'Ghostty fixture\nBuild Config\n  - build mode : .fast\n'
         self.raw = {
             'version': self.version,
             'help': 'HEAD\n' + ''.join('  +' + a + '\n' for a in self.actions) + 'TAIL\n',

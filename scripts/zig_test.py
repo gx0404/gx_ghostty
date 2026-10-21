@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""并行 Zig 测试运行器：按 Zig 0.16 test runner 的 server 协议，把测试二进制的用例分片到多个进程。
+"""并行 Zig 测试运行器：按 Zig 0.16/0.17 test runner 的 server 协议，把测试二进制的用例分片到多个进程。
 
 用法：
   python scripts/zig_test.py [--suite vt|main] [--binary PATH]... [--jobs N] [--seed N]

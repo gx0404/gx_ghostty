@@ -653,7 +653,7 @@ fn windowsCreateCommandLine(allocator: mem.Allocator, argv: []const []const u8) 
 
 // fork(gx): GX-0053 begin: verify process argv with the native Windows decoder
 test "Command: D23 native Windows argv preserves empty arguments" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const cases = [_][]const []const u8{
         &.{ "ghostty.exe", "" },
         &.{ "ghostty.exe", "", "middle", "", "" },
@@ -667,7 +667,7 @@ test "Command: D23 native Windows argv preserves empty arguments" {
 }
 
 test "Command: D23 Windows quoting agrees with GX for slashes quotes and Unicode" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const args = [_][]const u8{
         "C:\\Program Files\\Ghostty\\ghostty.exe",
         "C:\\plain\\",

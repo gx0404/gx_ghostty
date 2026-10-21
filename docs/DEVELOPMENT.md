@@ -15,17 +15,17 @@
 然后在仓库根依次运行：
 
 ```sh
-just setup               # 钉版 Zig 0.16.0 与图谱 venv 装进仓内 .local/，幂等
+just setup               # 钉版 Zig 0.17.0 与图谱 venv 装进仓内 .local/，幂等
 just setup --innosetup   # 可选，仅 Windows：另装钉版 Inno Setup 7.1.0，just package-windows 打安装包要用
 just doctor              # 只读体检，必需项缺失时退出 1
 just install-hooks       # core.hooksPath=.githooks，启用 commit-msg 提交规范检查
 ```
 
-- `just setup`（`scripts/setup_env.py`）分两步，各自幂等。第一步把 Zig 按 sha256 钉版下载到 `.local/toolchains/zig/zig-0.16.0/`：`GX_GHOSTTY_ZIG_MIRROR` 指定的源最先尝试，然后是内置镜像，最后是官方源，源太慢或校验不符就换下一个；`GX_GHOSTTY_ZIG` 或 `ZIG` 已经指向可用的 0.16.0 时跳过下载。第二步建 `.local/tools/venv` 并装 `graphifyy==0.9.73`，有 `uv` 用 uv，否则用 venv + pip，解释器取 `find_real_python` 找到的真实路径。任一步失败退出 1。参数原样交给脚本：`--force` 覆盖重装损坏的钉版 Zig；`--innosetup` 另加第三步，把 sha256 钉版的 Inno Setup 7.1.0 安装包缓存到 `.local/cache/innosetup/`，以 `/CURRENTUSER /PORTABLE=1` 静默装进 `.local/tools/innosetup/`（不写注册表、不建卸载项与快捷方式），非 Windows 主机上这一步失败。
+- `just setup`（`scripts/setup_env.py`）分两步，各自幂等。第一步把 Zig 按 sha256 钉版下载到 `.local/toolchains/zig/zig-0.17.0/`：`GX_GHOSTTY_ZIG_MIRROR` 指定的源最先尝试，然后是内置镜像，最后是官方源，源太慢或校验不符就换下一个；`GX_GHOSTTY_ZIG` 或 `ZIG` 已经指向可用的 0.17.0 时跳过下载。第二步建 `.local/tools/venv` 并装 `graphifyy==0.9.73`，有 `uv` 用 uv，否则用 venv + pip，解释器取 `find_real_python` 找到的真实路径。任一步失败退出 1。参数原样交给脚本：`--force` 覆盖重装损坏的钉版 Zig；`--innosetup` 另加第三步，把 sha256 钉版的 Inno Setup 7.1.0 安装包缓存到 `.local/cache/innosetup/`，以 `/CURRENTUSER /PORTABLE=1` 静默装进 `.local/tools/innosetup/`（不写注册表、不建卸载项与快捷方式），非 Windows 主机上这一步失败。
 - `just doctor`（`setup_env.py --check`）：不安装，不在仓库里建任何东西（符号链接探测只用系统临时目录并随即删除）。必需项是 zig、python、git、MSVC（仅 Windows）、venv、graphify，任一为 MISSING 就退出 1；hooksPath、Windows 上的符号链接权限（`symlink`）与钉版 Inno Setup（`innosetup`），以及 codex、claude、kimi、zcode、actionlint、uv 只报 FOUND 或 OPTIONAL。每项都给出修复提示。
 - `just install-hooks`：只改本仓 `.git/config` 的 `core.hooksPath`。不装也能开发，但 `gx-ci` 的 `framework` job 按同一规则校验首父链提交，不合规的提交 push 后一样会红。
 
-装好后用 `just framework-check` 确认框架本身是绿的，再用 `just ci-check` 确认 Zig 链路可用。首次 `just ci-check` 要拉依赖并编译测试二进制，远比日常慢；之后热缓存下约 100 s，改过 Zig 源码再加约 2 min 编译（见 TESTING.md「并行运行器与耗时」）。
+日常 Windows 验证使用 `just quick-prepare` 后 `just quick-check`：编译独立，快速门计时不超过 60 秒，过期产物不得运行。完整 `just ci-check` 及跨平台验收用于上游同步、发版和风险回归，不受快速门预算约束；覆盖与历史耗时见 TESTING.md。
 
 ## 日常闭环（九步）
 
@@ -125,7 +125,7 @@ just rules-review <本轮全部路径…>
 
 ### 构建与运行
 
-- `just build` 在 Windows 主机上给 `zig build` 补 `-Dtarget=x86_64-windows-gnu`（`scripts/zig_build.py`；显式写了 `-Dtarget` 或是 `-Demit-lib-vt` 构建时不补），Windows 目标的 apprt 默认就是 `win32`（GX-0003），产出 Debug 的 `zig-out\bin\ghostty.exe` 与 `zig-out\share\`。要看性能时加 `-Doptimize=ReleaseFast`。不经 `just` 直接 `zig build` 时目标没写 ABI，`src/build/Config.zig::init` 会强制 MSVC，这条路径未验证。
+- `just build` 在 Windows 主机上给 `zig build` 补 `-Dtarget=x86_64-windows-gnu`（`scripts/zig_build.py`；显式写了 `-Dtarget` 或是 `-Demit-lib-vt` 构建时不补），Windows 目标的 apprt 默认就是 `win32`（GX-0003），产出 Debug 的 `zig-out\bin\ghostty.exe` 与 `zig-out\share\`。要看性能时加 `-Doptimize=fast`。不经 `just` 直接 `zig build` 时目标没写 ABI，`src/build/Config.zig::init` 会强制 MSVC，这条路径未验证。
 - 运行：直接启动 `zig-out\bin\ghostty.exe`。它是 GUI 子系统程序，没有控制台；`+list-fonts` 等 CLI 动作的输出只在标准输出被重定向或接管道时可见（cmd 的 `>`、`|`，Git Bash 均可；PowerShell 要 `| Out-String`）。
 - 日志：每次运行写 `%LOCALAPPDATA%\ghostty\logs\ghostty.log`，上一次的改名为 `ghostty.log.1`（`src/apprt/win32/file_log.zig`）；Debug 构建写全部级别，其他构建不写 debug。常用的核对行：`runtime=.win32`、`loaded OpenGL X.Y vendor=… renderer=… software=…`、`ConPTY: bundled …` 或 `ConPTY: system (kernel32) …`。
 - 隔离配置做实验：Windows 上的配置目录是 `%XDG_CONFIG_HOME%\ghostty`，未设时 `%LOCALAPPDATA%\ghostty`（`src/os/xdg.zig::config`），用户配置、`gui-settings.ghostty` 与写入的 `GX Mocha` 主题都在这里；日志目录只看 `LOCALAPPDATA`。实验与截图验证时把两个变量都指向同一个隔离目录（约定 `.local\evidence\<任务>\env\<场景>`，与 TESTING.md「Windows GUI 验证」一致），配置写在其下的 `ghostty\config.ghostty`，日志落在 `ghostty\logs\ghostty.log`，例如 PowerShell：
@@ -159,7 +159,7 @@ Windows 主机上的 Linux 构建、测试与截图都经 `just wsl`（`scripts/
 
 ```sh
 just wsl setup --apt                     # 首次：先以 root 补装 apt 依赖与 zh_CN.UTF-8、en_US.UTF-8 locale，再做下一行的事
-just wsl setup                           # 幂等：克隆、钉版 Zig、钉版 blueprint-compiler 0.16.0、预取 Zig 包；已就绪时约 1 s
+just wsl setup                           # 幂等：克隆、钉版 Zig、钉版 blueprint-compiler 0.20.0、预取 Zig 包；已就绪时约 1 s
 just wsl sync <worktree 目录> --dirty     # 把某个 worktree（连未提交改动）detached 检出到克隆
 just wsl build --gtk                     # GTK app（-fno-sys=gtk4-layer-shell）
 just wsl test                            # 完整单测，同 gx-ci linux-main 加 -Dapp-runtime=none；--gtk 带上 GTK apprt
@@ -269,7 +269,7 @@ git commit -m "chore(sync): 合并上游 main（<sha>）"
 - 上游改了 `build.zig.zon` 的 `minimum_zig_version` 时，钉版 Zig 必须跟着升级（`build.zig` 经 `src/build/zig.zig::requireZig` 校验版本，钉版落后就无法构建）：
   1. 从官方 `https://ziglang.org/download/index.json` 取新版本各平台条目的 `shasum`，更新 `scripts/setup_zig.py` 的 `ZIG_VERSION` 与 `PINS`（五个平台都要更新）。
   2. `just setup` 装好新版本，再跑 `just framework-test`：`scripts/test_setup_zig.py` 锁定 `ZIG_VERSION` 等于 `minimum_zig_version`，测试里写死的旧版本号也会在这里暴露，一并改正。`gx-ci` 与 `gx-release` 的 `mlugg/setup-zig` 都按 `minimum_zig_version` 取版本（`gx-release` 的 prepare 另外校验它与 `ZIG_VERSION` 一致），workflow 不用改。
-  3. 更新文档与注释里写死的 `0.16.0`：根 `AGENTS.md`「项目模型」、`justfile`、本目录与 `docs/AGENT_RULES/` 下的文档。
+  3. 更新文档与注释里写死的 `0.17.0`：根 `AGENTS.md`「项目模型」、`justfile`、本目录与 `docs/AGENT_RULES/` 下的文档。
   4. 在 `CHANGELOG.md` 当前的 `(TBD)` 段记一条「钉版 Zig 升级到 X.Y.Z」，然后 `just kb`。
 
   `GX_GHOSTTY_ZIG`、`ZIG` 只用来指向已装好的同版本 Zig，不能拿来换版本、绕过钉版（zigw 也会拒绝与 `ZIG_VERSION` 不一致的 Zig）；正确做法是按上面的步骤升级钉版。

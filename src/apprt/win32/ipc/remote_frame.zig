@@ -16,7 +16,7 @@ const max_sequence = std.math.maxInt(u64) >> 3;
 comptime {
     // Other targets may lower u64 atomics through process-local helper locks.
     // The Windows app transport is restricted to native 64-bit atomics.
-    const arch = @import("builtin").cpu.arch;
+    const arch = @import("builtin").target.cpu.arch;
     if (arch != .x86_64 and arch != .aarch64) @compileError("remote frames require native 64-bit atomics");
 }
 const State = enum(u3) { free = 0, writing = 1, ready = 2, reading = 3 };
@@ -31,7 +31,7 @@ fn state(control: u64) Error!State {
     return value;
 }
 fn withState(control: u64, value: State) u64 {
-    return (control & ~state_mask) | @intFromEnum(value);
+    return (control & ~state_mask) | @backingInt(value);
 }
 
 pub const Mapped = struct {
@@ -104,7 +104,7 @@ pub const Mapped = struct {
             const phase = try state(previous);
             if (phase != .free and phase != .ready) continue;
             const sequence = try self.nextSequence();
-            const expected = (sequence << 3) | @intFromEnum(State.writing);
+            const expected = (sequence << 3) | @backingInt(State.writing);
             if (@cmpxchgStrong(u64, control, previous, expected, .acq_rel, .acquire) != null) continue;
             const start = self.layout.offset(@intCast(index));
             return .{ .control = control, .expected = expected, .closed = atomicAt(self.bytes, closed_offset), .metadata = self.bytes[offset + 16 ..][0..32], .generation = self.generation, .pixels = self.bytes[start..][0..self.layout.frame_bytes] };

@@ -227,7 +227,7 @@ pub const DirectWrite = struct {
         }
         var result: mapped.Batch = .{};
         errdefer result.deinit(alloc);
-        if (family) |locked| result.family = try alloc.dupeZ(u8, locked);
+        if (family) |locked| result.family = try alloc.dupeSentinel(u8, locked, 0);
         var it = try self.discover(alloc, request);
         defer it.deinit();
         var base_traits: ?mapped.Traits = null;
@@ -246,7 +246,7 @@ pub const DirectWrite = struct {
             var buf: [1024]u8 = undefined;
             const actual_family = try candidate.source.deferred.familyName(&buf);
             if (result.family == null) {
-                result.family = try alloc.dupeZ(u8, actual_family);
+                result.family = try alloc.dupeSentinel(u8, actual_family, 0);
                 base_traits = candidate.traits;
             }
             const wanted = if (style == .regular) base_traits.? else mapped.Traits.fromStyle(style);
@@ -274,7 +274,7 @@ pub const DirectWrite = struct {
         const style_z: ?[*:0]const u8 = face.face.handle.*.style_name;
         const family = std.mem.span(family_z orelse return try face.name(buf));
         const style = std.mem.span(style_z orelse return family);
-        return std.fmt.bufPrint(buf, "{s} {s}", .{ family, style }) catch family;
+        return std.mem.print(buf, "{s} {s}", .{ family, style }) catch family;
     }
 
     pub const DiscoverIterator = union(enum) {
@@ -331,7 +331,7 @@ const Api = struct {
             .collection = collection,
             .fallback = fallback,
             .gdi = factory.getGdiInterop() catch null,
-            .locale = [_:0]u16{0} ** com.LOCALE_NAME_MAX_LENGTH,
+            .locale = @as([com.LOCALE_NAME_MAX_LENGTH:0]u16, @splat(0)),
         };
         if (com.GetUserDefaultLocaleName(&api.locale, api.locale.len) <= 0) {
             const en = std.unicode.utf8ToUtf16LeStringLiteral("en-US");
@@ -867,8 +867,8 @@ const AttrQuery = struct {
 
 fn fontAttributes(f: *com.IDWriteFont, query: AttrQuery) match.Attributes {
     return .{
-        .weight = @intCast(std.math.clamp(@intFromEnum(f.getWeight()), 1, 999)),
-        .stretch = @intCast(@min(@intFromEnum(f.getStretch()), 9)),
+        .weight = @intCast(std.math.clamp(@backingInt(f.getWeight()), 1, 999)),
+        .stretch = @intCast(@min(@backingInt(f.getStretch()), 9)),
         .slant = switch (f.getStyle()) {
             .italic => .italic,
             .oblique => .oblique,

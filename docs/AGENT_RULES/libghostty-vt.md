@@ -71,7 +71,7 @@
 
 - 定向：`just test-vt --filter <filter>`，同时跑 `ghostty-vt`（Zig API）与 `ghostty-vt-c`（C ABI）两个模块，清单测试也在内；全量 `just test-vt` 属于 `just ci-check`。
 - Windows 环境前置：未开开发者模式（也不是管理员）时，全量 `just test-vt` 固定有 4 处失败，都是 `src/lib/tinyio` 的符号链接用例报 `PermissionDenied`。这不是回归：记 FAIL 并写明原因，不跳过、不修改这些上游用例，开启开发者模式后重跑（见 `docs/TESTING.md`「Windows 本机限制」）。
-- 构建：`just build-vt`；交叉 `just build-vt -Dtarget=<triple>`（同 gx-ci 的 `lib-vt-cross` 矩阵）；freestanding 抽查 `just build-vt -Dtarget=thumb-freestanding-eabi -Dcpu=cortex_m4 -Doptimize=ReleaseSafe`。
+- 构建：`just build-vt`；交叉 `just build-vt -Dtarget=<triple>`（同 gx-ci 的 `lib-vt-cross` 矩阵）；freestanding 抽查 `just build-vt -Dtarget=thumb-freestanding-eabi -Dcpu=cortex_m4 -Doptimize=safe`。
 - wasm：`just vt-wasm`；有 Node 时加跑上游的 `node test/wasm-alloc.mjs zig-out/bin/ghostty-vt.wasm`。
 - feature 组合：`just zig build test-lib-vt-build "-Dvt-features=-all,+render-state"` 只编译；覆盖导出块再跑 `just build-vt "-Dvt-features=-all,+render-state" -Dtarget=wasm32-freestanding`。
 - ABI 清单：`just zig build test-lib-vt-schema`，需要 `python3` 与 `jsonschema`（wasm 另需 `wasmtime`，上游由 `nix develop` 提供）；本机缺依赖时如实记 FAIL 或 PENDING，CI 由 `gx-ci.yml` 的 `linux-vt` job 运行。

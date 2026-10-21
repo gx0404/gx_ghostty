@@ -95,7 +95,7 @@ pub const Platform = enum {
     windows,
     linux,
 
-    pub const native: Platform = if (builtin.os.tag == .windows) .windows else .linux;
+    pub const native: Platform = if (builtin.target.os.tag == .windows) .windows else .linux;
 
     fn separator(self: Platform) u8 {
         return switch (self) {
@@ -134,7 +134,7 @@ pub const Probe = union(enum) {
                 if (!std.fs.path.isAbsolute(path) or !validNativePath(path)) return false;
                 @import("perf.zig").count("profiles.path_scan", 1);
                 std.Io.Dir.accessAbsolute(io, path, .{
-                    .execute = builtin.os.tag != .windows,
+                    .execute = builtin.target.os.tag != .windows,
                 }) catch return false;
                 return true;
             },
@@ -152,7 +152,7 @@ pub const Probe = union(enum) {
     fn validNativePath(path: []const u8) bool {
         for (path, 0..) |c, i| {
             if (c < 0x20) return false;
-            if (builtin.os.tag != .windows) continue;
+            if (builtin.target.os.tag != .windows) continue;
             switch (c) {
                 '<', '>', '"', '|', '?', '*' => return false,
                 ':' => if (i != 1) return false,
@@ -234,12 +234,12 @@ pub const List = struct {
         const profiles = try a.alloc(Profile, self.profiles.len);
         for (self.profiles, profiles) |profile, *copy| {
             copy.* = .{
-                .id = try a.dupeZ(u8, profile.id),
-                .name = try a.dupeZ(u8, profile.name),
-                .name_arg = if (profile.name_arg) |arg| try a.dupeZ(u8, arg) else null,
+                .id = try a.dupeSentinel(u8, profile.id, 0),
+                .name = try a.dupeSentinel(u8, profile.name, 0),
+                .name_arg = if (profile.name_arg) |arg| try a.dupeSentinel(u8, arg, 0) else null,
                 .command = switch (profile.command) {
                     .argv => |argv| .{ .argv = try dupeArgv(a, argv) },
-                    .command_line => |line| .{ .command_line = try a.dupeZ(u8, line) },
+                    .command_line => |line| .{ .command_line = try a.dupeSentinel(u8, line, 0) },
                 },
                 .kind = profile.kind,
             };
@@ -274,7 +274,7 @@ fn filledEql(template: []const u8, arg: []const u8, query: []const u8) bool {
 
 fn dupeArgv(alloc: Allocator, argv: []const [:0]const u8) Allocator.Error![]const [:0]const u8 {
     const result = try alloc.alloc([:0]const u8, argv.len);
-    for (argv, result) |arg, *out| out.* = try alloc.dupeZ(u8, arg);
+    for (argv, result) |arg, *out| out.* = try alloc.dupeSentinel(u8, arg, 0);
     return result;
 }
 
@@ -286,9 +286,9 @@ pub const Custom = struct {
 
 fn customProfile(alloc: Allocator, entry: Custom) Allocator.Error!Profile {
     return .{
-        .id = try std.fmt.allocPrintSentinel(alloc, "custom:{s}", .{entry.name}, 0),
-        .name = try alloc.dupeZ(u8, entry.name),
-        .command = .{ .command_line = try alloc.dupeZ(u8, entry.command) },
+        .id = try alloc.printSentinel("custom:{s}", .{entry.name}, 0),
+        .name = try alloc.dupeSentinel(u8, entry.name, 0),
+        .command = .{ .command_line = try alloc.dupeSentinel(u8, entry.command, 0) },
         .kind = .custom,
     };
 }
@@ -375,9 +375,9 @@ const Detector = struct {
 
         const wsl = try self.existing(system_root, &.{ "System32", "wsl.exe" }) orelse "wsl.exe";
         for (self.environment.wsl_distros) |distro| {
-            const name = try self.alloc.dupeZ(u8, distro);
+            const name = try self.alloc.dupeSentinel(u8, distro, 0);
             try self.profiles.append(self.alloc, .{
-                .id = try std.fmt.allocPrintSentinel(self.alloc, "wsl:{s}", .{distro}, 0),
+                .id = try self.alloc.printSentinel("wsl:{s}", .{distro}, 0),
                 .name = "WSL: {name}",
                 .name_arg = name,
                 .command = .{ .argv = try self.argv(&.{ wsl, "-d", name }) },
@@ -427,7 +427,7 @@ const Detector = struct {
 
     fn argv(self: *Detector, args: []const []const u8) Allocator.Error![]const [:0]const u8 {
         const result = try self.alloc.alloc([:0]const u8, args.len);
-        for (args, result) |arg, *out| out.* = try self.alloc.dupeZ(u8, arg);
+        for (args, result) |arg, *out| out.* = try self.alloc.dupeSentinel(u8, arg, 0);
         return result;
     }
 
@@ -633,7 +633,7 @@ pub fn fingerprint(platform: Platform, env: *const std.process.Environ.Map) u64 
         .windows => &.{ "PATH", "LOCALAPPDATA", "ProgramFiles", "SystemRoot", "ComSpec" },
         .linux => &.{ "PATH", "SHELL" },
     };
-    var hasher: std.hash.Wyhash = .init(@intFromEnum(platform));
+    var hasher: std.hash.Wyhash = .init(@backingInt(platform));
     for (names) |name| hashValue(&hasher, env.get(name));
     return hasher.final();
 }
@@ -678,7 +678,7 @@ pub fn commandConfigured(steps: anytype) bool {
 /// (`isUtilityDistro`). Returns an empty list when WSL is not installed
 /// or on other platforms.
 pub fn wslDistros(alloc: Allocator) Allocator.Error![]const []const u8 {
-    if (comptime builtin.os.tag != .windows) return &.{};
+    if (comptime builtin.target.os.tag != .windows) return &.{};
     return try registry.wslDistros(alloc);
 }
 
@@ -694,7 +694,7 @@ pub fn isUtilityDistro(name: []const u8) bool {
     return false;
 }
 
-const registry = if (builtin.os.tag == .windows) struct {
+const registry = if (builtin.target.os.tag == .windows) struct {
     const win = std.os.windows;
     const HKEY = win.HKEY;
     const LSTATUS = win.LSTATUS;
@@ -1220,7 +1220,7 @@ test "commandConfigured reads the recorded configuration inputs" {
 }
 
 test "wslDistros reads the registry" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -1232,7 +1232,7 @@ test "wslDistros reads the registry" {
 }
 
 test "detectSystem finds a shell on the running system" {
-    if (builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows and builtin.target.os.tag != .linux) return error.SkipZigTest;
     const testing = std.testing;
     var env = try std.testing.environ.createMap(testing.allocator);
     defer env.deinit();
@@ -1245,5 +1245,5 @@ test "detectSystem finds a shell on the running system" {
             .command_line => unreachable,
         }
     }
-    if (builtin.os.tag == .windows) try testing.expect(list.find("cmd") != null);
+    if (builtin.target.os.tag == .windows) try testing.expect(list.find("cmd") != null);
 }

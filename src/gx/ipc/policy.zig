@@ -85,17 +85,17 @@ pub fn launchMode(launch: Launch) LaunchMode {
 test "gx.ipc.policy authenticate process birth and all isolation dimensions" {
     const identity: Identity = .{
         .process = .{ .pid = 7, .birth = 8 },
-        .sid = [_]u8{1} ** 32,
+        .sid = @as([32]u8, @splat(1)),
         .logon_id = 9,
         .session_id = 10,
         .integrity = .medium,
         .elevated = false,
     };
     const isolation: Isolation = .{
-        .config_root = [_]u8{2} ** 32,
-        .build = [_]u8{3} ** 32,
-        .class = [_]u8{4} ** 32,
-        .install = [_]u8{5} ** 32,
+        .config_root = @as([32]u8, @splat(2)),
+        .build = @as([32]u8, @splat(3)),
+        .class = @as([32]u8, @splat(4)),
+        .install = @as([32]u8, @splat(5)),
     };
     try authenticate(identity, identity, identity.process, isolation, isolation, false);
     try std.testing.expectError(error.RemotePeer, authenticate(identity, identity, identity.process, isolation, isolation, true));
@@ -114,9 +114,9 @@ test "gx.ipc.policy authenticate process birth and all isolation dimensions" {
     peer = identity;
     peer.integrity = .high;
     try std.testing.expectError(error.DifferentElevation, authenticate(identity, peer, identity.process, isolation, isolation, false));
-    inline for (std.meta.fields(Isolation)) |field| {
+    inline for (@typeInfo(Isolation).@"struct".field_names) |field| {
         var other = isolation;
-        @field(other, field.name)[0] += 1;
+        @field(other, field)[0] += 1;
         try std.testing.expectError(error.DifferentIsolation, authenticate(identity, identity, identity.process, isolation, other, false));
     }
     try std.testing.expectError(error.EpochMismatch, checkEpochs(1, 2, 1, 3));

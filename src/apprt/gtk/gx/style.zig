@@ -376,7 +376,7 @@ fn pxValues(css: []const u8, property: []const u8, out: []?f32) ![]?f32 {
 
 fn hasText(comptime fmt: []const u8, args: anytype) !bool {
     var buf: [256]u8 = undefined;
-    return std.mem.indexOf(u8, static_css, try std.fmt.bufPrint(&buf, fmt, args)) != null;
+    return std.mem.indexOf(u8, static_css, try std.mem.print(&buf, fmt, args)) != null;
 }
 
 test "the static px values and transitions come from ui_metrics and motion" {

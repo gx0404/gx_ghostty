@@ -69,7 +69,7 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 | `libvt-macos` | macos-15 | 仅 `macos=true`：构建 libghostty-vt XCFramework |
 | `linux-gtk` | ubuntu-24.04 中的 `debian:13` 容器 | `zig build dist` 产出完整源码包，再从该源码包构建 GTK app 并检查 `+version`，再用源码包内的 `scripts/gx_release.py linux-doc` 写入许可文件 |
 | `linux-gtk-noble` | ubuntu-24.04 中的 `ubuntu:24.04` 容器 | 按 GX Shell 的消费方命令从检出构建 GTK app 并生成、校验 deb stage，再装成一次性测试包，检查 `+version` 并截图；只上传证据 artifact `evidence-linux-gtk-noble`，不产出发布资产 |
-| `windows-app` | windows-2025 | 安装 sha256 钉版的 Inno Setup 7.1.0（当前用户、便携模式），以 `-Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast` 构建，再由 `scripts/gx_windows_package.py` 打出便携 zip 与安装包，并检查输出目录恰好是这两个文件 |
+| `windows-app` | windows-2025 | 安装 sha256 钉版的 Inno Setup 7.1.0（当前用户、便携模式），以 `-Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=fast` 构建，再由 `scripts/gx_windows_package.py` 打出便携 zip 与安装包，并检查输出目录恰好是这两个文件 |
 | `macos` | macos-26 | 仅 `macos=true`：构建 `Ghostty.app`。macos-15（Xcode 26.3）编不过 `images/Ghostty.icon` 的资源目录（2026-10-07 run 37587740223），上游也在 macOS 26 上构建 app |
 | `verify` | ubuntu-24.04 | 收集全部 `gx-*` artifact，运行 `scripts/gx_release.py verify`，写出 `manifest.json` 与 `SHA256SUMS` 并 `sha256sum -c`；只构建模式也运行；要求 `linux-gtk-noble` 与 `windows-app` 成功 |
 | `publish` | ubuntu-24.04 | 仅 `publish=true`：运行 `scripts/gx_release.py publish`；唯一拥有 `contents: write` 的 job |

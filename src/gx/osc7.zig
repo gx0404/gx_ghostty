@@ -27,7 +27,7 @@ pub const Error = error{InvalidPath} || Allocator.Error;
 /// Returns the path itself except on Windows, where it is converted with
 /// `windowsPath` and null means it is not a usable working directory.
 pub fn nativePath(alloc: Allocator, path: []const u8) Allocator.Error!?[]const u8 {
-    if (comptime builtin.os.tag != .windows) return path;
+    if (comptime builtin.target.os.tag != .windows) return path;
     return windowsPath(alloc, path) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidPath => {
@@ -146,7 +146,7 @@ test "windowsPath rejects what is not an absolute drive path" {
 
 test "nativePath leaves other platforms' paths alone" {
     const path = try nativePath(testing.allocator, "/C:/Windows");
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .windows) {
         defer testing.allocator.free(path.?);
         try testing.expectEqualStrings("C:\\Windows", path.?);
         try testing.expectEqual(null, try nativePath(testing.allocator, "/home/me"));
@@ -161,28 +161,30 @@ test "nativePath leaves other platforms' paths alone" {
 fn reportedPwd(arena: Allocator, url: []const u8) !?[]const u8 {
     const internal_os = @import("../os/main.zig");
     const uri = internal_os.uri.parse(url, .{
-        .mac_address = comptime builtin.os.tag != .macos,
+        .mac_address = comptime builtin.target.os.tag != .macos,
         .raw_path = std.mem.startsWith(u8, url, "kitty-shell-cwd://"),
     }) catch return null;
     if (!std.mem.eql(u8, "file", uri.scheme) and
         !std.mem.eql(u8, "kitty-shell-cwd", uri.scheme)) return null;
 
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = uri.getHost(&host_buffer) catch |err| switch (err) {
+    const host = std.Io.net.HostName.fromUri(uri, &host_buffer) catch |err| switch (err) {
         error.UriMissingHost => std.Io.net.HostName{ .bytes = "" },
+        else => return null,
     };
     if (!try internal_os.hostname.isLocal(host.bytes)) return null;
 
     // The same allocators as reportPwd: a stack fallback, used once, for
     // the decoded path and the arena for the native one.
-    var stack_alloc = std.heap.stackFallback(1024, arena);
-    const raw_path = try uri.path.toRawMaybeAlloc(stack_alloc.get());
+    var buffer: [1024]u8 = undefined;
+    var stack_alloc: std.heap.BufferFirstAllocator = .init(&buffer, arena);
+    const raw_path = try uri.path.toRawMaybeAlloc(stack_alloc.allocator());
     const path = try nativePath(arena, raw_path) orelse return null;
     return try arena.dupe(u8, path);
 }
 
 test "OSC 7 URLs from Windows shells become native working directories" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -210,7 +212,7 @@ test "OSC 7 URLs from Windows shells become native working directories" {
         if (lower) {
             for (name) |*c| c.* = std.ascii.toLower(c.*);
         }
-        const url = try std.fmt.allocPrint(alloc, "file://{s}/C:/Windows/System32", .{name});
+        const url = try alloc.print("file://{s}/C:/Windows/System32", .{name});
         try testing.expectEqualStrings("C:\\Windows\\System32", (try reportedPwd(alloc, url)).?);
     }
 

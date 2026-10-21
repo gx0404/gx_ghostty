@@ -18,11 +18,11 @@ pub const Decoded = struct {
 pub const State = struct {
     utf8: [16]u8 = undefined,
     key_utf16: [4]u16 = undefined,
-    ime_keys: std.StaticBitSet(256) = .initEmpty(),
+    ime_keys: std.StaticBitSet(256) = .empty,
     dead_key_preedit: bool = false,
     key_event_produced_text: bool = false,
     pub fn reset(self: *State) void {
-        self.ime_keys = .initEmpty();
+        self.ime_keys = .empty;
         self.dead_key_preedit = false;
         self.key_event_produced_text = false;
     }

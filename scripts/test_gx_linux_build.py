@@ -371,7 +371,7 @@ class BlueprintTests(unittest.TestCase):
         self.addCleanup(stdout.stop)
 
     def archive(self, commit: str = linux.BLUEPRINT_COMMIT) -> Path:
-        return tag_archive(self.base / "downloads" / f"{commit}.tar.gz", "blueprint-compiler-v0.16.0",
+        return tag_archive(self.base / "downloads" / f"{commit}.tar.gz", "blueprint-compiler-v0.20.0",
                            {"meson.build": b"project('blueprint-compiler')\n"}, commit)
 
     def runner(self, command, **kwargs):
@@ -384,7 +384,7 @@ class BlueprintTests(unittest.TestCase):
 
     def test_pins(self):
         self.assertRegex(linux.BLUEPRINT_COMMIT, r"^[0-9a-f]{40}$")
-        self.assertEqual(linux.BLUEPRINTS[0].sha256, "01feb8263fe7a450b0a9fed0fd54cf88947aaf00f86cc7da345f8b39a0e7bd30")
+        self.assertEqual(linux.BLUEPRINTS[0].sha256, "b6d43b474557dc5c591cca693f6d8a82e328fd125261a7e4fe702f2818106427")
         self.assertTrue(linux.BLUEPRINTS[0].url.startswith("https://gitlab.gnome.org/GNOME/blueprint-compiler/"))
         self.assertEqual(len({download.name for download in linux.BLUEPRINTS}), len(linux.BLUEPRINTS))
         for download in linux.BLUEPRINTS:
@@ -417,7 +417,7 @@ class BlueprintTests(unittest.TestCase):
         self.assertEqual(fetched, [(linux.BLUEPRINTS[0].name, cache), (linux.BLUEPRINTS[1].name, cache)])
         setup = next(command for command in self.calls if command[:2] == ["meson", "setup"])
         self.assertEqual(setup[-1], f"--prefix={linux.blueprint_home(self.root)}")
-        self.assertTrue(setup[3].endswith("blueprint-compiler-v0.16.0"))
+        self.assertTrue(setup[3].endswith("blueprint-compiler-v0.20.0"))
         self.assertIn(["meson", "install", "-C", setup[2]], self.calls)
 
     def test_wrong_archives_and_failed_downloads_are_refused(self):
@@ -519,7 +519,7 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(kwargs["cwd"], str(ROOT))
         self.assertEqual(kwargs["env"]["ZIG_LOCAL_CACHE_DIR"], str(ROOT / ".local" / "zig-cache" / "gx-linux-build"))
         self.assertTrue(kwargs["env"]["PATH"].startswith(str(self.base / "tools" / "bin") + os.pathsep))
-        for flag in ("-Doptimize=ReleaseFast", "-fno-sys=gtk4-layer-shell", "-Dpatch-rpath=$ORIGIN/../lib",
+        for flag in ("-Doptimize=fast", "-fno-sys=gtk4-layer-shell", "-Dpatch-rpath=$ORIGIN/../lib",
                      "-Dapp-runtime=gtk", "-Dcpu=baseline"):
             self.assertIn(flag, linux.BUILD_FLAGS)
 

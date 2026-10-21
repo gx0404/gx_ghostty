@@ -94,7 +94,7 @@ def all_invocations() -> dict[str, gx_wsl.Invocation]:
         "setup": setup[1],
         "check": gx_wsl.setup_invocations(CLONE, "E:/repo", check=True, apt=False)[0],
         "sync": gx_wsl.sync_invocation(CLONE, gx_wsl.SyncTarget("a" * 40, "E:/repo", "ref main")),
-        "build": gx_wsl.build_invocation(CLONE, True, ["-Doptimize=ReleaseFast"]),
+        "build": gx_wsl.build_invocation(CLONE, True, ["-Doptimize=fast"]),
         "test": gx_wsl.zig_test_invocation(CLONE, "main", False, ["Terminal"], []),
         "smoke": gx_wsl.smoke_invocation(
             CLONE, out="out", lang="zh_CN", xdotool=None, config=None, wait=20, name=None, ghostty_args=[]
@@ -146,16 +146,16 @@ class ArgumentTests(unittest.TestCase):
     def test_build_help_reaches_zig_instead_of_argparse(self):
         for help_flag in ("--help", "-h", "--list-steps", "-l"):
             with self.subTest(help_flag=help_flag), contextlib.redirect_stdout(io.StringIO()):
-                args = self.parse("build", "--gtk", "-Doptimize=ReleaseFast", help_flag)
-                self.assertEqual(["-Doptimize=ReleaseFast", help_flag], args.extra)
+                args = self.parse("build", "--gtk", "-Doptimize=fast", help_flag)
+                self.assertEqual(["-Doptimize=fast", help_flag], args.extra)
                 invocation = gx_wsl.plan(args)[0]
                 self.assertEqual(help_flag, invocation.args[-1])
                 self.assertIn("normal_build", invocation.script)
 
     def test_build_passes_unknown_arguments_through_in_order(self) -> None:
-        args = self.parse("build", "--gtk", "-Doptimize=ReleaseFast", "test-lib-vt-schema", "-fno-sys=foo", "--summary", "all")
+        args = self.parse("build", "--gtk", "-Doptimize=fast", "test-lib-vt-schema", "-fno-sys=foo", "--summary", "all")
         self.assertTrue(args.gtk)
-        self.assertEqual(["-Doptimize=ReleaseFast", "test-lib-vt-schema", "-fno-sys=foo", "--summary", "all"], args.extra)
+        self.assertEqual(["-Doptimize=fast", "test-lib-vt-schema", "-fno-sys=foo", "--summary", "all"], args.extra)
 
     def test_test_collects_filters_and_passes_the_rest(self) -> None:
         args = self.parse("test", "--suite", "vt", "--filter", "a b", "--filter=c", "--jobs", "8", "-Dtest-filter=x")
@@ -820,7 +820,7 @@ class PerfProgramTests(unittest.TestCase):
         from types import SimpleNamespace
         source = {"commit": "a" * 40, "tree": "b" * 40, "dirty": False, "dirty_paths": ""}
         image = {"sha256": "c" * 64, "device": 1, "inode": 2, "size": 3, "mtime_ns": 4}
-        version = "Ghostty 1.3.2-HEAD+aaaaaaaaa\n  - build mode : .ReleaseFast\n"
+        version = "Ghostty 1.3.2-HEAD+aaaaaaaaa\n  - build mode : .fast\n"
         for extra in (["--help"], ["-h"], ["--list-steps"], ["-l"], ["test"], ["--unknown-flag"], ["--skip-oom-steps"]):
             program = {"__name__": "test_build_query"}
             exec(gx_wsl.RECEIPT_PROGRAM, program)
@@ -833,7 +833,7 @@ class PerfProgramTests(unittest.TestCase):
                         mock.patch.object(program["os"], "close"), \
                         mock.patch.object(program["subprocess"], "run", return_value=SimpleNamespace(
                             returncode=0, stdout=version, stderr="")) as run, contextlib.redirect_stdout(io.StringIO()):
-                    code = program["build_main"](["-", "-Dapp-runtime=gtk", "-Doptimize=ReleaseFast", *extra])
+                    code = program["build_main"](["-", "-Dapp-runtime=gtk", "-Doptimize=fast", *extra])
                 self.assertEqual(0, code, "ordinary query/non-install status is passed through")
                 data = json.loads(receipt.read_text(encoding="utf-8"))
                 self.assertIs(data["perf_eligible"], False)
@@ -845,8 +845,8 @@ class PerfProgramTests(unittest.TestCase):
         program = self.supervisor()
         source = {"commit": "a" * 40, "tree": "b" * 40, "dirty": False, "dirty_paths": ""}
         image = {"path": "/own/ghostty", "sha256": "c" * 64}
-        version = "Ghostty 1.3.2-HEAD+aaaaaaaaa\n  - build mode : .ReleaseFast\n"
-        base = ["python3", "scripts/zigw.py", "build", "-Dapp-runtime=gtk", "-Doptimize=ReleaseFast"]
+        version = "Ghostty 1.3.2-HEAD+aaaaaaaaa\n  - build mode : .fast\n"
+        base = ["python3", "scripts/zigw.py", "build", "-Dapp-runtime=gtk", "-Doptimize=fast"]
         for extra in (["--summary", "all"], ["install", "--summary", "all", "-j4"], ["--color", "off", "-j4"]):
             receipt = {"schema": "gx-gtk-build-v1", "producer": "gx_wsl.py build", "build_exit": 0,
                        "build_argv": base + extra, "source_before": source, "source_after": source,
@@ -862,9 +862,9 @@ class PerfProgramTests(unittest.TestCase):
         program = self.supervisor()
         source = {"commit": "a" * 40, "tree": "b" * 40, "dirty": False, "dirty_paths": ""}
         image = {"path": "/own/ghostty", "sha256": "c" * 64}
-        version = "Ghostty 1.3.2-HEAD+aaaaaaaaa\n  - build mode : .ReleaseFast\n"
+        version = "Ghostty 1.3.2-HEAD+aaaaaaaaa\n  - build mode : .fast\n"
         receipt = {"schema": "gx-gtk-build-v1", "producer": "gx_wsl.py build", "build_exit": 0,
-                   "build_argv": ["python3", "scripts/zigw.py", "build", "-Dapp-runtime=gtk", "-Doptimize=ReleaseFast"],
+                   "build_argv": ["python3", "scripts/zigw.py", "build", "-Dapp-runtime=gtk", "-Doptimize=fast"],
                    "source_before": source, "source_after": source, "executable": image, "version": version, "version_exit": 0}
         self.assertEqual(receipt, program["validate_receipt"](receipt, source, image, version, 0))
         for changed in (source | {"dirty": True}, source | {"commit": "d" * 40}, source | {"tree": "e" * 40}):
@@ -872,7 +872,7 @@ class PerfProgramTests(unittest.TestCase):
                 program["validate_receipt"](receipt, changed, image, version, 0)
         for changed in (receipt | {"build_exit": 1}, receipt | {"source_before": source | {"dirty": True}},
                         receipt | {"executable": image | {"sha256": "d" * 64}},
-                        receipt | {"build_argv": receipt["build_argv"] + ["-Doptimize=Debug"]}):
+                        receipt | {"build_argv": receipt["build_argv"] + ["-Doptimize=debug"]}):
             with self.assertRaises(ValueError):
                 program["validate_receipt"](changed, source, image, version, 0)
         wrong = version.replace("aaaaaaaaa", "fffffffff")
@@ -949,7 +949,7 @@ mkdir() {
         self.assertNotIn("os.kill(", script)
         self.assertNotIn("child.poll(", script)
         self.assertIn("pidfd unavailable; refusing to launch", script)
-        self.assertIn("perf requires verified ReleaseFast", script)
+        self.assertIn("perf requires verified fast", script)
 
 
 class ScenarioScriptTests(unittest.TestCase):
@@ -1311,11 +1311,11 @@ class MainTests(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_dry_run_prints_command_and_script(self) -> None:
-        code, out, _ = self.run_main("build", "--gtk", "--dry-run", "-Doptimize=ReleaseFast")
+        code, out, _ = self.run_main("build", "--gtk", "--dry-run", "-Doptimize=fast")
         self.assertEqual(0, code)
         self.assertIn(
             "[gx-wsl] wsl.exe -d Ubuntu-24.04 --cd ~ -e bash -c <script> gx-wsl ~/src/gx_ghostty "
-            "-Dapp-runtime=gtk -fno-sys=gtk4-layer-shell -Doptimize=ReleaseFast",
+            "-Dapp-runtime=gtk -fno-sys=gtk4-layer-shell -Doptimize=fast",
             out,
         )
         self.assertIn('normal_build "$@"', out)
@@ -1349,6 +1349,85 @@ class MainTests(unittest.TestCase):
         self.assertIn("python3 scripts/zigw.py build -Dapp-runtime=gtk -fno-sys=gtk4-layer-shell", out)
         self.assertIn('LD_LIBRARY_PATH="$PWD/zig-out/lib" ./zig-out/bin/ghostty', out)
 
+
+
+class CachedRootTests(unittest.TestCase):
+    def test_concurrent_repairs_use_distinct_atomic_files(self):
+        import tarfile
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        program = prefetch_namespace()
+        barrier = threading.Barrier(2)
+        replaced = []
+        real_replace = os.replace
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "cache/p/expected.tar.gz"
+            self.archive(archive, "expected/upstream-commit")
+            def run(argv, **kwargs):
+                normalized = Path(kwargs["env"]["ZIG_GLOBAL_CACHE_DIR"]) / "p/expected.tar.gz"
+                self.archive(normalized, "expected")
+                barrier.wait(timeout=5)
+                return subprocess.CompletedProcess(argv, 0, "expected\n", "")
+            def replace(source, target):
+                replaced.append(str(source))
+                return real_replace(source, target)
+            with mock.patch.object(program["subprocess"], "run", side_effect=run), \
+                    mock.patch.object(program["os"], "replace", side_effect=replace), \
+                    ThreadPoolExecutor(max_workers=2) as pool:
+                jobs = [pool.submit(program["repair_cached_root"], str(root), str(root / "cache"), "expected") for _ in range(2)]
+                self.assertEqual([None, None], [job.result(timeout=10) for job in jobs])
+            self.assertEqual(2, len(set(replaced)))
+            self.assertEqual([], list(archive.parent.glob("*.tmp")))
+            with tarfile.open(archive) as bundle:
+                self.assertEqual(["expected/build.zig.zon"], bundle.getnames())
+
+    def archive(self, path, prefix):
+        import tarfile
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(path, "w:gz") as bundle:
+            member = tarfile.TarInfo(prefix + "/build.zig.zon")
+            data = b".{ .name = .fixture }"
+            member.size = len(data)
+            bundle.addfile(member, io.BytesIO(data))
+
+    def test_nested_root_is_repacked_only_after_exact_hash_verification(self):
+        program = prefetch_namespace()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "cache/p/expected.tar.gz"
+            self.archive(archive, "expected/upstream-commit")
+            def run(argv, **kwargs):
+                self.assertEqual("upstream-commit", Path(argv[-1]).name)
+                normalized = Path(kwargs["env"]["ZIG_GLOBAL_CACHE_DIR"]) / "p/expected.tar.gz"
+                self.archive(normalized, "expected")
+                return subprocess.CompletedProcess(argv, 0, "expected\n", "")
+            with mock.patch.object(program["subprocess"], "run", side_effect=run):
+                self.assertIsNone(program["repair_cached_root"](str(root), str(root / "cache"), "expected"))
+            import tarfile
+            with tarfile.open(archive) as bundle:
+                self.assertEqual(["expected/build.zig.zon"], bundle.getnames())
+
+    def test_wrong_hash_preserves_original_cache(self):
+        program = prefetch_namespace()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "cache/p/expected.tar.gz"
+            self.archive(archive, "expected/upstream-commit")
+            original = archive.read_bytes()
+            with mock.patch.object(program["subprocess"], "run", return_value=subprocess.CompletedProcess([], 0, "different\n", "")):
+                self.assertIn("does not match", program["repair_cached_root"](str(root), str(root / "cache"), "expected"))
+            self.assertEqual(original, archive.read_bytes())
+
+    def test_flat_cache_is_not_refetched(self):
+        program = prefetch_namespace()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "cache/p/expected.tar.gz"
+            self.archive(archive, "expected")
+            with mock.patch.object(program["subprocess"], "run") as run:
+                self.assertIsNone(program["repair_cached_root"](str(root), str(root / "cache"), "expected"))
+            run.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,3 +1,4 @@
+// fork(gx): GX-0060 Zig 0.17 formatting API compatibility.
 const std = @import("std");
 const builtin = @import("builtin");
 const wuffs = @import("wuffs");
@@ -998,7 +999,7 @@ test "image load accepts shared memory names without a leading slash" {
     // Sandboxed macOS apps can only create names of this form. The pid
     // keeps concurrent test runs apart; Darwin limits names to 31 bytes.
     var buf: [32]u8 = undefined;
-    const name = try std.fmt.bufPrintSentinel(&buf, "{s}{d}", .{
+    const name = try std.mem.printSentinel(&buf, "{s}{d}", .{
         if (comptime builtin.target.os.tag.isDarwin())
             "ghostty.test/shm-"
         else
@@ -1428,8 +1429,7 @@ test "image load: temporary file in /tmp on macOS" {
     var dir_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir_path = dir_path_buf[0..try tmp_dir.dir.realPath(io, &dir_path_buf)];
 
-    const path = try std.fmt.allocPrint(
-        alloc,
+    const path = try alloc.print(
         "/tmp/ghostty-test-{s}-tty-graphics-protocol-image.data",
         .{tmp_dir.sub_path},
     );

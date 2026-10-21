@@ -77,7 +77,7 @@ pub fn title(arena: Allocator, row: sheet.Row, commands: []const input.Command) 
         else => return null,
     };
     if (found.exact) return .{ .msgid = found.msgid };
-    const formatted = try std.fmt.allocPrint(arena, "{f}", .{action});
+    const formatted = try arena.print("{f}", .{action});
     return .{ .msgid = found.msgid, .argument = sheet.argument(formatted) };
 }
 
@@ -179,11 +179,12 @@ test "title names Ghostty GX actions and keeps arguments the title does not name
 }
 
 test "every Ghostty GX title and section title is translated" {
-    inline for (@typeInfo(gx.action.Action).@"union".fields) |field| {
-        const action = @unionInit(gx.action.Action, field.name, switch (field.type) {
+    const info = @typeInfo(gx.action.Action).@"union";
+    inline for (info.field_names, info.field_types) |name, field_type| {
+        const action = @unionInit(gx.action.Action, name, switch (field_type) {
             void => {},
             []const u8 => "x",
-            else => std.enums.values(field.type)[0],
+            else => std.enums.values(field_type)[0],
         });
         try testing.expect(gx.i18n.lookup(.zh_CN, action.title()) != null);
     }

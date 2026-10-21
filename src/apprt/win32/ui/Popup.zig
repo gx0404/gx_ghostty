@@ -111,7 +111,7 @@ pub const OpenTiming = struct {
     }
 
     fn add(self: *OpenTiming, phase: Phase, us: u64) void {
-        self.phases[@intFromEnum(phase)] += us;
+        self.phases[@backingInt(phase)] += us;
     }
 
     pub fn addSince(self: *OpenTiming, phase: Phase, start: perf.Instant) void {
@@ -129,7 +129,7 @@ pub const OpenTiming = struct {
         const total = perf.elapsedUs(self.start, at);
         var work: u64 = 0;
         for (self.phases[0..4]) |us| work += us;
-        self.phases[@intFromEnum(Phase.show)] = total -| work;
+        self.phases[@backingInt(Phase.show)] = total -| work;
         return total;
     }
 
@@ -137,8 +137,8 @@ pub const OpenTiming = struct {
         const total = self.finishAt(at);
         switch (self.kind) {
             inline else => |kind| {
-                inline for (std.meta.fields(Phase), 0..) |phase, i| {
-                    Recorder.record(@tagName(kind) ++ ".open." ++ phase.name, self.phases[i]);
+                inline for (@typeInfo(Phase).@"enum".field_names, 0..) |phase, i| {
+                    Recorder.record(@tagName(kind) ++ ".open." ++ phase, self.phases[i]);
                 }
                 Recorder.record(@tagName(kind) ++ ".open.ready", perf.elapsedUs(self.start, self.ready.?));
                 Recorder.record(@tagName(kind) ++ ".open.total", total);
@@ -473,11 +473,11 @@ pub const Preparation = struct {
     /// idle work.
     pub const Unit = enum { palette, main_menu, settings };
 
-    pending: std.EnumSet(Unit) = .initFull(),
+    pending: std.EnumSet(Unit) = .full,
 
     /// Prepare every unit again, at the next idle boundaries.
     pub fn request(self: *Preparation) void {
-        self.pending = .initFull();
+        self.pending = .full;
     }
 
     /// Whether a unit waits.
@@ -592,7 +592,7 @@ pub fn create(
     };
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
-    const corners: u32 = @intFromEnum(options.corners);
+    const corners: u32 = @backingInt(options.corners);
     _ = w32.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, @ptrCast(&corners), @sizeOf(u32));
     const dark: u32 = @intFromBool(options.dark);
     _ = w32.DwmSetWindowAttribute(hwnd, w32.DWMWA_USE_IMMERSIVE_DARK_MODE, @ptrCast(&dark), @sizeOf(u32));
@@ -3297,7 +3297,7 @@ pub const UiaTestClient = struct {
             self.app.uia_queue = try uia.Queue.create(std.heap.page_allocator, self.queue_hwnd);
             self.window = .{ .app = &self.app, .ui_reference = attachment.object, .ui_attachment = attachment };
             self.windows = .{&self.window};
-            self.app.windows = .{ .items = &self.windows, .capacity = self.windows.len };
+            self.app.windows = .{ .items = &self.windows, .capacity = self.windows.len, .pointer_stability = .{} };
         }
 
         pub fn deinit(self: *AppFixture) void {
@@ -3705,7 +3705,7 @@ test "opening emits seven metrics once on reveal and none when cancelled" {
         try std.testing.expectEqual(@as(usize, 7), Capture.length);
         inline for (.{ "prepare", "create", "layout", "raster", "show", "ready", "total" }, 0..) |phase, i| {
             var buf: [64]u8 = undefined;
-            const name = try std.fmt.bufPrint(&buf, "{s}.open.{s}", .{ @tagName(kind), phase });
+            const name = try std.mem.print(&buf, "{s}.open.{s}", .{ @tagName(kind), phase });
             try std.testing.expectEqualStrings(name, Capture.names[i]);
         }
         try std.testing.expectEqual(@as(u64, 150), Capture.values[5]);
@@ -3742,7 +3742,7 @@ test "opening phases partition the action through reveal including repeated rast
     timing.add(.raster, 50);
     const total = timing.finishAt(.{ .nanoseconds = 1_001_000 });
     try std.testing.expectEqual(@as(u64, 1000), total);
-    try std.testing.expectEqual(@as(u64, 850), timing.phases[@intFromEnum(OpenTiming.Phase.show)]);
+    try std.testing.expectEqual(@as(u64, 850), timing.phases[@backingInt(OpenTiming.Phase.show)]);
     var sum: u64 = 0;
     for (timing.phases) |us| sum += us;
     try std.testing.expectEqual(total, sum);

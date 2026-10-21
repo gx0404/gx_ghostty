@@ -1,6 +1,7 @@
 //! GTK session lifecycle. The shared model owns the bounded disk contract;
 //! this module snapshots only user state and resolves current trusted profiles.
 const std = @import("std");
+const adw = @import("adw");
 const gtk = @import("gtk");
 const gobject = @import("gobject");
 const glib = @import("glib");
@@ -12,7 +13,6 @@ const Application = @import("../class/application.zig").Application;
 const Window = @import("../class/window.zig").Window;
 const Tab = @import("../class/tab.zig").Tab;
 const Surface = @import("../class/surface.zig").Surface;
-const Dialog = @import("../class/dialog.zig").Dialog;
 const Overrides = @import("../class/Overrides.zig");
 const origin = @import("origin.zig");
 const launch = @import("launch.zig");
@@ -47,7 +47,7 @@ const State = struct {
     cli: Cli = .{},
     parsed: ?model.Parsed = null,
     approvals: std.ArrayList(Approval) = .empty,
-    dialog: ?*Dialog = null,
+    dialog: ?*adw.AlertDialog = null,
     dialog_handler: c_ulong = 0,
     asking: ?Approval = null,
 
@@ -57,8 +57,8 @@ const State = struct {
         if (self.idle) |idle| _ = glib.Source.remove(idle);
         if (self.dialog) |dialog| {
             if (self.dialog_handler != 0) gobject.signalHandlerDisconnect(dialog.as(gobject.Object), self.dialog_handler);
-            dialog.close();
-            dialog.unref();
+            dialog.as(adw.Dialog).forceClose();
+            dialog.as(gobject.Object).unref();
         }
         if (self.parsed) |parsed| parsed.deinit();
         self.approvals.deinit(self.alloc);
@@ -183,31 +183,31 @@ fn continueRestore(value: *State) void {
         const leaf = node.leaf orelse continue;
         const profile = profiles.findId(leaf.profile_id) orelse continue;
         if (model.restoreDecision(profile.id, true) != .confirm_custom or approved(value, profile.*) != null) continue;
-        const dialog = gobject.ext.newInstance(Dialog, .{});
+        const dialog = adw.AlertDialog.new(null, null);
         _ = dialog.as(gobject.Object).refSink();
         value.dialog = dialog;
         value.asking = .{ .id = leaf.profile_id, .signature = signature(profile.*), .allowed = false };
-        dialog.as(Dialog.Parent).setHeading(tr("Restore custom launch profile?"));
+        dialog.setHeading(tr("Restore custom launch profile?"));
         const command = if (profile.args.len > 0) profile.args[0] else "";
-        const body = std.fmt.allocPrintSentinel(value.alloc, "{s}\n{s}\n\n{s}", .{ profile.name, command, tr("This profile runs its current configured command. Restore it for this session?") }, 0) catch return restoreFailed(value);
+        const body = value.alloc.printSentinel("{s}\n{s}\n\n{s}", .{ profile.name, command, tr("This profile runs its current configured command. Restore it for this session?") }, 0) catch return restoreFailed(value);
         defer value.alloc.free(body);
-        dialog.as(Dialog.Parent).setBody(body);
-        dialog.as(Dialog.Parent).addResponse("skip", tr("Skip"));
-        dialog.as(Dialog.Parent).addResponse("restore", tr("Restore"));
-        dialog.as(Dialog.Parent).setDefaultResponse("skip");
-        dialog.as(Dialog.Parent).setCloseResponse("skip");
-        value.dialog_handler = Dialog.Parent.signals.response.connect(dialog.as(Dialog.Parent), *State, response, value, .{});
-        dialog.present(null);
+        dialog.setBody(body);
+        dialog.addResponse("skip", tr("Skip"));
+        dialog.addResponse("restore", tr("Restore"));
+        dialog.setDefaultResponse("skip");
+        dialog.setCloseResponse("skip");
+        value.dialog_handler = adw.AlertDialog.signals.response.connect(dialog, *State, response, value, .{});
+        dialog.as(adw.Dialog).present(null);
         return;
     };
     buildRestore(value, &profiles) catch return restoreFailed(value);
 }
-fn response(_: *Dialog.Parent, response_id: [*:0]const u8, value: *State) callconv(.c) void {
+fn response(_: *adw.AlertDialog, response_id: [*:0]const u8, value: *State) callconv(.c) void {
     if (value.quitting) return;
     const dialog = value.dialog orelse return;
     value.dialog = null;
     value.dialog_handler = 0;
-    defer dialog.unref();
+    defer dialog.as(gobject.Object).unref();
     var approval = value.asking orelse return;
     value.asking = null;
     approval.allowed = std.mem.eql(u8, std.mem.span(response_id), "restore");
@@ -225,8 +225,8 @@ fn restoreFailed(value: *State) void {
         if (value.dialog_handler != 0) gobject.signalHandlerDisconnect(dialog.as(gobject.Object), value.dialog_handler);
         value.dialog = null;
         value.dialog_handler = 0;
-        dialog.close();
-        dialog.unref();
+        dialog.as(adw.Dialog).forceClose();
+        dialog.as(gobject.Object).unref();
     }
     clearParsed(value);
     value.app.gxNewWindow(null, .none) catch {};
@@ -303,13 +303,13 @@ fn restoreNode(value: *State, profiles: *const launch.List, tab: model.Tab, inde
         _ = it.init(args);
         var overrides = try Overrides.parse(arena.allocator(), &it);
         overrides.launch_origin = .{ .profile = profile.id };
-        overrides.title = if (!value.cli.title) if (leaf.title_override) |title| try arena.allocator().dupeZ(u8, title) else null else null;
+        overrides.title = if (!value.cli.title) if (leaf.title_override) |title| try arena.allocator().dupeSentinel(u8, title, 0) else null else null;
         if (leaf.cwd) |cwd| if (cwd.kind == .posix) {
             // Parse already validated the lexical local-domain constraint.
             if (std.Io.Dir.openDirAbsolute(global.io(), cwd.path, .{})) |dir_| {
                 var dir = dir_;
                 dir.close(global.io());
-                overrides.working_directory = try arena.allocator().dupeZ(u8, cwd.path);
+                overrides.working_directory = try arena.allocator().dupeSentinel(u8, cwd.path, 0);
             } else |_| return error.WorkingDirectoryUnavailable;
         };
         const surface = Surface.new(overrides);
@@ -369,7 +369,7 @@ fn buildRestore(value: *State, profiles: *const launch.List) !void {
             _ = tab.as(gobject.Object).refSink();
             defer tab.unref();
             if (!value.cli.title) if (saved_tab.title_override) |title| {
-                const title_z = try value.alloc.dupeZ(u8, title);
+                const title_z = try value.alloc.dupeSentinel(u8, title, 0);
                 defer value.alloc.free(title_z);
                 tab.setTitleOverride(title_z);
             };

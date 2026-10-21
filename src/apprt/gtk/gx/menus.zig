@@ -148,7 +148,7 @@ pub const Source = struct {
         append(result, self.menu(@tagName(id)).as(gio.MenuModel), self.options);
         result.as(gobject.Object).setData(
             language_key,
-            @ptrFromInt(@as(usize, @intFromEnum(gx.i18n.current())) + 1),
+            @ptrFromInt(@as(usize, @backingInt(gx.i18n.current())) + 1),
         );
         return result;
     }
@@ -250,7 +250,7 @@ const Cache = struct {
     sources: [std.enums.values(gx.i18n.Language).len]?Source = @splat(null),
 
     fn source(self: *Cache, options: Options) *Source {
-        const slot = &self.sources[@intFromEnum(gx.i18n.current())];
+        const slot = &self.sources[@backingInt(gx.i18n.current())];
         if (slot.*) |*existing| {
             existing.prepare(options);
             return existing;
@@ -355,7 +355,7 @@ fn unrefMenu(data: ?*anyopaque) callconv(.c) c_int {
 /// language.
 pub fn isCurrent(model: *gio.MenuModel) bool {
     const stamp = model.as(gobject.Object).getData(language_key) orelse return false;
-    return @intFromPtr(stamp) == @as(usize, @intFromEnum(gx.i18n.current())) + 1;
+    return @intFromPtr(stamp) == @as(usize, @backingInt(gx.i18n.current())) + 1;
 }
 
 fn append(target: *gio.Menu, source: *gio.MenuModel, options: Options) void {

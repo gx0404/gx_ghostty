@@ -219,11 +219,11 @@ pub const BellFeature = struct {
 /// The `bell-features` flags, in display order. Both settings runtimes
 /// implement every flag, including the per-terminal border highlight.
 pub const bell_features = [_]BellFeature{
-    .{ .field = "system", .label = "System Sound", .runtimes = .initFull() },
-    .{ .field = "audio", .label = "Audio File", .runtimes = .initFull() },
-    .{ .field = "attention", .label = "Request Attention", .runtimes = .initFull() },
-    .{ .field = "title", .label = "Bell Icon in Title", .runtimes = .initFull() },
-    .{ .field = "border", .label = "Border Highlight", .runtimes = .initFull() },
+    .{ .field = "system", .label = "System Sound", .runtimes = .full },
+    .{ .field = "audio", .label = "Audio File", .runtimes = .full },
+    .{ .field = "attention", .label = "Request Attention", .runtimes = .full },
+    .{ .field = "title", .label = "Bell Icon in Title", .runtimes = .full },
+    .{ .field = "border", .label = "Border Highlight", .runtimes = .full },
 };
 
 /// The value type of `cursor-style`.
@@ -466,7 +466,7 @@ pub const FontSize = struct {
     /// Formats a normalized size as a configuration value, without
     /// trailing zeros (`12`, `12.5`).
     pub fn format(buf: []u8, value: f32) error{NoSpaceLeft}![]const u8 {
-        return std.fmt.bufPrint(buf, "{d}", .{value});
+        return std.mem.print(buf, "{d}", .{value});
     }
 };
 
@@ -499,10 +499,10 @@ pub fn fontFamilies(alloc: Allocator, new: []const u8, current: []const []const 
 /// `system,no-audio,attention`, so it does not depend on the defaults.
 pub fn formatFlags(comptime T: type, value: T, buf: []u8) error{NoSpaceLeft}![]const u8 {
     var writer: std.Io.Writer = .fixed(buf);
-    inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
+    inline for (@typeInfo(T).@"struct".field_names, 0..) |field, i| {
         if (i > 0) writer.writeByte(',') catch return error.NoSpaceLeft;
-        if (!@field(value, field.name)) writer.writeAll("no-") catch return error.NoSpaceLeft;
-        writer.writeAll(field.name) catch return error.NoSpaceLeft;
+        if (!@field(value, field)) writer.writeAll("no-") catch return error.NoSpaceLeft;
+        writer.writeAll(field) catch return error.NoSpaceLeft;
     }
     return writer.buffered();
 }
@@ -516,12 +516,12 @@ pub fn quietReloadArg(buf: []u8, current: Config.AppNotifications) error{NoSpace
     quiet.@"config-reload" = false;
     var flags_buf: [128]u8 = undefined;
     const flags = try formatFlags(Config.AppNotifications, quiet, &flags_buf);
-    return std.fmt.bufPrintZ(buf, "--app-notifications={s}", .{flags});
+    return std.mem.printSentinel(buf, "--app-notifications={s}", .{flags}, 0);
 }
 
 /// The command-line override that previews the theme `name`.
 pub fn themeArg(alloc: Allocator, name: []const u8) Allocator.Error![:0]u8 {
-    return std.fmt.allocPrintSentinel(alloc, "--theme={s}", .{name}, 0);
+    return alloc.printSentinel("--theme={s}", .{name}, 0);
 }
 
 /// The theme a theme list shows as selected for a `theme` value: the
@@ -552,8 +552,8 @@ pub const ThemePair = struct {
     /// The `theme` value: the name of one theme, `light:<light>,dark:<dark>`
     /// for two. Names must pass `isThemeName`.
     pub fn value(self: ThemePair, alloc: Allocator) Allocator.Error![:0]u8 {
-        if (!self.isPair()) return try alloc.dupeZ(u8, self.light);
-        return try std.fmt.allocPrintSentinel(alloc, "light:{s},dark:{s}", .{ self.light, self.dark }, 0);
+        if (!self.isPair()) return try alloc.dupeSentinel(u8, self.light, 0);
+        return try alloc.printSentinel("light:{s},dark:{s}", .{ self.light, self.dark }, 0);
     }
 
     /// The command-line override that previews the pair.
@@ -632,7 +632,7 @@ pub fn listThemes(alloc: Allocator, io: std.Io, dirs: []const []const u8) Alloca
             if (!isThemeName(entry.name)) continue;
             const result = try seen.getOrPut(arena_alloc, entry.name);
             if (result.found_existing) continue;
-            const name = try arena_alloc.dupeZ(u8, entry.name);
+            const name = try arena_alloc.dupeSentinel(u8, entry.name, 0);
             result.key_ptr.* = name;
             try names.append(arena_alloc, name);
         }
@@ -662,7 +662,7 @@ pub fn profileCommand(
     platform: profiles.Platform,
 ) Allocator.Error![:0]u8 {
     const args = switch (profile.command) {
-        .command_line => |line| return try alloc.dupeZ(u8, line),
+        .command_line => |line| return try alloc.dupeSentinel(u8, line, 0),
         .argv => |argv| argv,
     };
 
@@ -919,7 +919,7 @@ fn testConfig(args: []const []const u8) !Config {
 }
 
 fn settingArg(buf: []u8, setting: Setting) ![]const u8 {
-    return std.fmt.bufPrint(buf, "--{s}={s}", .{ setting.key, setting.value });
+    return std.mem.print(buf, "--{s}={s}", .{ setting.key, setting.value });
 }
 
 test "material presets set opacity and blur" {
@@ -963,7 +963,7 @@ test "choices offer every value once and parse back" {
         for (std.enums.values(T)) |value| {
             const index = choiceIndex(T, choices, value).?;
             var buf: [64]u8 = undefined;
-            var cfg = try testConfig(&.{try std.fmt.bufPrint(&buf, "--" ++ case[2] ++ "={s}", .{@tagName(value)})});
+            var cfg = try testConfig(&.{try std.mem.print(&buf, "--" ++ case[2] ++ "={s}", .{@tagName(value)})});
             defer cfg.deinit();
             try testing.expectEqual(choices[index].value, @field(cfg, case[2]));
         }
@@ -973,11 +973,11 @@ test "choices offer every value once and parse back" {
 }
 
 test "bell feature labels cover every flag" {
-    const fields = @typeInfo(Config.BellFeatures).@"struct".fields;
+    const fields = @typeInfo(Config.BellFeatures).@"struct".field_names;
     try testing.expectEqual(fields.len, bell_features.len);
     inline for (fields) |field| {
         const found = for (bell_features) |feature| {
-            if (std.mem.eql(u8, feature.field, field.name)) break true;
+            if (std.mem.eql(u8, feature.field, field)) break true;
         } else false;
         try testing.expect(found);
     }
@@ -1009,7 +1009,7 @@ test "switches write booleans their keys parse" {
     for ([_]Switch{ cursor_blink, focus_follows_mouse, ctrl_scroll_zoom }) |item| {
         for ([_]bool{ true, false }) |on| {
             var buf: [64]u8 = undefined;
-            var cfg = try testConfig(&.{try std.fmt.bufPrint(&buf, "--{s}={s}", .{ item.key, Switch.value(on) })});
+            var cfg = try testConfig(&.{try std.mem.print(&buf, "--{s}={s}", .{ item.key, Switch.value(on) })});
             defer cfg.deinit();
         }
     }
@@ -1027,7 +1027,7 @@ test "switches write booleans their keys parse" {
 test "accent choices write values that parse back" {
     for (std.enums.values(Accent)) |choice| {
         var buf: [64]u8 = undefined;
-        var cfg = try testConfig(&.{try std.fmt.bufPrint(&buf, "--{s}={s}", .{ Accent.key, choice.value() })});
+        var cfg = try testConfig(&.{try std.mem.print(&buf, "--{s}={s}", .{ Accent.key, choice.value() })});
         defer cfg.deinit();
         try testing.expectEqual(choice, Accent.fromConfig(cfg.@"gx-accent-color").?);
     }
@@ -1048,7 +1048,7 @@ test "opacity choices write values that parse back" {
             continue;
         };
         var buf: [64]u8 = undefined;
-        var cfg = try testConfig(&.{try std.fmt.bufPrint(&buf, "--background-opacity={s}", .{text})});
+        var cfg = try testConfig(&.{try std.mem.print(&buf, "--background-opacity={s}", .{text})});
         defer cfg.deinit();
         try testing.expectEqual(@as(?Opacity, choice), Opacity.fromConfig(cfg.@"background-opacity", true));
     }
@@ -1065,8 +1065,8 @@ test "padding presets write values that parse back" {
         };
         var bufs: [2][64]u8 = undefined;
         var cfg = try testConfig(&.{
-            try std.fmt.bufPrint(&bufs[0], "--{s}={s}", .{ Padding.keys[0], texts[0] }),
-            try std.fmt.bufPrint(&bufs[1], "--{s}={s}", .{ Padding.keys[1], texts[1] }),
+            try std.mem.print(&bufs[0], "--{s}={s}", .{ Padding.keys[0], texts[0] }),
+            try std.mem.print(&bufs[1], "--{s}={s}", .{ Padding.keys[1], texts[1] }),
         });
         defer cfg.deinit();
         try testing.expectEqual(@as(?Padding, preset), Padding.fromConfig(cfg.@"window-padding-x", cfg.@"window-padding-y", true));
@@ -1161,7 +1161,7 @@ test "formatFlags round-trips through the parser" {
     };
     for (bells) |bell| {
         var arg_buf: [160]u8 = undefined;
-        const arg = try std.fmt.bufPrint(&arg_buf, "--bell-features={s}", .{try formatFlags(Config.BellFeatures, bell, &buf)});
+        const arg = try std.mem.print(&arg_buf, "--bell-features={s}", .{try formatFlags(Config.BellFeatures, bell, &buf)});
         var cfg = try testConfig(&.{ "--bell-features=system,audio", arg });
         defer cfg.deinit();
         try testing.expectEqual(bell, cfg.@"bell-features");
@@ -1206,7 +1206,7 @@ test "font sizes are clamped, rounded and formatted" {
 
     for ([_]f32{ 6, 12.5, 13.3, 100 }) |size| {
         var arg_buf: [64]u8 = undefined;
-        var cfg = try testConfig(&.{try std.fmt.bufPrint(&arg_buf, "--font-size={s}", .{try FontSize.format(&buf, size)})});
+        var cfg = try testConfig(&.{try std.mem.print(&arg_buf, "--font-size={s}", .{try FontSize.format(&buf, size)})});
         defer cfg.deinit();
         try testing.expectEqual(size, cfg.@"font-size");
     }
@@ -1286,7 +1286,7 @@ test "listThemes skips directories it cannot read" {
     defer testing.allocator.free(resources);
     const file = try std.fs.path.join(testing.allocator, &.{ root, "file" });
     defer testing.allocator.free(file);
-    const long = try std.fs.path.join(testing.allocator, &.{ root, "x" ** 300 });
+    const long = try std.fs.path.join(testing.allocator, &.{ root, std.mem.asBytes(&@as([300]["x".len]u8, @splat("x".*))) });
     defer testing.allocator.free(long);
 
     var list = try listThemes(testing.allocator, io, &.{ long, file, resources });
@@ -1338,7 +1338,7 @@ test "profileCommand direct commands parse back to the arguments" {
     }, .linux);
     defer testing.allocator.free(command);
     var buf: [128]u8 = undefined;
-    var cfg = try testConfig(&.{try std.fmt.bufPrint(&buf, "--command={s}", .{command})});
+    var cfg = try testConfig(&.{try std.mem.print(&buf, "--command={s}", .{command})});
     defer cfg.deinit();
     const parsed = cfg.command.?.direct;
     try testing.expectEqual(argv.len, parsed.len);
@@ -1463,7 +1463,7 @@ test "settings strings are translated" {
             count.* += 1;
         }
     }.check;
-    inline for (@typeInfo(msg).@"struct".decls) |decl| check(@field(msg, decl.name), &missing);
+    inline for (@typeInfo(msg).@"struct".decl_names) |decl| check(@field(msg, decl), &missing);
     for (right_click_choices) |choice| check(choice.label, &missing);
     for (close_confirmation_choices) |choice| check(choice.label, &missing);
     for (cursor_style_choices) |choice| check(choice.label, &missing);

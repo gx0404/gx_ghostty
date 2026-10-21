@@ -91,7 +91,7 @@ const toast_text_max = 256;
 pub fn ownerId(reference: refs.Reference) u64 {
     var hasher = std.hash.Wyhash.init(0x67785f72656d6f74);
     hasher.update(std.mem.asBytes(&reference.epoch));
-    const kind: u64 = @intFromEnum(reference.kind);
+    const kind: u64 = @backingInt(reference.kind);
     hasher.update(std.mem.asBytes(&kind));
     hasher.update(std.mem.asBytes(&reference.id));
     hasher.update(std.mem.asBytes(&reference.generation));
@@ -288,7 +288,7 @@ fn commandFinished(app: *App, pane: *RemotePane, exit_code: ?u8, duration_ns: u6
         else
             i18n.tr("Command finished");
         var duration_buf: [32]u8 = undefined;
-        const text = std.fmt.bufPrint(&duration_buf, "{f}", .{duration.round(std.time.ns_per_ms)}) catch "";
+        const text = std.mem.print(&duration_buf, "{f}", .{duration.round(std.time.ns_per_ms)}) catch "";
         var body_buf: [256]u8 = undefined;
         var body: std.Io.Writer = .fixed(&body_buf);
         if (exit_code) |code| {
@@ -394,7 +394,7 @@ test "remote key hints keep whole UTF-8 characters within the toast text" {
     const testing = std.testing;
     var buf: [toast_text_max]u8 = undefined;
     try testing.expectEqualStrings("Ctrl+A \u{2192} B \u{2026}", sequenceHint(&buf, "Ctrl+A \u{2192} B"));
-    const long = "\u{2192}" ** 120;
+    const long = std.mem.asBytes(&@as([120]["\u{2192}".len]u8, @splat("\u{2192}".*)));
     const hint = sequenceHint(&buf, long);
     try testing.expect(hint.len <= buf.len);
     try testing.expect(std.unicode.utf8ValidateSlice(hint));

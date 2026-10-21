@@ -236,7 +236,7 @@ fn syncTabWith(tab: *Tab, force: bool) void {
 const kind_key = "gx-progress-kind";
 
 pub fn setKind(page: *adw.TabPage, kind: gx.leader.Kind) void {
-    page.as(gobject.Object).setData(kind_key, @ptrFromInt(@intFromEnum(kind)));
+    page.as(gobject.Object).setData(kind_key, @ptrFromInt(@backingInt(kind)));
     const tab = gobject.ext.cast(Tab, page.getChild()) orelse return;
     setTooltip(page, tabIndicator(tab));
 }
@@ -256,15 +256,15 @@ fn combinedTooltip(indicator: Indicator, kind: gx.leader.Kind, buf: []u8) [:0]co
     var progress_buf: [128]u8 = undefined;
     const text = indicator.tooltip(&progress_buf);
     if (text.len == 0) return status;
-    return std.fmt.bufPrintZ(buf, "{s} · {s}", .{ status, text }) catch status;
+    return std.mem.printSentinel(buf, "{s} · {s}", .{ status, text }, 0) catch status;
 }
 
 fn tabTooltip(base: [:0]const u8, indicator: Indicator, kind: gx.leader.Kind, buf: []u8) [:0]const u8 {
     var detail_buf: [256]u8 = undefined;
     const detail = combinedTooltip(indicator, kind, &detail_buf);
     if (detail.len == 0) return base;
-    if (base.len == 0) return std.fmt.bufPrintZ(buf, "{s}", .{detail}) catch base;
-    return std.fmt.bufPrintZ(buf, "{s}\n{s}", .{ base, detail }) catch base;
+    if (base.len == 0) return std.mem.printSentinel(buf, "{s}", .{detail}, 0) catch base;
+    return std.mem.printSentinel(buf, "{s}\n{s}", .{ base, detail }, 0) catch base;
 }
 
 fn tabTooltipChanged(_: *gobject.Object, _: *gobject.ParamSpec, tab: *Tab) callconv(.c) void {

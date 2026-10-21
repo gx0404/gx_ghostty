@@ -63,7 +63,7 @@ pub fn fromDeferred(alloc: Allocator, library: font.Library, deferred: font.Defe
         source.fc.?.variations = inputs;
         break :blk .{ (try source.fc.?.pattern.get(.file, 0)).string, (try source.fc.?.pattern.get(.index, 0)).integer };
     };
-    const path = try alloc.dupeZ(u8, file);
+    const path = try alloc.dupeSentinel(u8, file, 0);
     errdefer alloc.free(path);
     var peek = try source.load(library, .{ .size = .{ .points = 12 } });
     defer peek.deinit();

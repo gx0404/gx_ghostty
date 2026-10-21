@@ -137,7 +137,7 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(1, setup_env.exit_code([*ok, Item("graphify", "MISSING", "", True)]))
 
     def test_render_lists_every_item(self) -> None:
-        items = [setup_env.Item("zig", "FOUND", "0.16.0", True), setup_env.Item("codex", "OPTIONAL", "未安装（可选）", False)]
+        items = [setup_env.Item("zig", "FOUND", "0.17.0", True), setup_env.Item("codex", "OPTIONAL", "未安装（可选）", False)]
         table = setup_env.render(items).splitlines()
         self.assertEqual(3, len(table))
         self.assertTrue(table[1].startswith("FOUND"))

@@ -94,7 +94,7 @@ pub fn slantRank(italic: bool, actual: Slant) u8 {
 /// first, then slant, then weight (the CSS order); the named style match
 /// and monospace break ties around them.
 fn rankKey(req: Request, attrs: Attributes) u64 {
-    const style: u64 = if (req.style) 2 - @as(u64, @intFromEnum(attrs.style_match)) else 0;
+    const style: u64 = if (req.style) 2 - @as(u64, @backingInt(attrs.style_match)) else 0;
     const stretch: u64 = stretchRank(normal_stretch, attrs.stretch);
     const slant: u64 = slantRank(req.italic and !req.style, attrs.slant);
     const desired_weight: u16 = if (req.bold and !req.style) bold_weight else normal_weight;
@@ -174,7 +174,7 @@ pub fn styleMatch(names: []const []const u8, wanted: []const u8) StyleMatch {
     var result: StyleMatch = .none;
     for (names) |name| {
         if (std.ascii.eqlIgnoreCase(name, wanted)) return .exact;
-        if (wanted.len > 0 and std.ascii.indexOfIgnoreCase(name, wanted) != null) result = .fuzzy;
+        if (wanted.len > 0 and std.ascii.findIgnoreCase(name, wanted) != null) result = .fuzzy;
     }
     return result;
 }

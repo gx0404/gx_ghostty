@@ -135,7 +135,7 @@ fn entersContainer(args: []const []const u8) bool {
 /// `.local`.
 pub fn terminalKind(alloc: Allocator, io: std.Io, root: ?u64, tree: ?proc.Tree) Kind {
     const pid = std.math.cast(proc.Pid, root orelse return .local) orelse return .local;
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux => {
             var dir = std.Io.Dir.openDirAbsolute(io, "/proc", .{}) catch return .local;
             defer dir.close(io);
@@ -210,7 +210,7 @@ pub fn procKind(
 /// `<pid>/status` in `proc_dir`, or null if it is unknown.
 pub fn effectiveUid(io: std.Io, proc_dir: std.Io.Dir, pid: proc.Pid) ?u32 {
     var path_buf: [32]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{d}/status", .{pid}) catch return null;
+    const path = std.mem.print(&path_buf, "{d}/status", .{pid}) catch return null;
     var buf: [4096]u8 = undefined;
     const data = proc_dir.readFile(io, path, &buf) catch return null;
     var lines = std.mem.splitScalar(u8, data, '\n');
@@ -229,7 +229,7 @@ pub fn effectiveUid(io: std.Io, proc_dir: std.Io.Dir, pid: proc.Pid) ?u32 {
 /// in `proc_dir`, or null if they are unknown.
 fn readArgs(arena: Allocator, io: std.Io, proc_dir: std.Io.Dir, pid: proc.Pid) Allocator.Error!?[]const []const u8 {
     var path_buf: [32]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{d}/cmdline", .{pid}) catch return null;
+    const path = std.mem.print(&path_buf, "{d}/cmdline", .{pid}) catch return null;
     var buf: [4096]u8 = undefined;
     const data = proc_dir.readFile(io, path, &buf) catch return null;
     var args: std.ArrayList([]const u8) = .empty;

@@ -179,16 +179,12 @@ pub fn htmlDocument(alloc: Allocator, fragment: []const u8) Allocator.Error![]u8
     const start_fragment = start_html + html_prefix.len;
     const end_fragment = start_fragment + fragment.len;
     const end_html = end_fragment + html_suffix.len;
-    return std.fmt.allocPrint(
-        alloc,
-        "Version:0.9\r\n" ++
-            "StartHTML:{d:0>10}\r\n" ++
-            "EndHTML:{d:0>10}\r\n" ++
-            "StartFragment:{d:0>10}\r\n" ++
-            "EndFragment:{d:0>10}\r\n" ++
-            html_prefix ++ "{s}" ++ html_suffix,
-        .{ start_html, end_html, start_fragment, end_fragment, fragment },
-    );
+    return alloc.print("Version:0.9\r\n" ++
+        "StartHTML:{d:0>10}\r\n" ++
+        "EndHTML:{d:0>10}\r\n" ++
+        "StartFragment:{d:0>10}\r\n" ++
+        "EndFragment:{d:0>10}\r\n" ++
+        html_prefix ++ "{s}" ++ html_suffix, .{ start_html, end_html, start_fragment, end_fragment, fragment });
 }
 
 /// Call `tryOnce` up to `attempts` times, calling `wait` between two

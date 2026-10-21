@@ -455,7 +455,7 @@ test "a full history replaces its weakest pick" {
     var history: History = .{};
     var buf: [16]u8 = undefined;
     for (0..max_picks) |i| {
-        history.record(try std.fmt.bufPrint(&buf, "k{d}", .{i}), t0 + @as(i64, @intCast(i)));
+        history.record(try std.mem.print(&buf, "k{d}", .{i}), t0 + @as(i64, @intCast(i)));
     }
     history.record("newest", t0 + 1000);
     try testing.expectEqual(@as(usize, max_picks), history.picks_len);

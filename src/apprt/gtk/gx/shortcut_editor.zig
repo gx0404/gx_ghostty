@@ -69,7 +69,7 @@ fn paramKind(comptime T: type) ParamKind {
 fn enumValues(comptime T: type) []const u8 {
     if (@typeInfo(T) != .@"enum") return "";
     comptime var text: []const u8 = "";
-    inline for (std.meta.fieldNames(T), 0..) |name, i| text = text ++ (if (i == 0) "" else ", ") ++ name;
+    inline for (@typeInfo(T).@"enum".field_names, 0..) |name, i| text = text ++ (if (i == 0) "" else ", ") ++ name;
     return text;
 }
 
@@ -77,32 +77,33 @@ fn enumValues(comptime T: type) []const u8 {
 /// binding cannot be set to; `gx:` actions one by one.
 const choices = blk: {
     @setEvalBranchQuota(200_000);
-    const fields = @typeInfo(Binding.Action).@"union".fields;
+    const info = @typeInfo(Binding.Action).@"union";
     var count = 0;
-    for (fields) |field| {
-        if (skipChoice(field)) continue;
-        count += if (std.mem.eql(u8, field.name, "gx")) @typeInfo(field.type).@"union".fields.len else 1;
+    for (info.field_names, info.field_types) |name, field_type| {
+        if (skipChoice(name, field_type)) continue;
+        count += if (std.mem.eql(u8, name, "gx")) @typeInfo(field_type).@"union".field_names.len else 1;
     }
     var result: [count]Choice = undefined;
     var i = 0;
-    for (fields) |field| {
-        if (skipChoice(field)) continue;
-        if (std.mem.eql(u8, field.name, "gx")) {
-            for (@typeInfo(field.type).@"union".fields) |sub| {
-                result[i] = .{ .name = "gx:" ++ sub.name, .param = if (sub.type == void) .none else .required, .values = enumValues(sub.type) };
+    for (info.field_names, info.field_types) |name, field_type| {
+        if (skipChoice(name, field_type)) continue;
+        if (std.mem.eql(u8, name, "gx")) {
+            const sub = @typeInfo(field_type).@"union";
+            for (sub.field_names, sub.field_types) |sub_name, sub_type| {
+                result[i] = .{ .name = "gx:" ++ sub_name, .param = if (sub_type == void) .none else .required, .values = enumValues(sub_type) };
                 i += 1;
             }
             continue;
         }
-        result[i] = .{ .name = field.name, .param = paramKind(field.type), .values = enumValues(field.type) };
+        result[i] = .{ .name = name, .param = paramKind(field_type), .values = enumValues(field_type) };
         i += 1;
     }
     const final = result;
     break :blk final;
 };
 
-fn skipChoice(comptime field: std.builtin.Type.UnionField) bool {
-    return std.mem.eql(u8, field.name, "unbind") or field.type == Binding.Action.CursorKey;
+fn skipChoice(comptime name: []const u8, comptime field_type: type) bool {
+    return std.mem.eql(u8, name, "unbind") or field_type == Binding.Action.CursorKey;
 }
 
 fn choiceIndex(name: []const u8) ?usize {
@@ -256,7 +257,7 @@ fn buildChoices(state: *State) !void {
         fn lessThan(_: void, a: usize, b: usize) bool {
             const pa = sheet.placeByName(choices[a].name);
             const pb = sheet.placeByName(choices[b].name);
-            if (pa.category != pb.category) return @intFromEnum(pa.category) < @intFromEnum(pb.category);
+            if (pa.category != pb.category) return @backingInt(pa.category) < @backingInt(pb.category);
             if (pa.rank != pb.rank) return pa.rank < pb.rank;
             return sheet.naturalOrder(choices[a].name, choices[b].name) == .lt;
         }
@@ -267,7 +268,7 @@ fn buildChoices(state: *State) !void {
     state.choice_titles = titles;
     for (order, 0..) |choice, position| {
         const name = choices[choice].name;
-        titles[position] = try state.alloc.dupeZ(u8, if (sheet.titleForName(name)) |msgid| trRuntime(msgid) else name);
+        titles[position] = try state.alloc.dupeSentinel(u8, if (sheet.titleForName(name)) |msgid| trRuntime(msgid) else name, 0);
     }
 }
 
@@ -402,12 +403,12 @@ const Titles = struct { translated: [:0]const u8, english: []const u8 };
 fn entryTitle(alloc: Allocator, entry: model.Entry, text: []const u8, commands: []const input.Command) !Titles {
     const row: sheet.Row = .{ .category = .other, .rank = 0, .actions = entry.actions, .sequences = &.{}, .text = text };
     const found = try shortcuts.title(alloc, row, commands) orelse {
-        const raw = try alloc.dupeZ(u8, text);
+        const raw = try alloc.dupeSentinel(u8, text, 0);
         return .{ .translated = raw, .english = raw };
     };
     const translated = trRuntime(found.msgid);
     const argument = found.argument orelse return .{
-        .translated = try alloc.dupeZ(u8, translated),
+        .translated = try alloc.dupeSentinel(u8, translated, 0),
         .english = try alloc.dupe(u8, found.msgid),
     };
     return .{
@@ -499,9 +500,9 @@ fn reload(state: *State) !void {
         if (selection != .lower) try used.append(alloc, selection);
         const text = try actionsText(alloc, entry.actions);
         const titles = try entryTitle(alloc, entry, text, commands);
-        const formatted = try std.fmt.allocPrint(alloc, "{f}", .{entry.actions[0]});
+        const formatted = try alloc.print("{f}", .{entry.actions[0]});
         const where = sheet.place(entry.actions[0]);
-        var section: u32 = @intFromEnum(where.category);
+        var section: u32 = @backingInt(where.category);
         var section_title: [:0]const u8 = trRuntime(where.category.title());
         if (entry.key.table.len > 0) {
             for (tables.items, 0..) |name, i| if (std.mem.eql(u8, name, entry.key.table)) {
@@ -565,9 +566,9 @@ fn reload(state: *State) !void {
 fn overrideItem(alloc: Allocator, policy: model.Policy, selection: model.Selection, values: []const []const u8, section_title: [:0]const u8) !Item {
     const first = if (values.len == 0 or values[0].len == 0) "keybind =" else values[0];
     const title = if (values.len > 1)
-        try std.fmt.allocPrintSentinel(alloc, "{s} …", .{first}, 0)
+        try alloc.printSentinel("{s} …", .{first}, 0)
     else
-        try alloc.dupeZ(u8, first);
+        try alloc.dupeSentinel(u8, first, 0);
     const text = try model.valuesText(alloc, values);
     return .{
         .entry = null,
@@ -883,7 +884,7 @@ fn openStructured(state: *State, item: ?Item) void {
     var param: []const u8 = "";
     var flags: Binding.Flags = .{};
     if (item) |found| if (found.entry) |entry| {
-        const formatted = std.fmt.allocPrint(alloc, "{f}", .{entry.actions[0]}) catch "";
+        const formatted = alloc.print("{f}", .{entry.actions[0]}) catch "";
         const split = splitAction(formatted);
         choice = choiceIndex(split.name) orelse choice;
         param = split.param;
@@ -909,7 +910,7 @@ fn openStructured(state: *State, item: ?Item) void {
     action_group.add(edit.combo.as(gtk.Widget));
     edit.param = adw.EntryRow.new();
     edit.param.as(adw.PreferencesRow).setTitle(tr("Parameter"));
-    edit.param.as(gtk.Editable).setText(alloc.dupeZ(u8, param) catch "");
+    edit.param.as(gtk.Editable).setText(alloc.dupeSentinel(u8, param, 0) catch "");
     action_group.add(edit.param.as(gtk.Widget));
     edit.param_hint = gtk.Label.new("");
     edit.param_hint.setXalign(0);
@@ -1003,7 +1004,7 @@ fn selectedChoice(edit: *Edit) Choice {
 fn showChoice(edit: *Edit) void {
     const alloc = edit.arena.allocator();
     const choice = selectedChoice(edit);
-    edit.combo.as(adw.ActionRow).setSubtitle(alloc.dupeZ(u8, choice.name) catch "");
+    edit.combo.as(adw.ActionRow).setSubtitle(alloc.dupeSentinel(u8, choice.name, 0) catch "");
     edit.param.as(gtk.Widget).setVisible(@intFromBool(choice.param != .none));
     edit.param_hint.as(gtk.Widget).setVisible(@intFromBool(choice.param != .none));
     const hint: [:0]const u8 = switch (choice.param) {
@@ -1228,7 +1229,7 @@ fn draftValues(edit: *Edit, alloc: Allocator) ![]const []const u8 {
             const text = if (choice.param == .none or param.len == 0)
                 try alloc.dupe(u8, choice.name)
             else
-                try std.fmt.allocPrint(alloc, "{s}:{s}", .{ choice.name, param });
+                try alloc.print("{s}:{s}", .{ choice.name, param });
             const action = Binding.Action.parse(text) catch return error.InvalidParam;
             var flags: Binding.Flags = .{};
             flags.performable = edit.flags[0].getActive() != 0;

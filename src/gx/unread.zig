@@ -110,7 +110,7 @@ fn dirty(t: *const terminal.Terminal) bool {
 }
 
 fn anyFlag(flags: anytype) bool {
-    const Int = std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(flags)));
+    const Int = @Int(.unsigned, @bitSizeOf(@TypeOf(flags)));
     return @as(Int, @bitCast(flags)) != 0;
 }
 

@@ -234,11 +234,11 @@ class C6FormalTests(unittest.TestCase):
             for index, label in enumerate(('warmup', 'no-warmup')):
                 exes[index].write_bytes(label.encode())
                 manifest['arms'][label] = dict(source_commit=commits[index], source_clean=True,
-                    optimize='ReleaseFast', exe_sha256=hashlib.sha256(exes[index].read_bytes()).hexdigest(),
+                    optimize='fast', exe_sha256=hashlib.sha256(exes[index].read_bytes()).hexdigest(),
                     build_command='root wrapper command', build_log=str(log),
                     build_log_sha256=hashlib.sha256(log.read_bytes()).hexdigest(),
                     source_exe_attested_by='root',
-                    build_options=['-Doptimize=ReleaseFast', '-Dtarget=x86_64-windows-gnu'])
+                    build_options=['-Doptimize=fast', '-Dtarget=x86_64-windows-gnu'])
             args = SimpleNamespace(runs=10, config=None, env=[], label_env=[], diagnostic=False,
                                    uninstrumented=[], font_manifest=root / 'manifest.json')
             def git(argv):

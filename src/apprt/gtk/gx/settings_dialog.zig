@@ -232,14 +232,14 @@ fn movedPosition(current: ?usize, delta: isize, len: usize) ?usize {
 /// An opacity as a percentage (`0.85` is `85%`).
 fn opacityText(buf: []u8, opacity: f64) error{NoSpaceLeft}![]const u8 {
     const percent: i64 = @intFromFloat(@round(std.math.clamp(opacity, 0, 1) * 100));
-    return std.fmt.bufPrint(buf, "{d}%", .{percent});
+    return std.mem.print(buf, "{d}%", .{percent});
 }
 
 /// A `window-padding-x`/`-y` value: one number, or two when the sides
 /// differ.
 fn paddingValue(buf: []u8, padding: CoreConfig.WindowPadding) error{NoSpaceLeft}![]const u8 {
-    if (padding.top_left == padding.bottom_right) return std.fmt.bufPrint(buf, "{d}", .{padding.top_left});
-    return std.fmt.bufPrint(buf, "{d},{d}", .{ padding.top_left, padding.bottom_right });
+    if (padding.top_left == padding.bottom_right) return std.mem.print(buf, "{d}", .{padding.top_left});
+    return std.mem.print(buf, "{d},{d}", .{ padding.top_left, padding.bottom_right });
 }
 
 /// The value of the opacity row.
@@ -531,10 +531,6 @@ pub const GxSettingsDialog = extern struct {
     /// a page, the dialog starts on the page the last one was closed on.
     pub fn showPage(app: *Application, page: ?settings_map.Page) void {
         var timing = open_perf.begin(.settings);
-        if (!adw_version.supportsDialogs()) {
-            log.warn("the settings dialog needs libadwaita 1.5 or newer", .{});
-            return;
-        }
 
         const window = app.as(gtk.Application).getActiveWindow();
         const parent: ?*gtk.Widget = if (window) |value| value.as(gtk.Widget) else null;
@@ -676,7 +672,6 @@ pub const GxSettingsDialog = extern struct {
     /// settings` this shows the settings dialog and returns true; it
     /// returns false when the caller should open the editor.
     pub fn openConfig(app: *Application) bool {
-        if (!adw_version.supportsDialogs()) return false;
         const config = app.getConfig();
         defer config.unref();
         switch (config.get().@"gx-open-config-ui") {
@@ -1010,8 +1005,8 @@ pub const GxSettingsDialog = extern struct {
             field.* = null;
         }
         if (settings_map.ThemePair.fromConfig(theme)) |pair| {
-            st.saved_light = st.alloc.dupeZ(u8, pair.light) catch null;
-            st.saved_dark = st.alloc.dupeZ(u8, pair.dark) catch null;
+            st.saved_light = st.alloc.dupeSentinel(u8, pair.light, 0) catch null;
+            st.saved_dark = st.alloc.dupeSentinel(u8, pair.dark, 0) catch null;
         }
 
         const pair = self.isThemePair();
@@ -1222,7 +1217,7 @@ pub const GxSettingsDialog = extern struct {
                     var x_buf: [32]u8 = undefined;
                     var y_buf: [32]u8 = undefined;
                     var buf: [80]u8 = undefined;
-                    const value = std.fmt.bufPrint(&buf, "{s} × {s}", .{
+                    const value = std.mem.print(&buf, "{s} × {s}", .{
                         paddingValue(&x_buf, custom.x) catch "?",
                         paddingValue(&y_buf, custom.y) catch "?",
                     }) catch "?";
@@ -1359,15 +1354,15 @@ pub const GxSettingsDialog = extern struct {
             for (list.profiles) |profile| {
                 const command = settings_map.profileCommand(arena, profile, gx.profiles.Platform.native) catch continue;
                 const exe: ?[:0]const u8 = switch (profile.command) {
-                    .argv => |argv| if (argv.len > 0) arena.dupeZ(u8, argv[0]) catch null else null,
+                    .argv => |argv| if (argv.len > 0) arena.dupeSentinel(u8, argv[0], 0) catch null else null,
                     .command_line => null,
                 };
                 if (profile.kind == .herdr) st.herdr = exe;
                 const label: @FieldType(Shell, "label") = if (profile.kind == .custom)
-                    .{ .literal = arena.dupeZ(u8, profile.name) catch continue }
+                    .{ .literal = arena.dupeSentinel(u8, profile.name, 0) catch continue }
                 else
                     .{ .profile = .{
-                        .msgid = arena.dupeZ(u8, profile.name) catch continue,
+                        .msgid = arena.dupeSentinel(u8, profile.name, 0) catch continue,
                         .name = arena.dupe(u8, profile.name_arg orelse "") catch continue,
                     } };
                 shells.append(arena, .{
@@ -1389,7 +1384,7 @@ pub const GxSettingsDialog = extern struct {
 
         if (selected == null) custom: {
             // A command the settings UI did not write.
-            const command = arena.dupeZ(u8, overlay_command.?) catch break :custom;
+            const command = arena.dupeSentinel(u8, overlay_command.?, 0) catch break :custom;
             shells.append(arena, .{ .command = command, .label = .{ .custom = command } }) catch break :custom;
             selected = shells.items.len - 1;
         }
@@ -1405,13 +1400,13 @@ pub const GxSettingsDialog = extern struct {
         const arena = st.arena.allocator();
 
         if (file_load.preferredDefaultFilePath(arena)) |path| {
-            if (arena.dupeZ(u8, path)) |path_z| priv.config_path_row.setSubtitle(path_z) else |_| {}
+            if (arena.dupeSentinel(u8, path, 0)) |path_z| priv.config_path_row.setSubtitle(path_z) else |_| {}
         } else |err| {
             log.warn("cannot locate the configuration file err={}", .{err});
         }
 
         if (gx.config_layers.overlayPath(arena)) |path| {
-            if (arena.dupeZ(u8, path)) |path_z| priv.settings_path_row.setSubtitle(path_z) else |_| {}
+            if (arena.dupeSentinel(u8, path, 0)) |path_z| priv.settings_path_row.setSubtitle(path_z) else |_| {}
         } else |err| {
             log.warn("cannot locate {s} err={}", .{ gx.gui_settings.file_name, err });
         }
@@ -1709,12 +1704,12 @@ pub const GxSettingsDialog = extern struct {
         const color = st.accent_color;
         var buf: [96]u8 = undefined;
         const layer: ?gx.config_layers.Layer = if (st.layers) |*layers| layers.provenance(settings_map.Accent.key) else null;
-        const note = std.fmt.bufPrintZ(&buf, "#{x:0>2}{x:0>2}{x:0>2} · {s}", .{
+        const note = std.mem.printSentinel(&buf, "#{x:0>2}{x:0>2}{x:0>2} · {s}", .{
             color.r,
             color.g,
             color.b,
             self.tr(settings_map.provenanceLabel(layer)),
-        }) catch return;
+        }, 0) catch return;
         priv.accent_custom_row.setSubtitle(note);
     }
 
@@ -2583,7 +2578,7 @@ pub const GxSettingsDialog = extern struct {
         switch (st.opacity) {
             .custom => |value| {
                 var buf: [32]u8 = undefined;
-                self.queueSet("background-opacity", std.fmt.bufPrint(&buf, "{d}", .{value}) catch return);
+                self.queueSet("background-opacity", std.mem.print(&buf, "{d}", .{value}) catch return);
             },
             .choice => {},
         }
@@ -2646,7 +2641,7 @@ pub const GxSettingsDialog = extern struct {
             settings_map.FontSize.normalize(row.getValue()),
         ) catch return 0;
         var text_buf: [33]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&text_buf, "{s}", .{value}) catch return 0;
+        const z = std.mem.printSentinel(&text_buf, "{s}", .{value}, 0) catch return 0;
         row.as(gtk.Editable).setText(z);
         return 1;
     }
@@ -3049,7 +3044,7 @@ const ThemeSwatch = extern struct {
 
     /// `gsk.RoundedRect`, which is only reachable through the GTK
     /// functions that take it.
-    const RoundedRect = @typeInfo(@typeInfo(@TypeOf(gtk.Snapshot.pushRoundedClip)).@"fn".params[1].type.?).pointer.child;
+    const RoundedRect = @typeInfo(@typeInfo(@TypeOf(gtk.Snapshot.pushRoundedClip)).@"fn".param_types[1].?).pointer.child;
 
     fn new() *Self {
         return gobject.ext.newInstance(Self, .{});
@@ -3197,7 +3192,7 @@ test "values the custom padding writes parse back" {
     }) |padding| {
         var buf: [32]u8 = undefined;
         var arg_buf: [64]u8 = undefined;
-        const arg = try std.fmt.bufPrint(&arg_buf, "--window-padding-x={s}", .{try paddingValue(&buf, padding)});
+        const arg = try std.mem.print(&arg_buf, "--window-padding-x={s}", .{try paddingValue(&buf, padding)});
         var cfg = try CoreConfig.default(testing.allocator);
         defer cfg.deinit();
         var it = @import("../../../cli.zig").args.sliceIterator(&.{arg});
@@ -3404,8 +3399,8 @@ test "a kept dialog opens again only while its language and theme stay and no re
 
 test "the dialog strings are translated" {
     var missing: usize = 0;
-    inline for (@typeInfo(text).@"struct".decls) |decl| {
-        const id = @field(text, decl.name);
+    inline for (@typeInfo(text).@"struct".decl_names) |decl_name| {
+        const id = @field(text, decl_name);
         if (gx.i18n.lookup(.zh_CN, id) == null) {
             std.debug.print("missing zh-CN translation for {s}\n", .{id});
             missing += 1;

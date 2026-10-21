@@ -185,7 +185,7 @@ pub fn diagnosticsDigest(config: *const Config) u64 {
 
 /// The Ghostty GX defaults for this platform, in configuration file
 /// syntax.
-pub const defaults: []const u8 = @embedFile("defaults.ghostty") ++ switch (builtin.os.tag) {
+pub const defaults: []const u8 = @embedFile("defaults.ghostty") ++ switch (builtin.target.os.tag) {
     .windows => @embedFile("defaults-windows.ghostty"),
     else => "",
 };
@@ -484,7 +484,7 @@ pub const Layers = struct {
         } else null;
         const at = position orelse expand orelse list.items.len;
         for (values, 0..) |value, n| {
-            const arg = try std.fmt.allocPrintSentinel(arena, "--{s}={s}", .{ key, value }, 0);
+            const arg = try arena.printSentinel("--{s}={s}", .{ key, value }, 0);
             try list.insert(arena, at + n, .{ .arg = arg });
         }
         if (values.len > 0 and expand == null) {
@@ -583,7 +583,7 @@ fn loadOverlay(live: *Config, alloc_gpa: Allocator, arena: Allocator, path: []co
         return null;
     };
     log.warn("cannot read {s} err={}", .{ path, failure });
-    return .{ .message = try std.fmt.allocPrintSentinel(arena, "error reading {s}: {}", .{ path, failure }, 0) };
+    return .{ .message = try arena.printSentinel("error reading {s}: {}", .{ path, failure }, 0) };
 }
 
 /// Where the layers come from when loading for real.
@@ -667,8 +667,8 @@ fn loadWith(alloc_gpa: Allocator, sources: anytype) !Config {
 /// A copy of `step` allocated with `arena`.
 fn cloneStep(arena: Allocator, step: Step) Allocator.Error!Step {
     return switch (step) {
-        .arg => |arg| .{ .arg = try arena.dupeZ(u8, arg) },
-        .gx_default_cursor_arg => |arg| .{ .gx_default_cursor_arg = try arena.dupeZ(u8, arg) },
+        .arg => |arg| .{ .arg = try arena.dupeSentinel(u8, arg, 0) },
+        .gx_default_cursor_arg => |arg| .{ .gx_default_cursor_arg = try arena.dupeSentinel(u8, arg, 0) },
         .expand => |base| .{ .expand = try arena.dupe(u8, base) },
         .conditional_arg => |value| .{ .conditional_arg = .{
             .conditions = conditions: {
@@ -707,12 +707,7 @@ fn languageDiagnostic(arena: Allocator, steps: []const Step) Allocator.Error!?St
     if (i18n.parseLanguage(language) != null) return null;
     return .{ .diagnostic = .{
         .key = "language",
-        .message = try std.fmt.allocPrintSentinel(
-            arena,
-            "unsupported value \"{s}\", using {s}",
-            .{ language, i18n.Language.default.configValue() },
-            0,
-        ),
+        .message = try arena.printSentinel("unsupported value \"{s}\", using {s}", .{ language, i18n.Language.default.configValue() }, 0),
     } };
 }
 
@@ -729,7 +724,7 @@ fn defaultSteps(arena: Allocator, text: []const u8) Allocator.Error![]const Step
     var reader: std.Io.Reader = .fixed(text);
     var iter: cli.args.LineIterator = .{ .r = &reader, .filepath = defaults_location };
     var result: std.ArrayList(Step) = .empty;
-    while (iter.next()) |arg| try result.append(arena, .{ .arg = try arena.dupeZ(u8, arg) });
+    while (iter.next()) |arg| try result.append(arena, .{ .arg = try arena.dupeSentinel(u8, arg, 0) });
     return result.items;
 }
 
@@ -761,7 +756,7 @@ fn effectiveDefaults(arena: Allocator, raw: []const Step, user_font: bool, blink
 /// Appends one layer, resetting each `replaced_keys` key before the
 /// layer's first value for it.
 fn appendLayer(arena: Allocator, list: *std.ArrayList(Step), layer: []const Step) Allocator.Error!void {
-    var reset = [_]bool{false} ** replaced_keys.len;
+    var reset = @as([replaced_keys.len]bool, @splat(false));
     for (layer) |step| {
         switch (step) {
             .arg => |arg| if (replacedKey(arg)) |index| {
@@ -863,8 +858,8 @@ fn translatePaletteEntry(arena: Allocator, arg: []const u8, lang: i18n.Language)
     const description = i18n.lookup(lang, command.description);
     if (title == null and description == null) return null;
 
-    const action = try std.fmt.allocPrint(arena, "{f}", .{command.action});
-    return try std.fmt.allocPrintSentinel(arena, "{s}title:\"{f}\",description:\"{f}\",action:\"{f}\"", .{
+    const action = try arena.print("{f}", .{command.action});
+    return try arena.printSentinel("{s}title:\"{f}\",description:\"{f}\",action:\"{f}\"", .{
         prefix,
         std.zig.fmtString(title orelse command.title),
         std.zig.fmtString(description orelse command.description),
@@ -987,7 +982,7 @@ test "the embedded defaults parse cleanly" {
     try testing.expectEqualStrings("GX Mocha", cfg.theme.?.dark);
     try testing.expectEqual(config_types.AccentColor.brand, cfg.@"gx-accent-color");
     try testing.expectEqualStrings("zh-CN", cfg.language.?);
-    try expectFamilies(if (builtin.os.tag == .windows) &.{"JetBrainsMono Nerd Font"} else &.{}, cfg.@"font-family");
+    try expectFamilies(if (builtin.target.os.tag == .windows) &.{"JetBrainsMono Nerd Font"} else &.{}, cfg.@"font-family");
     for ([_]u21{ 0x3200, 0x33ff, 0xfe10, 0xfe1f }) |codepoint| {
         try testing.expect(cfg.@"font-codepoint-map".map.get(codepoint) != null);
     }
@@ -1003,10 +998,10 @@ test "the embedded defaults parse cleanly" {
     try testing.expectEqual(Config.RightClickAction.@"context-menu", cfg.@"right-click-action");
     try testing.expectEqual(Config.ConfirmCloseSurface.true, cfg.@"confirm-close-surface");
     try testing.expect(cfg.@"gx-herdr-app-mode");
-    if (builtin.os.tag == .windows) try testing.expect(cfg.@"quit-after-last-window-closed");
+    if (builtin.target.os.tag == .windows) try testing.expect(cfg.@"quit-after-last-window-closed");
 
     // Alt+1..Alt+8 belong to the shell; other default bindings remain.
-    if (!builtin.os.tag.isDarwin()) {
+    if (!builtin.target.os.tag.isDarwin()) {
         for ([_][]const u8{ "alt+1", "alt+digit_1", "alt+8", "alt+digit_8" }) |trigger| {
             const parsed = try inputpkg.Binding.Trigger.parse(trigger);
             try testing.expect(upstream.keybind.set.get(parsed) != null);
@@ -1030,7 +1025,7 @@ test "the embedded defaults parse cleanly" {
     }
 
     // Windows has no selection clipboard: Shift+Insert pastes the clipboard.
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         const shift_insert = try inputpkg.Binding.Trigger.parse("shift+insert");
         const entry = cfg.keybind.set.get(shift_insert) orelse return error.TestUnexpectedResult;
         try testing.expect(entry.value_ptr.* == .leaf);
@@ -1064,7 +1059,7 @@ test "GX0057 cursor origins survive layers equal values and copies" {
     const raw = "cursor-style = block\ncursor-style-blink = true\n";
     const user = try dir.write(arena, "cursor.ghostty", raw);
     const include = try dir.write(arena, "include.ghostty", "config-file = cursor.ghostty\n");
-    const include_arg = try std.fmt.allocPrintSentinel(arena, "--config-file={s}", .{user}, 0);
+    const include_arg = try arena.printSentinel("--config-file={s}", .{user}, 0);
     const cases = [_]struct { sources: TestSources, explicit: bool }{
         .{ .sources = .{ .defaults_text = raw }, .explicit = false },
         .{ .sources = .{ .defaults_text = raw, .system_cursor_blink = false }, .explicit = false },
@@ -1145,7 +1140,7 @@ test "GX0057 theme cursors stay defaults across conditional replay" {
     defer dir.deinit();
     const light = try dir.write(arena, "Light", "cursor-style=bar\ncursor-style-blink=false\n");
     const dark = try dir.write(arena, "Dark", "cursor-style=underline\ncursor-style-blink=true\n");
-    const theme_arg = try std.fmt.allocPrintSentinel(arena, "--theme=light:{s},dark:{s}", .{ light, dark }, 0);
+    const theme_arg = try arena.printSentinel("--theme=light:{s},dark:{s}", .{ light, dark }, 0);
     var cfg = try loadWith(alloc, TestSources{ .defaults_text = "", .args = &.{theme_arg} });
     defer cfg.deinit();
     try expectNoDiagnostics(&cfg);
@@ -1336,7 +1331,7 @@ test "a user theme replaces the default theme and user colors beat themes" {
 
     const theme_a = try dir.write(arena, "theme-a", "background = #111111\nforeground = #aaaaaa\n");
     const theme_b = try dir.write(arena, "theme-b", "background = #222222\n");
-    const defaults_text = try std.fmt.allocPrint(arena, "theme = {s}\nfont-size = 12\n", .{theme_a});
+    const defaults_text = try arena.print("theme = {s}\nfont-size = 12\n", .{theme_a});
 
     {
         var cfg = try loadWith(testing.allocator, TestSources{ .defaults_text = defaults_text });
@@ -1354,7 +1349,7 @@ test "a user theme replaces the default theme and user colors beat themes" {
         try testing.expectEqual(Config.Color{ .r = 0xaa, .g = 0xaa, .b = 0xaa }, cfg.foreground);
     }
     {
-        const user = try dir.write(arena, "theme.ghostty", try std.fmt.allocPrint(arena, "theme = {s}\n", .{theme_b}));
+        const user = try dir.write(arena, "theme.ghostty", try arena.print("theme = {s}\n", .{theme_b}));
         var cfg = try loadWith(testing.allocator, TestSources{ .defaults_text = defaults_text, .user_path = user });
         defer cfg.deinit();
         try testing.expectEqualStrings(theme_b, cfg.theme.?.light);
@@ -1380,11 +1375,7 @@ test "conditional theme reloads keep the layer order" {
 
     const light = try dir.write(arena, "light", "background = #eeeeee\n");
     const dark = try dir.write(arena, "dark", "background = #111111\n");
-    const defaults_text = try std.fmt.allocPrint(
-        arena,
-        "theme = light:{s},dark:{s}\nfont-family = A\nfont-size = 12\n",
-        .{ light, dark },
-    );
+    const defaults_text = try arena.print("theme = light:{s},dark:{s}\nfont-family = A\nfont-size = 12\n", .{ light, dark });
     const user = try dir.write(arena, "config.ghostty", "font-family = U\nfont-size = 13\n");
 
     var cfg = try loadWith(testing.allocator, TestSources{
@@ -1453,7 +1444,7 @@ test "overrides rank above the command line and below -e" {
     const overlay = try dir.write(
         arena,
         "overlay.ghostty",
-        try std.fmt.allocPrint(arena, "theme = {s}\nfont-size = 14\n", .{theme_a}),
+        try arena.print("theme = {s}\nfont-size = 14\n", .{theme_a}),
     );
 
     var cfg = try loadWith(testing.allocator, TestSources{
@@ -1461,7 +1452,7 @@ test "overrides rank above the command line and below -e" {
         .overlay_path = overlay,
         .args = &.{ "--font-size=15", "-e", "htop" },
         .overrides = &.{
-            try std.fmt.allocPrintSentinel(arena, "--theme={s}", .{theme_b}, 0),
+            try arena.printSentinel("--theme={s}", .{theme_b}, 0),
             "--font-size=16",
         },
     });
@@ -1499,7 +1490,7 @@ test "config-default-files=false skips user files and the overlay, not the defau
         .defaults_text = "font-size = 12\nlanguage = zh-CN\n",
         .user_path = user,
         .overlay_path = overlay,
-        .args = &.{ "--config-default-files=false", try std.fmt.allocPrint(arena, "--config-file={s}", .{include}) },
+        .args = &.{ "--config-default-files=false", try arena.print("--config-file={s}", .{include}) },
     });
     defer cfg.deinit();
     try testing.expect(!cfg.@"config-default-files");
@@ -1519,7 +1510,7 @@ test "config-file errors survive the rebuild and later replays" {
     const theme = try dir.write(arena, "theme", "background = #111111\n");
     const user = try dir.write(arena, "config.ghostty", "config-file = missing.ghostty\n");
     var cfg = try loadWith(testing.allocator, TestSources{
-        .defaults_text = try std.fmt.allocPrint(arena, "theme = {s}\n", .{theme}),
+        .defaults_text = try arena.print("theme = {s}\n", .{theme}),
         .user_path = user,
     });
     defer cfg.deinit();
@@ -1548,8 +1539,8 @@ test "upstream loading also keeps config-file errors across theme reloads" {
     var cfg = try Config.default(testing.allocator);
     defer cfg.deinit();
     var it = cli.args.sliceIterator(&.{
-        try std.fmt.allocPrint(arena, "--theme={s}", .{theme}),
-        try std.fmt.allocPrint(arena, "--config-file={s}", .{try std.fs.path.join(arena, &.{ dir.root, "missing" })}),
+        try arena.print("--theme={s}", .{theme}),
+        try arena.print("--config-file={s}", .{try std.fs.path.join(arena, &.{ dir.root, "missing" })}),
     });
     try cfg.loadIter(testing.allocator, &it);
     try cfg.loadRecursiveFiles(testing.allocator);
@@ -1713,11 +1704,7 @@ test "translated GX palette entries survive conditional reloads and clones" {
     const chinese = try defaultPaletteTexts(arena, .zh_CN);
     const light = try dir.write(arena, "light", "background = #eeeeee\n");
     const dark = try dir.write(arena, "dark", "background = #111111\n");
-    const defaults_text = try std.fmt.allocPrint(
-        arena,
-        "theme = light:{s},dark:{s}\n{s}",
-        .{ light, dark, try paletteDefaults(arena) },
-    );
+    const defaults_text = try arena.print("theme = light:{s},dark:{s}\n{s}", .{ light, dark, try paletteDefaults(arena) });
 
     var cfg = try loadWith(testing.allocator, TestSources{ .defaults_text = defaults_text, .translate_palette = true });
     defer cfg.deinit();
@@ -1759,7 +1746,7 @@ test "a window material that shows behind the terminals gets a default backgroun
 
     const light = try dir.write(arena, "light", "background = #eeeeee\n");
     const dark = try dir.write(arena, "dark", "background = #111111\n");
-    const defaults_text = try std.fmt.allocPrint(arena, "theme = light:{s},dark:{s}\n", .{ light, dark });
+    const defaults_text = try arena.print("theme = light:{s},dark:{s}\n", .{ light, dark });
     const mica = try dir.write(arena, "mica.ghostty", "gx-window-material = mica\n");
     const acrylic = try dir.write(arena, "acrylic.ghostty", "gx-window-material = acrylic\n");
     const own = try dir.write(arena, "own.ghostty", "background-opacity = 0.9\ngx-window-material = tabbed\n");
@@ -1806,7 +1793,7 @@ test "applyArg ranks above every layer and keeps the -e command" {
     const dark = try dir.write(arena, "dark", "background = #111111\n");
     const user = try dir.write(arena, "config.ghostty", "background-opacity = 0.8\n");
     var cfg = try loadWith(testing.allocator, TestSources{
-        .defaults_text = try std.fmt.allocPrint(arena, "theme = light:{s},dark:{s}\n", .{ light, dark }),
+        .defaults_text = try arena.print("theme = light:{s},dark:{s}\n", .{ light, dark }),
         .user_path = user,
         .args = &.{ "--font-size=15", "-e", "htop" },
     });
@@ -1879,11 +1866,7 @@ test "Layers.build gives what loading gives, without reading the files again" {
     const dark = try dir.write(arena, "dark", "background = #111111\n");
     _ = try dir.write(arena, "include.ghostty", "window-padding-y = 7\nfont-family = I\n");
     const sources: TestSources = .{
-        .defaults_text = try std.fmt.allocPrint(
-            arena,
-            "theme = light:{s},dark:{s}\nfont-size = 12\nfont-family = A\nlanguage = zh-CN\n",
-            .{ light, dark },
-        ),
+        .defaults_text = try arena.print("theme = light:{s},dark:{s}\nfont-size = 12\nfont-family = A\nlanguage = zh-CN\n", .{ light, dark }),
         .user_path = try dir.write(arena, "config.ghostty", "font-size = 13\nconfig-file = include.ghostty\n"),
         .overlay_path = try dir.write(arena, gui_settings.file_name, "language = en\nfont-family = O\n"),
         .args = &.{ "--window-padding-x=20", "-e", "htop", "--font-size=99" },
@@ -1914,7 +1897,7 @@ test "Layers.build gives what loading gives, without reading the files again" {
     try testing.expectEqualStrings("htop", built.@"initial-command".?.direct[0]);
 
     // Other overrides, such as a theme preview, need no files either.
-    var preview = try layers.build(testing.allocator, &.{try std.fmt.allocPrintSentinel(arena, "--theme={s}", .{dark}, 0)});
+    var preview = try layers.build(testing.allocator, &.{try arena.printSentinel("--theme={s}", .{dark}, 0)});
     defer preview.deinit();
     try testing.expectEqual(Config.Color{ .r = 0x11, .g = 0x11, .b = 0x11 }, preview.background);
     try testing.expectEqual(@as(f32, 13), preview.@"font-size");
@@ -2065,7 +2048,7 @@ test "an unreadable overlay and an unsupported language are reported" {
     const overlay = try std.fs.path.join(arena, &.{ dir.root, gui_settings.file_name });
     const theme = try dir.write(arena, "theme", "background = #111111\n");
     var cfg = try loadWith(testing.allocator, TestSources{
-        .defaults_text = try std.fmt.allocPrint(arena, "theme = {s}\nlanguage = zh-CN\n", .{theme}),
+        .defaults_text = try arena.print("theme = {s}\nlanguage = zh-CN\n", .{theme}),
         .user_path = try dir.write(arena, "config.ghostty", "language = fr\n"),
         .overlay_path = overlay,
     });
@@ -2146,7 +2129,7 @@ test "rebuild keeps the inputs, the conditional state and the command" {
     const dark = try dir.write(arena, "dark", "background = #111111\n");
     const user = try dir.write(arena, "config.ghostty", "font-size = 13\nfont-family = U\n");
     var cfg = try loadWith(testing.allocator, TestSources{
-        .defaults_text = try std.fmt.allocPrint(arena, "theme = light:{s},dark:{s}\nfont-family = A\n", .{ light, dark }),
+        .defaults_text = try arena.print("theme = light:{s},dark:{s}\nfont-family = A\n", .{ light, dark }),
         .user_path = user,
         .args = &.{ "--font-size=15", "-e", "htop" },
     });
@@ -2198,7 +2181,7 @@ test "R4 ordinary font input matrix preserves layer maps and raw defaults" {
     const empty = try dir.write(arena, "empty.ghostty", "font-family =\n");
     _ = try dir.write(arena, "nested.ghostty", "font-family = Included\n");
     const include = try dir.write(arena, "include.ghostty", "config-file = nested.ghostty\n");
-    const include_arg = try std.fmt.allocPrint(arena, "--config-file={s}", .{include});
+    const include_arg = try arena.print("--config-file={s}", .{include});
     const custom = try dir.write(arena, "maps.ghostty", "font-family = User\nfont-codepoint-map = U+E000=User Symbols\n");
     const overlay = try dir.write(arena, "overlay.ghostty", "font-codepoint-map = U+E001=GUI Symbols\n");
     const identical = try dir.write(arena, "identical.ghostty", "font-family = User\n" ++ map);
@@ -2274,7 +2257,7 @@ test "R4 effective defaults survive conditional replay clone finalize and rebuil
     const light = try dir.write(arena, "light", "background = #eeeeee\n");
     const dark = try dir.write(arena, "dark", "background = #111111\n");
     var config = try loadWith(alloc, TestSources{
-        .defaults_text = try std.fmt.allocPrint(arena, "theme = light:{s},dark:{s}\ncursor-style-blink = true\nfont-codepoint-map = U+4E00-U+9FFF=Default CJK\n", .{ light, dark }),
+        .defaults_text = try arena.print("theme = light:{s},dark:{s}\ncursor-style-blink = true\nfont-codepoint-map = U+4E00-U+9FFF=Default CJK\n", .{ light, dark }),
         .args = &.{ "--font-family=User", "--font-codepoint-map=U+E000=Symbols", "-e", "sh", "--font-family=Command" },
         .system_cursor_blink = false,
     });
@@ -2316,9 +2299,9 @@ test "R4 system blink is a default below every user layer and preview" {
         try std.testing.expectEqual(@as(?bool, system != false), defaults_only.@"cursor-style-blink");
         for (std.enums.values(Place)) |place| {
             for (values) |value| {
-                const text = try std.fmt.allocPrint(arena, "cursor-style-blink = {s}\n", .{value.text});
+                const text = try arena.print("cursor-style-blink = {s}\n", .{value.text});
                 const path = try dir.write(arena, "blink.ghostty", text);
-                const arg = try std.fmt.allocPrintSentinel(arena, "--cursor-style-blink={s}", .{value.text}, 0);
+                const arg = try arena.printSentinel("--cursor-style-blink={s}", .{value.text}, 0);
                 var sources: TestSources = .{ .defaults_text = raw, .system_cursor_blink = system };
                 switch (place) {
                     .user => sources.user_path = path,
@@ -2397,7 +2380,7 @@ test "R4 migrated theme is loaded with corrected ANSI whites" {
     defer dir.deinit();
     const path = try dir.write(arena, gx_theme.mocha.name, gx_theme.mocha.marker ++ "\n# gx-theme-version: 1\npalette = 7=#bac2de\npalette = 15=#a6adc8\n");
     try std.testing.expectEqual(gx_theme.InstallResult.updated, try gx_theme.install(alloc, std.testing.io, dir.root, gx_theme.mocha));
-    var config = try loadWith(alloc, TestSources{ .defaults_text = try std.fmt.allocPrint(arena, "theme = {s}\n", .{path}) });
+    var config = try loadWith(alloc, TestSources{ .defaults_text = try arena.print("theme = {s}\n", .{path}) });
     defer config.deinit();
     try expectNoDiagnostics(&config);
     const RGB = @TypeOf(config.palette.value[7]);

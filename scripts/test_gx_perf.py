@@ -256,12 +256,12 @@ def gtk_fixture(root: Path, thread_comm: str | None = None) -> dict:
     times = "pid 10\nwindow_seconds 1\nworkload_seconds 1\nworkload_finished 1\nrun_exit 0\n"
     program = {"__name__": "test_gtk_fixture"}
     exec(gx_wsl.PERF_PROGRAM, program)
-    version = "Ghostty 1.3.2-HEAD+bbbbbbbbb\n  - build mode    : .ReleaseFast\n"
+    version = "Ghostty 1.3.2-HEAD+bbbbbbbbb\n  - build mode    : .fast\n"
     source = {"commit": "b" * 40, "tree": "c" * 40, "dirty": False, "dirty_paths": ""}
     image = {"sha256": "a" * 64, "device": 1, "inode": 2, "size": 3, "mtime_ns": 4}
     executable = {"path": "/own/ghostty", **image}
     receipt = {"schema": "gx-gtk-build-v1", "producer": "gx_wsl.py build", "build_exit": 0, "perf_eligible": True,
-               "build_argv": ["python3", "scripts/zigw.py", "build", "-Dapp-runtime=gtk", "-Doptimize=ReleaseFast"],
+               "build_argv": ["python3", "scripts/zigw.py", "build", "-Dapp-runtime=gtk", "-Doptimize=fast"],
                "source_before": source, "source_after": source, "executable": executable, "version": version, "version_exit": 0}
     receipt_text = json.dumps(receipt, indent=2) + "\n"
     def process(ticks, start):
@@ -278,7 +278,7 @@ def gtk_fixture(root: Path, thread_comm: str | None = None) -> dict:
         (root / name).write_text(text, encoding="utf-8", newline="\n")
     identity = {"pid": 10, "starttime": 100, "exe": "/own/ghostty", **image}
     meta = {"schema": "gx-gtk-perf-v1", "perf": True, "valid": True, "exit": 0, "errors": [], "identity": identity,
-            "workload_finished": True, "workload_exit": "0", "build_mode": "ReleaseFast", "cleanup_identity": "verified",
+            "workload_finished": True, "workload_exit": "0", "build_mode": "fast", "cleanup_identity": "verified",
             "cleanup": "owned pidfd SIGTERM", "child_exit": -15, "executable": executable, "version_exit": 0,
             **source, "source_end": source, "version": version, "effective_env": {}, "clk_tck": 100,
             "capture_id": gx_perf.hashlib.sha256(str(root).encode()).hexdigest()[:32],

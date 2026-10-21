@@ -1389,7 +1389,8 @@ pub const Application = extern struct {
     ) callconv(.c) void {
         const location = css_section.toString();
         defer glib.free(location);
-        bytes: {
+        // fork(gx): GX-0059 gtk_css_section_get_bytes is GTK 4.16+
+        if (comptime gtk_version.atLeast(4, 16, 0)) bytes: {
             const bytes = css_section.getBytes() orelse break :bytes;
             var len: usize = undefined;
             const ptr = bytes.getData(&len) orelse break :bytes;

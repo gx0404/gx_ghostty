@@ -763,7 +763,7 @@ fn testCollection() !struct { *IDWriteFactory, *IDWriteFontCollection } {
 }
 
 test "system collection finds a family and the file of its faces" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
 
     const factory, const collection = try testCollection();
@@ -799,7 +799,7 @@ test "system collection finds a family and the file of its faces" {
 }
 
 test "system font fallback maps a character outside the base font" {
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
 
     const factory, const collection = try testCollection();

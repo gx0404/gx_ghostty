@@ -59,7 +59,7 @@ pub const Timing = struct {
 
     /// Ends `phase`, which ran since the previous lap (or the start).
     fn lapAt(self: *Timing, phase: Phase, at: perf.Instant) void {
-        self.phases[@intFromEnum(phase)] += perf.elapsedUs(self.last, at);
+        self.phases[@backingInt(phase)] += perf.elapsedUs(self.last, at);
         self.last = at;
     }
 

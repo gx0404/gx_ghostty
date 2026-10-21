@@ -250,7 +250,7 @@ fn loadBundled(path_buf: *[path_max]u16) Bundled {
     ) orelse {
         log.warn("cannot load {f} err={d}", .{
             std.unicode.fmtUtf16Le(dll_path),
-            @intFromEnum(windows.GetLastError()),
+            @backingInt(windows.GetLastError()),
         });
         return .{ .skipped = "conpty.dll failed to load" };
     };

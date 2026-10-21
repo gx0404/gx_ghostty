@@ -17,7 +17,7 @@ const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(OpenGL);
 const Dmabuf = @import("Dmabuf.zig");
 // fork(gx): GX-0004 Windows has no EGL; its device loads WGL instead
-pub const Device = if (builtin.os.tag == .windows) wgl.Device else @import("opengl/Device.zig");
+pub const Device = if (builtin.target.os.tag == .windows) wgl.Device else @import("opengl/Device.zig");
 
 pub const GraphicsAPI = OpenGL;
 pub const Target = @import("opengl/Target.zig");
@@ -49,7 +49,7 @@ test "D-16 image and atlas sampling formats remain mode independent" {
 /// Triple-buffering gives the GPU room to pipeline renders without
 /// having to wait on the apprt consuming previous frames.
 // fork(gx): GX-0004 Windows presents (and finishes) every frame before the next, so one is enough
-pub const swap_chain_count = if (builtin.os.tag == .windows) 1 else 3;
+pub const swap_chain_count = if (builtin.target.os.tag == .windows) 1 else 3;
 
 const log = std.log.scoped(.opengl);
 
@@ -69,10 +69,10 @@ blending: configpkg.Config.AlphaBlending,
 device: *const Device,
 
 // fork(gx): GX-0004 Windows uses `wgl_context` instead
-egl_context: if (builtin.os.tag == .windows) void else *gl.egl.Context,
+egl_context: if (builtin.target.os.tag == .windows) void else *gl.egl.Context,
 
 // fork(gx): GX-0004 begin: per-surface WGL state on Windows
-wgl_context: if (builtin.os.tag == .windows) wgl.Context else void = undefined,
+wgl_context: if (builtin.target.os.tag == .windows) wgl.Context else void = undefined,
 // fork(gx): GX-0004 end
 
 pub fn init(
@@ -81,7 +81,7 @@ pub fn init(
     opts: rendererpkg.Options,
 ) !OpenGL {
     // fork(gx): GX-0004 begin: the WGL context is created on the render thread
-    if (comptime builtin.os.tag == .windows) return .{
+    if (comptime builtin.target.os.tag == .windows) return .{
         .alloc = alloc,
         .blending = opts.config.blending,
         .device = device,
@@ -126,7 +126,7 @@ pub fn init(
 
 pub fn deinit(self: *OpenGL) void {
     // fork(gx): GX-0004 begin: the WGL context is gone with the render thread
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .windows) {
         self.wgl_context.deinit();
         self.* = undefined;
         return;
@@ -230,6 +230,7 @@ fn prepareContext(getProcAddress: anytype) !void {
     try gl.enable(gl.c.GL_DEBUG_OUTPUT);
 
     // Register our debug message callback with the OpenGL context.
+    // fork(gx): GX-0060 Zig 0.17 preserves the GLAD C field name.
     gl.glad.context.DebugMessageCallback.?(glDebugMessageCallback, null);
 
     // Enable SRGB framebuffer for linear blending support.
@@ -243,7 +244,7 @@ fn prepareContext(getProcAddress: anytype) !void {
 pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
     _ = surface;
     // fork(gx): GX-0004 begin: create and bind the WGL context on Windows
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .windows) {
         try self.wgl_context.threadEnter(self.device);
         errdefer self.wgl_context.threadExit(self.device);
         try prepareContext(&wgl.getProcAddress);
@@ -262,7 +263,7 @@ pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
 /// the main thread.
 pub fn threadExit(self: *OpenGL) void {
     // fork(gx): GX-0004 begin: destroy the WGL context on Windows
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .windows) {
         self.wgl_context.threadExit(self.device);
         gl.glad.unload();
         return;
@@ -275,7 +276,7 @@ pub fn threadExit(self: *OpenGL) void {
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
     // fork(gx): GX-0050 begin: failed recovery has no current GL context.
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .windows) {
         if (!self.wgl_context.drawable()) return error.ContextLost;
     }
     // fork(gx): GX-0050 end
@@ -294,7 +295,7 @@ pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
 /// but now we need to do this manually.
 pub fn setViewport(self: *const OpenGL, width: u32, height: u32) void {
     // fork(gx): GX-0050 begin: mailbox resizes must not use unloaded GLAD.
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .windows) {
         if (!self.wgl_context.drawable()) return;
     }
     // fork(gx): GX-0050 end
@@ -316,7 +317,7 @@ pub fn drawFrameStart(self: *OpenGL) void {
 /// Right now there's nothing we need to do for OpenGL.
 pub fn drawFrameEnd(self: *OpenGL) void {
     // fork(gx): GX-0050 begin: the completed frame has returned its permit.
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .windows) {
         self.wgl_context.finishRecovery(self.device) catch |err| {
             log.err("cannot recreate the OpenGL context err={}", .{err});
         };
@@ -360,7 +361,7 @@ pub fn present(
     presentation_health: rendererpkg.Health,
 ) !ExportedFrame {
     // fork(gx): GX-0004 begin: Windows presents straight to the window
-    if (comptime builtin.os.tag == .windows) return self.wgl_context.present(self.device, target);
+    if (comptime builtin.target.os.tag == .windows) return self.wgl_context.present(self.device, target);
     // fork(gx): GX-0004 end
     // We only export DMABUFs when the apprt can present them.
     // Otherwise, use CPU buffers.
@@ -384,7 +385,7 @@ pub fn present(
 
 /// A finished frame exported for presentation by the apprt.
 // fork(gx): GX-0004 Windows presents in place and exports nothing
-pub const ExportedFrame = if (builtin.os.tag == .windows) void else union(enum) {
+pub const ExportedFrame = if (builtin.target.os.tag == .windows) void else union(enum) {
     dmabuf: Dmabuf,
     memory: Memory,
 

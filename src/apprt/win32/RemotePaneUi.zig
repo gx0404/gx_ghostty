@@ -99,7 +99,7 @@ pub fn sendAction(self: *Self, pane: *RemotePane, action: Action, origin: ?proto
         self.search_confirmed = false;
     }
     var text: [1024]u8 = undefined;
-    const encoded = try std.fmt.bufPrint(&text, "{f}", .{action});
+    const encoded = try std.mem.print(&text, "{f}", .{action});
     _ = try pane.app.remote.sendToSource(pane.source_reference, .{ .apply_action = .{ .surface = pane.source_reference, .lease = lease, .transaction = id, .config_generation = self.config_generation, .action = try protocol.ActionText.init(encoded) } });
     self.last_action_performed = null;
 }
@@ -187,7 +187,7 @@ pub fn performBindingAction(self: *Self, pane: *RemotePane, action: Action) !boo
         .search => |needle| {
             const app = pane.app;
             const reference = pane.ui_reference;
-            const owned = try app.core_app.alloc.dupeZ(u8, needle);
+            const owned = try app.core_app.alloc.dupeSentinel(u8, needle, 0);
             defer app.core_app.alloc.free(owned);
             self.search_bar.bindRemote(pane);
             self.search_confirmed = false;

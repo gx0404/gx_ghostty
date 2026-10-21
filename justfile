@@ -1,6 +1,6 @@
 # gx_ghostty 命令入口（fork 维护；上游 Makefile 保持原样）。命令手册：docs/MAKE_COMMANDS.md
 # 配方体只写单条命令，cmd.exe / PowerShell / Git Bash / Linux sh 下行为一致；串联的门禁用依赖表达，
-# 产品命令一律经 scripts/zigw.py 调用钉版 Zig 0.16.0（test、test-vt 由 scripts/zig_test.py 转调它）。
+# 产品命令一律经 scripts/zigw.py 调用钉版 Zig 0.17.0（test、test-vt 由 scripts/zig_test.py 转调它）。
 # 变长参数原样拼进配方命令行、再按空格切分：含空格的值要在参数里内嵌双引号
 # （bash 写法：just test-vt '--filter="Terminal: input"'），或绕过 just 直接调用脚本。
 # 警告：参数不加引号地交给配方 shell 解释，Windows 的 cmd.exe 会处理 & | < > ^ %，其他系统的 sh
@@ -16,7 +16,7 @@ python := if os_family() == "windows" { "python" } else { "python3" }
 default:
     @just --list
 
-# 安装钉版 Zig 0.16.0 与 graphify venv 到 .local/（幂等，已就绪则跳过）；--innosetup 另装钉版 Inno Setup 7.1.0（仅 Windows）
+# 安装钉版 Zig 0.17.0 与 graphify venv 到 .local/（幂等，已就绪则跳过）；--innosetup 另装钉版 Inno Setup 7.1.0（仅 Windows）
 setup *a:
     {{python}} scripts/setup_env.py {{a}}
 
@@ -57,6 +57,14 @@ generated-check: kb-check i18n-check pinyin-check fluent-check graph-check
 
 # 本地 CI 门：framework-check、fmt-check、test-vt
 ci-check: framework-check fmt-check test-vt
+
+# 独立编译并签收完整本机测试产物；不计入快速门 60 秒预算
+quick-prepare:
+    {{python}} scripts/quick_check.py prepare
+
+# 固定 Windows profile：55 秒执行 + 5 秒清理报告，不代替完整 CI
+quick-check:
+    {{python}} scripts/quick_check.py check
 
 # 重建代码图谱（钉版 graphifyy，需先 just setup）
 graph:
@@ -136,7 +144,7 @@ build-vt *a:
 
 # 构建 libghostty-vt 的 wasm32-freestanding ReleaseSmall 产物
 vt-wasm:
-    {{python}} scripts/zigw.py build -Demit-lib-vt -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall
+    {{python}} scripts/zigw.py build -Demit-lib-vt -Dtarget=wasm32-freestanding -Doptimize=small
 
 # 打含 libghostty-vt 的源码包：zig build dist -Demit-lib-vt=true
 dist-vt:

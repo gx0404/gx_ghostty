@@ -23,7 +23,7 @@ pub const ProgressState = enum(u3) {
     @"error" = 4,
 
     fn priority(self: ProgressState) u3 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 

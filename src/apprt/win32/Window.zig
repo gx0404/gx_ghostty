@@ -152,19 +152,19 @@ tab_title_lens: [MAX_TABS]u16 = undefined,
 
 /// The title each tab shows instead of its focused terminal's
 /// (`set_tab_title`, renaming the tab), or null.
-tab_title_overrides: [MAX_TABS]?tabs.Title = [_]?tabs.Title{null} ** MAX_TABS,
+tab_title_overrides: [MAX_TABS]?tabs.Title = @as([MAX_TABS]?tabs.Title, @splat(null)),
 
 /// Whether each tab received output (or rang the bell) since it was last
 /// the active tab (the tab bar shows a badge).
-tab_unread: [MAX_TABS]bool = [_]bool{false} ** MAX_TABS,
+tab_unread: [MAX_TABS]bool = @as([MAX_TABS]bool, @splat(false)),
 
 /// Whether a terminal of each tab rang the bell since the tab was last
 /// selected (`ringTab`, `tabStatus`).
-tab_bell: [MAX_TABS]bool = [_]bool{false} ** MAX_TABS,
+tab_bell: [MAX_TABS]bool = @as([MAX_TABS]bool, @splat(false)),
 
 /// When each tab was last selected, as the `activation_count` of that
 /// selection (`tabRecency`); 0 for never.
-tab_activated: [MAX_TABS]u64 = [_]u64{0} ** MAX_TABS,
+tab_activated: [MAX_TABS]u64 = @as([MAX_TABS]u64, @splat(0)),
 
 /// Tab selections so far, for `tab_activated`.
 activation_count: u64 = 0,
@@ -1928,7 +1928,7 @@ pub fn closeTabMode(self: *Window, mode: apprt.action.CloseTabMode, surface: *Su
     _ = w32.PostMessageW(
         hwnd,
         WM_APP_CLOSE_TAB,
-        @intCast(@intFromEnum(mode)),
+        @intCast(@backingInt(mode)),
         @bitCast(surface.core_surface.id),
     );
 }
@@ -2276,7 +2276,12 @@ const Divider = split_layout.Divider(Tree);
 
 /// The terminal area the panes of the active tab share.
 fn splitArea(self: *const Window) split_layout.Rect {
-    return @bitCast(self.surfaceRect());
+    const rect = self.surfaceRect();
+    return .{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.bottom };
+}
+
+fn nativeSplitRect(rect: split_layout.Rect) w32.RECT {
+    return .{ .left = rect.left, .top = rect.top, .right = rect.right, .bottom = rect.bottom };
 }
 
 /// The gap between split panes and the divider lines, in pixels.
@@ -2303,7 +2308,7 @@ const PaneLayout = struct {
 
     /// `split_layout.walk` visitor.
     pub fn pane(self: *PaneLayout, _: Tree.Node.Handle, surface: *Leaf, rect: split_layout.Rect) void {
-        self.add(surface, @bitCast(rect));
+        self.add(surface, nativeSplitRect(rect));
     }
 
     /// Whether the pass shows `surface`, for a zoomed tab (one pane).
@@ -2411,10 +2416,10 @@ fn paintDividers(self: *Window, hdc: w32.HDC, fill_gaps: bool) void {
         colors: DividerColors,
 
         pub fn divider(painter: *@This(), d: Divider) void {
-            if (painter.fill_gaps) painter.window.fillTerminalBackground(painter.hdc, @bitCast(d.band));
+            if (painter.fill_gaps) painter.window.fillTerminalBackground(painter.hdc, nativeSplitRect(d.band));
             const active = painter.window.dividerActive(d.handle);
             const line = d.line(if (active) painter.metrics.line_active else painter.metrics.line);
-            painter.window.fillColor(painter.hdc, @bitCast(line), if (active) painter.colors.active else painter.colors.normal);
+            painter.window.fillColor(painter.hdc, nativeSplitRect(line), if (active) painter.colors.active else painter.colors.normal);
         }
     };
     const metrics = self.splitMetrics();
@@ -2620,7 +2625,7 @@ pub fn newSplit(self: *Window, direction: SplitTree(Leaf).Split.Direction) !void
     geometry.zoomed = null;
     const area = self.splitArea();
     const pane = split_layout.paneRect(Tree, &geometry, area, metrics.gap, handle) orelse area;
-    const rect: w32.RECT = @bitCast(split_layout.insertRect(Tree.Split.Direction, pane, direction, metrics.gap));
+    const rect = nativeSplitRect(split_layout.insertRect(Tree.Split.Direction, pane, direction, metrics.gap));
 
     // Create new surface. Once the single-node tree holds it, freeing the
     // tree frees the surface.
@@ -2787,7 +2792,7 @@ pub fn selectTab(self: *Window, target: apprt.action.GotoTab) bool {
         .previous => .previous,
         .next => .next,
         .last => .last,
-        _ => .{ .number = std.math.cast(usize, @intFromEnum(target)) orelse return false },
+        _ => .{ .number = std.math.cast(usize, @backingInt(target)) orelse return false },
     };
     const idx = tabs.gotoIndex(self.active_tab, self.tab_count, goto) orelse return false;
     if (idx == self.active_tab) {
@@ -2833,7 +2838,7 @@ pub fn moveSplitToTab(self: *Window, view: anytype) !bool {
         .attachment = attachment,
         .tree = detached.moved,
         .active_surface = surface,
-        .title = [_]u16{0} ** 256,
+        .title = @as([256]u16, @splat(0)),
         .title_len = 0,
         .title_override = null,
         .unread = false,
@@ -2875,7 +2880,7 @@ pub fn moveSplitToNewWindow(self: *Window, view: anytype) !bool {
         .attachment = attachment,
         .tree = detached.moved,
         .active_surface = surface,
-        .title = [_]u16{0} ** 256,
+        .title = @as([256]u16, @splat(0)),
         .title_len = 0,
         .title_override = null,
         .unread = false,
@@ -3322,7 +3327,7 @@ fn fixtureMessage(self: *Window, enabled: bool, message: u32, field: usize, argu
                 if (argument < 0) tree.zoom(null) else {
                     const index: usize = @intCast(argument);
                     if (index >= tree.nodes.len or tree.nodes[index] != .leaf) return 0;
-                    tree.zoom(@enumFromInt(index));
+                    tree.zoom(@fromBackingInt(@intCast(index)));
                 }
                 // Same follow-up as toggleSplitZoom: without it the tab bar kept a
                 // stale zoom marker in fixture screenshots (round3 MIG-02/MIG-03).
@@ -4565,8 +4570,8 @@ test "runtime references follow tab slots across reorder and window ownership" {
     source.tab_trees[1] = .empty;
     source.tab_active_surface[0] = first.leaf.?;
     source.tab_active_surface[1] = second.leaf.?;
-    source.tab_titles[0] = [_]u16{0} ** 256;
-    source.tab_titles[1] = [_]u16{0} ** 256;
+    source.tab_titles[0] = @as([256]u16, @splat(0));
+    source.tab_titles[1] = @as([256]u16, @splat(0));
     source.tab_title_lens[0] = 0;
     source.tab_title_lens[1] = 0;
     const first_ref = source.tab_references[0];
@@ -4985,8 +4990,8 @@ pub fn adoptRemoteTab(self: *Window, at: usize, description: *const protocol.Tre
     }
     const reference = try self.app.ui_ids.create(.tab);
     const attachment = try self.app.ui_ids.attach(reference, self.ui_reference);
-    var identities = [_]?*Leaf{null} ** protocol.max_nodes;
-    var visited = [_]bool{false} ** protocol.max_nodes;
+    var identities = @as([protocol.max_nodes]?*Leaf, @splat(null));
+    var visited = @as([protocol.max_nodes]bool, @splat(false));
     var tree = try self.buildRemoteTree(description, description.root, panes, &identities, &visited, 0);
     errdefer tree.deinit();
     for (visited[0..description.nodes.len]) |seen| if (!seen) return error.InvalidTree;
@@ -5048,9 +5053,9 @@ pub fn describeTab(self: *Window, tab_reference: refs.Reference) !protocol.Tree 
     var nodes: protocol.Bounded(protocol.Node, protocol.max_nodes) = .{ .len = @intCast(tree.nodes.len) };
     for (tree.nodes, nodes.items[0..tree.nodes.len]) |node, *destination| destination.* = switch (node) {
         .leaf => |leaf| .{ .leaf = leaf.reference() },
-        .split => |branch| .{ .split = .{ .axis = if (branch.layout == .horizontal) .horizontal else .vertical, .ratio = @floatCast(branch.ratio), .first = @intFromEnum(branch.left), .second = @intFromEnum(branch.right) } },
+        .split => |branch| .{ .split = .{ .axis = if (branch.layout == .horizontal) .horizontal else .vertical, .ratio = @floatCast(branch.ratio), .first = @backingInt(branch.left), .second = @backingInt(branch.right) } },
     };
-    return .{ .nodes = nodes, .root = 0, .active = @intFromEnum(tree.locate(self.tab_active_surface[index]) orelse return error.InvalidTree), .zoom = if (tree.zoomed) |zoom| @intFromEnum(zoom) else null, .tab_override = if (self.tab_title_overrides[index]) |title| try protocolTitle(title.slice()) else .{}, .window_override = if (self.window_title_override_len) |len| try protocolTitle(self.window_title_override[0..len]) else .{} };
+    return .{ .nodes = nodes, .root = 0, .active = @backingInt(tree.locate(self.tab_active_surface[index]) orelse return error.InvalidTree), .zoom = if (tree.zoomed) |zoom| @backingInt(zoom) else null, .tab_override = if (self.tab_title_overrides[index]) |title| try protocolTitle(title.slice()) else .{}, .window_override = if (self.window_title_override_len) |len| try protocolTitle(self.window_title_override[0..len]) else .{} };
 }
 /// UI actions run against the visible target identity. The source evaluates
 /// key bindings, while window/tree operations always belong to this owner.
@@ -5095,7 +5100,7 @@ pub fn performUiAction(self: *Window, origin: refs.Reference, action: @import(".
         .previous_tab => return self.selectTab(.previous),
         .next_tab => return self.selectTab(.next),
         .last_tab => return self.selectTab(.last),
-        .goto_tab => |index| return self.selectTab(@enumFromInt(index)),
+        .goto_tab => |index| return self.selectTab(@fromBackingInt(@intCast(index))),
         .move_tab => |amount| return self.moveTab(leaf, amount),
         .move_tab_to_new_window => return try self.moveTabToNewWindow(leaf),
         .goto_window => |direction| {
@@ -5119,7 +5124,7 @@ pub fn performUiAction(self: *Window, origin: refs.Reference, action: @import(".
             return true;
         },
         .set_window_title => |title| {
-            const owned = try self.app.core_app.alloc.dupeZ(u8, title);
+            const owned = try self.app.core_app.alloc.dupeSentinel(u8, title, 0);
             defer self.app.core_app.alloc.free(owned);
             self.setWindowTitle(owned);
             return true;

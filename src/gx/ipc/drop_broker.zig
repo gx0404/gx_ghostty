@@ -71,7 +71,7 @@ pub fn encode(allocator: std.mem.Allocator, request: u64, nonce: u128, payload: 
     const bytes = try allocator.alloc(u8, size);
     @memcpy(bytes[0..4], "GXDP");
     std.mem.writeInt(u16, bytes[4..6], 1, .little);
-    std.mem.writeInt(u16, bytes[6..8], @intFromEnum(payload), .little);
+    std.mem.writeInt(u16, bytes[6..8], @backingInt(payload), .little);
     std.mem.writeInt(u32, bytes[8..12], @intCast(size), .little);
     std.mem.writeInt(u32, bytes[12..16], @intCast(count), .little);
     std.mem.writeInt(u64, bytes[16..24], request, .little);
@@ -359,9 +359,9 @@ test "drop broker permits only medium high crossing and preserves every other id
     other = peer;
     other.process.birth += 1;
     try std.testing.expectError(error.ProcessChanged, authenticate(local, other, peer.process, domain, domain));
-    inline for (std.meta.fields(policy.Isolation)) |field| {
+    inline for (@typeInfo(policy.Isolation).@"struct".field_names) |field| {
         var changed = domain;
-        @field(changed, field.name)[0] ^= 1;
+        @field(changed, field)[0] ^= 1;
         try std.testing.expectError(error.DifferentIsolation, authenticate(local, peer, peer.process, domain, changed));
     }
 }

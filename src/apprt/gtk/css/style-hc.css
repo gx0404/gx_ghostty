@@ -1,0 +1,4 @@
+/* fork(gx): GX-0059 libadwaita 1.5 theme variants without CSS variables */
+.transparent {
+  background-color: transparent;
+}

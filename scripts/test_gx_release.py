@@ -77,7 +77,7 @@ MACOS_ASSETS = {
 
 
 def write_root(base: Path, *, date: str | None = "2026-10-07", zon_version: str = "1.3.2-dev",
-               zig: str = "0.16.0", pin: str = "0.16.0", newline: str = "\n") -> Path:
+               zig: str = "0.17.0", pin: str = "0.17.0", newline: str = "\n") -> Path:
     root = base / "repo"
     (root / "scripts").mkdir(parents=True, exist_ok=True)
     changelog = [
@@ -353,7 +353,7 @@ class ReleaseInfoTests(EnvironmentCase):
         self.assertEqual(info.date, "2026-10-07")
         self.assertEqual(info.product_version, "1.3.2")
         self.assertEqual(info.zon_version, "1.3.2-dev")
-        self.assertEqual(info.zig_version, "0.16.0")
+        self.assertEqual(info.zig_version, "0.17.0")
         self.assertEqual((info.tag, info.title, info.version_string), (TAG, TITLE, VS))
 
     def test_crlf_files_and_plain_product_versions_are_accepted(self):
@@ -362,7 +362,7 @@ class ReleaseInfoTests(EnvironmentCase):
                 root = write_root(self.base / zon_version, zon_version=zon_version, newline="\r\n")
                 info = release.release_info(root)
                 self.assertEqual(info.version_string, f"{zon_version.split('-')[0].split('+')[0]}-gx.{FORK}")
-                self.assertEqual(info.zig_version, "0.16.0")
+                self.assertEqual(info.zig_version, "0.17.0")
 
     def test_tbd_heading_has_no_date(self):
         root = write_root(self.base / "tbd", date=None)
@@ -384,7 +384,7 @@ class ReleaseInfoTests(EnvironmentCase):
     def test_rejects_missing_or_duplicate_zon_fields_and_missing_pin(self):
         zon = self.root / "build.zig.zon"
         original = zon.read_text(encoding="utf-8")
-        zon.write_text(original.replace('    .minimum_zig_version = "0.16.0",\n', ""), encoding="utf-8")
+        zon.write_text(original.replace('    .minimum_zig_version = "0.17.0",\n', ""), encoding="utf-8")
         with self.assertRaisesRegex(release.ReleaseError, "minimum_zig_version"):
             release.release_info(self.root)
         zon.write_text(original.replace('.paths = .{""},', '.version = "9.9.9",'), encoding="utf-8")
@@ -436,7 +436,7 @@ class PrepareTests(EnvironmentCase):
     def test_build_only_runs_all_gates_and_writes_exact_outputs(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO):
             outputs = release.prepare(self.root, False)
-        expected = {"sha": SHA, "version": FORK, "tag": TAG, "version_string": VS, "zig": "0.16.0"}
+        expected = {"sha": SHA, "version": FORK, "tag": TAG, "version_string": VS, "zig": "0.17.0"}
         self.assertEqual(outputs, expected)
         self.assertEqual(self.output.read_bytes().decode("utf-8"),
                          "".join(f"{key}={value}\n" for key, value in expected.items()))

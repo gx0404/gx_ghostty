@@ -42,14 +42,14 @@ pub const Measurements = struct {
 fn measurementKey(text: []const u8, text_style: d2d.TextStyle, width: f32, dpi: f32, language: i18n.Language) u64 {
     var hash: std.hash.Wyhash = .init(0);
     const parameters = [_]u32{
-        @intFromEnum(text_style.font),
-        @intFromEnum(text_style.weight),
+        @backingInt(text_style.font),
+        @backingInt(text_style.weight),
         @intFromBool(text_style.wrap),
         @bitCast(text_style.size),
         @bitCast(text_style.line_height),
         @bitCast(width),
         @bitCast(dpi),
-        @intFromEnum(language),
+        @backingInt(language),
         @intCast(text_style.family.len),
     };
     hash.update(std.mem.asBytes(&parameters));

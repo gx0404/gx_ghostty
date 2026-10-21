@@ -278,7 +278,7 @@ pub fn showAbout(owner: ?w32.HWND, version: []const u8) void {
     if (owner) |hwnd| if (windowOf(hwnd)) |window| writeGraphics(window.app, &body, &copy);
 
     var detail_buf: [512]u8 = undefined;
-    const detail = std.fmt.bufPrint(&detail_buf, "{s}\n{s}", .{
+    const detail = std.mem.print(&detail_buf, "{s}\n{s}", .{
         i18n.tr(branding.notice),
         i18n.tr(branding.license),
     }) catch i18n.tr(branding.notice);
@@ -306,13 +306,13 @@ pub fn showAbout(owner: ?w32.HWND, version: []const u8) void {
 /// Append the OpenGL implementation the app renders with: a translated
 /// line to `body`, an English one to `copy`. Nothing when it is unknown.
 fn writeGraphics(app: *App, body: *std.Io.Writer, copy: *std.Io.Writer) void {
-    const device = &app.core_app.device;
+    const device = app.core_app.device orelse return;
     if (comptime !@hasDecl(@TypeOf(device.*), "backend")) return;
     device.wait() catch return;
     const backend = device.backend();
     if (backend.renderer.len == 0) return;
     var version_buf: [24]u8 = undefined;
-    const gl_version = std.fmt.bufPrint(&version_buf, "{d}.{d}", .{ backend.version.major, backend.version.minor }) catch "";
+    const gl_version = std.mem.print(&version_buf, "{d}.{d}", .{ backend.version.major, backend.version.minor }) catch "";
     const template = if (backend.software)
         i18n.tr("Graphics: {renderer}, OpenGL {version} (software rendering)")
     else
@@ -562,11 +562,11 @@ const Layout = struct {
     list_label_h: f32 = 0,
     preview: d2d.Rect = zero_rect,
     detail: d2d.Rect = zero_rect,
-    links: [max_links]d2d.Rect = .{zero_rect} ** max_links,
-    link_text_w: [max_links]f32 = .{0} ** max_links,
+    links: [max_links]d2d.Rect = @splat(zero_rect),
+    link_text_w: [max_links]f32 = @splat(0),
     check: d2d.Rect = zero_rect,
     footer: d2d.Rect = zero_rect,
-    buttons: [max_buttons]d2d.Rect = .{zero_rect} ** max_buttons,
+    buttons: [max_buttons]d2d.Rect = @splat(zero_rect),
 };
 
 const zero_rect: d2d.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
@@ -1546,7 +1546,7 @@ const Piece = struct {
 /// cell `column` of a row.
 fn displayPiece(buf: *[16]u8, cp_: ?u21, byte: u8, column: usize, comptime widthOf: WidthFn) Piece {
     const cp = cp_ orelse {
-        const s = std.fmt.bufPrint(buf, "<0x{X:0>2}>", .{byte}) catch unreachable;
+        const s = std.mem.print(buf, "<0x{X:0>2}>", .{byte}) catch unreachable;
         return .{ .text = s, .cells = s.len, .marked = true };
     };
     switch (cp) {
@@ -1556,13 +1556,13 @@ fn displayPiece(buf: *[16]u8, cp_: ?u21, byte: u8, column: usize, comptime width
             return .{ .text = buf[0..n], .cells = n, .marked = false };
         },
         0x00...0x08, 0x0B...0x0C, 0x0E...0x1F, 0x7F => {
-            const s = std.fmt.bufPrint(buf, "<U+{X:0>4}>", .{cp}) catch unreachable;
+            const s = std.mem.print(buf, "<U+{X:0>4}>", .{cp}) catch unreachable;
             return .{ .text = s, .cells = s.len, .marked = true };
         },
         else => {},
     }
     if (isHidden(cp)) {
-        const s = std.fmt.bufPrint(buf, "<U+{X:0>4}>", .{cp}) catch unreachable;
+        const s = std.mem.print(buf, "<U+{X:0>4}>", .{cp}) catch unreachable;
         return .{ .text = s, .cells = s.len, .marked = true };
     }
     const len = std.unicode.utf8Encode(cp, buf) catch unreachable;
@@ -2409,8 +2409,8 @@ test "preview: long lines wrap by cells, wide characters take two" {
     try testing.expect(p.rows[1].line_end and !p.rows[1].line_start);
     try testing.expectEqual(@as(usize, 1), p.lines);
 
-    previewLines(&p, "\u{4E00}" ** 9, 16, 8, testWidth);
-    try expectRows(&p, &.{ "\u{4E00}" ** 7, "\u{4E00}" ** 2 });
+    previewLines(&p, std.mem.asBytes(&@as([9]["\u{4E00}".len]u8, @splat("\u{4E00}".*))), 16, 8, testWidth);
+    try expectRows(&p, &.{ std.mem.asBytes(&@as([7]["\u{4E00}".len]u8, @splat("\u{4E00}".*))), std.mem.asBytes(&@as([2]["\u{4E00}".len]u8, @splat("\u{4E00}".*))) });
 
     // An escape does not split across rows.
     previewLines(&p, "0123456789\u{202E}", 16, 8, testWidth);
@@ -2436,7 +2436,7 @@ test "preview: text past the last row is counted, not shown" {
     try testing.expectEqual(@as(usize, 5), previewRows(&p));
 
     // One long line: part of it shows, no whole line is hidden.
-    previewLines(&p, "x" ** 200, 16, 4, testWidth);
+    previewLines(&p, std.mem.asBytes(&@as([200]["x".len]u8, @splat("x".*))), 16, 4, testWidth);
     try testing.expectEqual(@as(usize, 3), p.row_count);
     try testing.expect(p.truncated);
     try testing.expectEqual(@as(usize, 0), p.hidden_lines);
@@ -2445,14 +2445,14 @@ test "preview: text past the last row is counted, not shown" {
 
     // A wrapped line cut at the reserved row counts as hidden when none of
     // its rows remain.
-    previewLines(&p, "1\n2\n3\n" ++ "y" ** 40, 16, 4, testWidth);
+    previewLines(&p, "1\n2\n3\n" ++ std.mem.asBytes(&@as([40]["y".len]u8, @splat("y".*))), 16, 4, testWidth);
     try expectRows(&p, &.{ "1", "2", "3" });
     try testing.expectEqual(@as(usize, 1), p.hidden_lines);
 }
 
 test "preview: combining marks without end stay within the row buffer" {
     var p: Preview = undefined;
-    previewLines(&p, "e" ++ "\u{0301}" ** 400, 60, 8, testWidth);
+    previewLines(&p, "e" ++ std.mem.asBytes(&@as([400]["\u{0301}".len]u8, @splat("\u{0301}".*))), 60, 8, testWidth);
     for (p.shown()) |row| try testing.expect(row.len <= Preview.row_bytes);
     try testing.expectEqual(@as(usize, 401), p.chars);
     try testing.expect(std.unicode.utf8ValidateSlice(p.rowText(&p.rows[0])));

@@ -11,7 +11,8 @@ pub const completions = comptimeGenerateCompletions();
 
 fn comptimeGenerateCompletions() []const u8 {
     comptime {
-        @setEvalBranchQuota(50000);
+        // fork(gx): GX-0060 allow Zig 0.17 to format the additional GX configuration keys.
+        @setEvalBranchQuota(100000);
         var counter: std.Io.Writer.Discarding = .init(&.{});
         try writeCompletions(&counter.writer);
 

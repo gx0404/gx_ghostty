@@ -82,7 +82,7 @@ test "apprt.win32.ipc.environment unknown overrides and execute are local" {
 }
 
 test "apprt.win32.ipc.environment canonical directories and executable identity" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

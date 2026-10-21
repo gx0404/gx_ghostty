@@ -285,7 +285,7 @@ pub fn validate(packet: *const Packet) Error!void {
     switch (packet.body) {
         .prepare => |*tree| {
             if (packet.sender_epoch != ticket.source_epoch or tree.nodes.len == 0 or tree.nodes.len > max_nodes) return error.InvalidTree;
-            var visited = [_]bool{false} ** max_nodes;
+            var visited = @as([max_nodes]bool, @splat(false));
             var leaves: usize = 0;
             try visit(tree, tree.root, 0, &visited, &leaves, ticket.source_epoch);
             for (visited[0..tree.nodes.len]) |found| if (!found) return error.InvalidTree;
@@ -475,10 +475,10 @@ const Writer = struct {
                     if (value.len > T.capacity) return error.LimitExceeded;
                     try self.put(u16, value.len);
                     for (value.slice()) |*item| try self.putRef(item);
-                } else inline for (info.fields) |field| try self.putRef(&@field(value.*, field.name));
+                } else inline for (info.field_names) |field| try self.putRef(&@field(value.*, field));
             },
             .@"union" => {
-                try self.put(u16, @intCast(@intFromEnum(value.*)));
+                try self.put(u16, @intCast(@backingInt(value.*)));
                 switch (value.*) {
                     inline else => |*payload| try self.putRef(payload),
                 }
@@ -497,10 +497,10 @@ const Writer = struct {
                 std.mem.writeInt(T, self.bytes[self.offset..][0..@sizeOf(T)], value, .little);
                 self.offset += @sizeOf(T);
             },
-            .float => |info| try self.put(std.meta.Int(.unsigned, info.bits), @bitCast(value)),
+            .float => |info| try self.put(@Int(.unsigned, info.bits), @bitCast(value)),
             .bool => try self.put(u8, @intFromBool(value)),
             .void => {},
-            .@"enum" => try self.put(u16, @intCast(@intFromEnum(value))),
+            .@"enum" => try self.put(u16, @intCast(@backingInt(value))),
             .optional => |info| {
                 try self.put(bool, value != null);
                 if (value) |some| try self.put(info.child, some);
@@ -510,10 +510,10 @@ const Writer = struct {
                     if (value.len > T.capacity) return error.LimitExceeded;
                     try self.put(u16, value.len);
                     for (value.slice()) |item| try self.put(T.Element, item);
-                } else inline for (info.fields) |field| try self.put(field.type, @field(value, field.name));
+                } else inline for (info.field_names) |field| try self.put(@FieldType(T, field), @field(value, field));
             },
             .@"union" => |info| {
-                try self.put(u16, @intCast(@intFromEnum(value)));
+                try self.put(u16, @intCast(@backingInt(value)));
                 switch (value) {
                     inline else => |payload| try self.put(@TypeOf(payload), payload),
                 }
@@ -534,7 +534,7 @@ const Reader = struct {
                     target.len = try self.get(u16);
                     if (target.len > T.capacity) return error.LimitExceeded;
                     for (target.items[0..target.len]) |*item| try self.getInto(item);
-                } else inline for (info.fields) |field| try self.getInto(&@field(target.*, field.name));
+                } else inline for (info.field_names) |field| try self.getInto(&@field(target.*, field));
             },
             .@"union" => |info| {
                 const tag = std.enums.fromInt(info.tag_type.?, try self.get(u16)) orelse return error.InvalidEnum;
@@ -563,7 +563,7 @@ const Reader = struct {
                 self.offset += @sizeOf(T);
                 return value;
             },
-            .float => |info| return @bitCast(try self.get(std.meta.Int(.unsigned, info.bits))),
+            .float => |info| return @bitCast(try self.get(@Int(.unsigned, info.bits))),
             .bool => return switch (try self.get(u8)) {
                 0 => false,
                 1 => true,
@@ -578,7 +578,7 @@ const Reader = struct {
                     result.len = try self.get(u16);
                     if (result.len > T.capacity) return error.LimitExceeded;
                     for (result.items[0..result.len]) |*item| item.* = try self.get(T.Element);
-                } else inline for (info.fields) |field| @field(result, field.name) = try self.get(field.type);
+                } else inline for (info.field_names) |field| @field(result, field) = try self.get(@FieldType(T, field));
                 return result;
             },
             .@"union" => |info| {
@@ -721,7 +721,7 @@ test "gx.remote measurement eligibility matches wire validation for text-bearing
 }
 
 test "gx.remote test query and scrollback state preserve existing tags and validate exact direction lease and bounds" {
-    try std.testing.expectEqual(@intFromEnum(std.meta.Tag(Body).inspector_result) + 1, @intFromEnum(std.meta.Tag(Body).test_query));
+    try std.testing.expectEqual(@backingInt(std.meta.Tag(Body).inspector_result) + 1, @backingInt(std.meta.Tag(Body).test_query));
     const alloc = std.testing.allocator;
     const packet = try alloc.create(Packet);
     defer alloc.destroy(packet);

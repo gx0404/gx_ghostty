@@ -43,10 +43,10 @@ TEMPLATE_CHILDREN = {
 
 # The upstream menus the GX menus replace: (blueprint, upstream menu id, GX menu id).
 REPLACED_MENUS = (
-    ("1.5/window.blp", "main_menu", "main_menu"),
-    ("1.5/window.blp", "split_menu", "split_menu"),
-    ("1.5/window.blp", "tab_context_menu", "tab_context_menu"),
-    ("1.2/surface.blp", "context_menu_model", "context_menu"),
+    ("1.4/window.blp", "main_menu", "main_menu"),
+    ("1.4/window.blp", "split_menu", "split_menu"),
+    ("1.4/window.blp", "tab_context_menu", "tab_context_menu"),
+    ("1.0/surface.blp", "context_menu_model", "context_menu"),
 )
 
 # Upstream actions the GX menus deliberately replace, with their replacement.
@@ -305,7 +305,7 @@ class MainPopoverParentTests(unittest.TestCase):
 
 class HeaderBarTests(unittest.TestCase):
     def test_matched_icons_are_on_window_buttons(self):
-        window = blueprint("1.5/window.blp")
+        window = blueprint("1.4/window.blp")
         icons = {node.props["icon-name"]: node.kind for node in window.walk() if "icon-name" in node.props}
         matched = {m.group("icon") for text in gx_sources().values() for m in ICON_IS_RE.finditer(text)}
         self.assertEqual(matched, {"open-menu-symbolic", "view-grid-symbolic"})
@@ -313,12 +313,12 @@ class HeaderBarTests(unittest.TestCase):
         self.assertEqual(icons.get("view-grid-symbolic"), "Gtk.ToggleButton")
 
     def test_buttons_carry_the_menus_the_gx_layer_replaces(self):
-        window = blueprint("1.5/window.blp")
+        window = blueprint("1.4/window.blp")
         models = [(node.kind, node.props.get("menu-model")) for node in window.walk() if "menu-model" in node.props]
         self.assertIn(("Gtk.MenuButton", "main_menu"), models)
         self.assertIn(("Adw.SplitButton", "split_menu"), models)
         self.assertIn(("Adw.TabView", "tab_context_menu"), models)
-        surface = blueprint("1.2/surface.blp")
+        surface = blueprint("1.0/surface.blp")
         self.assertEqual(ids(surface)["context_menu"].props.get("menu-model"), "context_menu_model")
 
 

@@ -67,11 +67,11 @@ pub const FocusWatch = extern struct {
     vtable: *const FocusVtable = &focus_vtable,
     events: u32 = 0,
     /// Slot `i` is readable once `ready[i]` is set.
-    ready: [slots]u32 = [_]u32{0} ** slots,
-    lengths: [slots]u32 = [_]u32{0} ** slots,
+    ready: [slots]u32 = @as([slots]u32, @splat(0)),
+    lengths: [slots]u32 = @as([slots]u32, @splat(0)),
     ids: [slots][96]u8 = undefined,
     /// Each sender's NativeWindowHandle (0 when it has none).
-    windows: [slots]i32 = [_]i32{0} ** slots,
+    windows: [slots]i32 = @as([slots]i32, @splat(0)),
 
     pub const slots = 8;
 
@@ -93,7 +93,7 @@ pub const FocusWatch = extern struct {
         for (0..slots) |index| {
             if (@atomicLoad(u32, &self.ready[index], .acquire) == 0) continue;
             const id = self.ids[index][0..self.lengths[index]];
-            const entry = std.fmt.bufPrint(buffer[length..], "|{s}@0x{x}", .{ id, @as(u32, @bitCast(self.windows[index])) }) catch break;
+            const entry = std.mem.print(buffer[length..], "|{s}@0x{x}", .{ id, @as(u32, @bitCast(self.windows[index])) }) catch break;
             length += entry.len;
         }
         return buffer[0..length];

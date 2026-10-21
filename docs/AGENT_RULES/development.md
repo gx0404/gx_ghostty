@@ -1,5 +1,7 @@
 # development：AI 协作框架自身
 
+日常 Windows 快速门见 `docs/TESTING.md`；编译独立，完整 CI 与同步验收保留。
+
 ## 范围
 
 - 规则与入口：根 `AGENTS.md`、全部 `**/AGENTS.md`（上游嵌套文件只登记、不改写）、`CLAUDE.md`、`docs/**`（含 `docs/AGENT_RULES/`、`docs/kb/`）。

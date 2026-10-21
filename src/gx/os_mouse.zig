@@ -13,7 +13,7 @@ pub const max_ms: u32 = std.math.maxInt(u32) / std.time.ns_per_ms;
 /// The user's double-click time in milliseconds, at most `max_ms`, or null
 /// when it is unknown: on other platforms, or when Windows reports 0.
 pub fn doubleClickTime() ?u32 {
-    if (comptime builtin.os.tag != .windows) return null;
+    if (comptime builtin.target.os.tag != .windows) return null;
     return clamp(user32.GetDoubleClickTime());
 }
 
@@ -36,7 +36,7 @@ test "doubleClickTime keeps the nanoseconds in range and skips zero" {
 }
 
 test "doubleClickTime follows the Windows mouse settings" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const system = user32.GetDoubleClickTime();
     try std.testing.expect(system != 0);
     try std.testing.expectEqual(clamp(system), doubleClickTime());

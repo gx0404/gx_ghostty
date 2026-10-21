@@ -522,11 +522,11 @@ test "elide preserves complete combining and emoji URL tails" {
         "\u{2764}\u{fe0f}",
     }) |cluster| {
         var url_buf: [256]u8 = undefined;
-        const url = try std.fmt.bufPrint(&url_buf, "{s}/aaa/{s}", .{ host, cluster });
+        const url = try std.mem.print(&url_buf, "{s}/aaa/{s}", .{ host, cluster });
         var buf: [256]u8 = undefined;
         try testing.expectEqualStrings(host ++ ellipsis, elide(&buf, url, 21, TestMeasurer{}));
         var expected_buf: [256]u8 = undefined;
-        const expected = try std.fmt.bufPrint(&expected_buf, "{s}{s}{s}", .{ host, ellipsis, cluster });
+        const expected = try std.mem.print(&expected_buf, "{s}{s}{s}", .{ host, ellipsis, cluster });
         const budget: f32 = @floatFromInt(20 + codepoints(cluster));
         const text = elide(&buf, url, budget, TestMeasurer{});
         try testing.expectEqualStrings(expected, text);
@@ -537,8 +537,8 @@ test "elide preserves complete combining and emoji URL tails" {
 test "elide fallback and buffer limits keep character boundaries" {
     const testing = std.testing;
     for ([_][]const u8{
-        "e\u{0301}/" ++ "x" ** 32 ++ "/\u{1f469}\u{200d}\u{1f4bb}",
-        "\u{1f44d}\u{1f3fd}/" ++ "x" ** 32 ++ "/\u{1f1e8}\u{1f1f3}\u{1f1ef}\u{1f1f5}",
+        "e\u{0301}/" ++ std.mem.asBytes(&@as([32]["x".len]u8, @splat("x".*))) ++ "/\u{1f469}\u{200d}\u{1f4bb}",
+        "\u{1f44d}\u{1f3fd}/" ++ std.mem.asBytes(&@as([32]["x".len]u8, @splat("x".*))) ++ "/\u{1f1e8}\u{1f1f3}\u{1f1ef}\u{1f1f5}",
         "https://example.com/aaa/e\u{0301}",
         "https://example.com\u{200d}/aaa/e\u{0301}",
     }) |url| {
@@ -562,7 +562,7 @@ test "elide fits complete characters in measured DirectWrite DPI budgets" {
     defer factory.destroy();
     const t = style.Tokens.fromColors(d2d.Color.hex(0x1e1e2e), d2d.Color.hex(0xcdd6f4), d2d.Color.hex(0x89b4fa));
     const measurer: Measurer = .{ .factory = factory, .text_style = textStyle(t) };
-    const url = "https://example.com/" ++ "segment/" ** 32 ++ "e\u{0301}/\u{1f469}\u{200d}\u{1f4bb}/\u{1f44d}\u{1f3fd}/\u{1f1e8}\u{1f1f3}/troubleshooting.html";
+    const url = "https://example.com/" ++ std.mem.asBytes(&@as([32]["segment/".len]u8, @splat("segment/".*))) ++ "e\u{0301}/\u{1f469}\u{200d}\u{1f4bb}/\u{1f44d}\u{1f3fd}/\u{1f1e8}\u{1f1f3}/troubleshooting.html";
     for ([_]f32{ 1, 1.25, 1.5, 2 }) |scale| {
         const cap: i32 = 519;
         const budget = textBudget(cap, scale);
@@ -644,7 +644,7 @@ test "elide cuts on grapheme boundaries within measured code point widths" {
 test "elide stays within its buffer" {
     const testing = std.testing;
     var buf: [16]u8 = undefined;
-    const url = "https://example.com/" ++ "x" ** 100;
+    const url = "https://example.com/" ++ std.mem.asBytes(&@as([100]["x".len]u8, @splat("x".*)));
     // Wide enough for all of it, but the buffer is not.
     const text = elide(&buf, url, 1000, TestMeasurer{});
     try testing.expect(text.len <= buf.len);

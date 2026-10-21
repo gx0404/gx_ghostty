@@ -43,7 +43,7 @@ pub fn enabled() bool {
 /// Whether `GHOSTTY_GX_PERF` in `environ` turns measurements on, read
 /// without allocating.
 fn envSwitch(environ: std.process.Environ) bool {
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         const wide = environ.getWindows(std.unicode.utf8ToUtf16LeStringLiteral(env_var)) orelse return false;
         var buf: [16]u8 = undefined;
         if (wide.len > buf.len) return false;
@@ -170,7 +170,7 @@ pub const Stats = struct {
         const parts = [_]struct { []const u8, f64 }{ .{ "_p50", 0.5 }, .{ "_p90", 0.9 }, .{ "_max", 1 } };
         for (parts) |part| {
             var buf: [128]u8 = undefined;
-            const name = std.fmt.bufPrint(&buf, "{s}{s}", .{ metric, part[0] }) catch continue;
+            const name = std.mem.print(&buf, "{s}{s}", .{ metric, part[0] }) catch continue;
             record(name, self.quantile(part[1]).?);
         }
     }
@@ -179,7 +179,7 @@ pub const Stats = struct {
 /// The microseconds since this process started, or null where that is not
 /// known. Linux counts in the kernel's clock ticks (10 ms).
 pub fn processAgeUs(io: std.Io) ?u64 {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .windows => {
             const win = std.os.windows;
             var creation: win.FILETIME = undefined;
@@ -225,7 +225,7 @@ fn procStartTicks(stat: []const u8) ?u64 {
     return null;
 }
 
-const windows = if (builtin.os.tag == .windows) struct {
+const windows = if (builtin.target.os.tag == .windows) struct {
     const win = std.os.windows;
     extern "kernel32" fn GetProcessTimes(
         hProcess: win.HANDLE,
@@ -246,7 +246,7 @@ test "count emits one unitless event or gauge only when enabled" {
 
         pub fn info(comptime fmt: []const u8, args: anytype) void {
             calls += 1;
-            line = std.fmt.bufPrint(&bytes, fmt, args) catch unreachable;
+            line = std.mem.print(&bytes, fmt, args) catch unreachable;
         }
     };
     Capture.calls = 0;
@@ -273,7 +273,7 @@ test "GHOSTTY_GX_PERF values that turn measurements on" {
 
 test "envSwitch reads GHOSTTY_GX_PERF" {
     try testing.expect(!envSwitch(.empty));
-    if (builtin.os.tag != .windows) {
+    if (builtin.target.os.tag != .windows) {
         const on = [_:null]?[*:0]const u8{ "PATH=/bin", "GHOSTTY_GX_PERF=yes" };
         try testing.expect(envSwitch(.{ .block = .{ .slice = &on } }));
         const off = [_:null]?[*:0]const u8{"GHOSTTY_GX_PERF=0"};
@@ -331,7 +331,7 @@ test "procStartTicks reads field 22 after the command name" {
 
 test "processAgeUs is known on Windows and Linux" {
     const age = processAgeUs(testing.io);
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .windows, .linux => try testing.expect(age.? < 24 * std.time.us_per_hour),
         else => try testing.expectEqual(@as(?u64, null), age),
     }

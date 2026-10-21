@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0058）之后的号。在册的 51 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053～GX-0058，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0060）之后的号。在册的 53 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053～GX-0060，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`，shell 脚本用 `#`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行 Zig/C/Swift 代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；改写上游 Zig 文档注释时，把被替换的上游原文以 `// ///` 普通注释留在同一 begin/end 块内（不进入生成文档）。CSS 与 shell 脚本没有 begin/end 块标记，每处改动都写单行标记，被替换的上游注释原样保留。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -137,6 +137,18 @@
 | GX-0057 | `src/termio/stream_handler.zig` | `fork(gx): GX-0057` | active |
 | GX-0057 | `src/Surface.zig` | `fork(gx): GX-0057` | active |
 | GX-0058 | `src/apprt/gtk/build/gresource.zig` | `fork(gx): GX-0058` | active |
+| GX-0059 | `src/apprt/gtk/adw_version.zig` | `fork(gx): GX-0059` | active |
+| GX-0059 | `src/apprt/gtk/build/gresource.zig` | `fork(gx): GX-0059` | active |
+| GX-0059 | `src/apprt/gtk/class/application.zig` | `fork(gx): GX-0059` | active |
+| GX-0059 | `src/apprt/gtk/css/style-dark.css` | `fork(gx): GX-0059` | active |
+| GX-0059 | `src/apprt/gtk/css/style-hc-dark.css` | `fork(gx): GX-0059` | active |
+| GX-0059 | `src/apprt/gtk/css/style-hc.css` | `fork(gx): GX-0059` | active |
+| GX-0059 | `src/apprt/gtk/css/style.css` | `fork(gx): GX-0059` | active |
+| GX-0059 | `src/apprt/gtk/gtk_version.zig` | `fork(gx): GX-0059` | active |
+| GX-0060 | `src/extra/fish.zig` | `fork(gx): GX-0060` | active |
+| GX-0060 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0060` | active |
+| GX-0060 | `src/terminal/formatter.zig` | `fork(gx): GX-0060` | active |
+| GX-0060 | `src/terminal/kitty/graphics_image.zig` | `fork(gx): GX-0060` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1175,7 +1187,7 @@ PowerShell 里 `[System.Diagnostics.FileVersionInfo]::GetVersionInfo('<prefix>\b
 
 ### 同步冲突处理
 
-块是纯新增：放在 `present` 里设置正文之后、`self.as(Dialog).present(parent)` 之前。上游改动 `Target`、`present` 的签名，或调用方传入的父控件（`window.zig::windowCloseRequest`、`window.zig::tabViewClosePage`、`split_tree.zig::surfaceCloseRequest`、`application.zig::quit`）时，同步 `src/apprt/gtk/gx/confirm.zig::Processes.collect` 的取终端规则；上游自己给确认框加了 extra child 时，把进程列表并进去，不要覆盖。
+块是纯新增：放在 `present` 里设置正文之后、`self.as(adw.Dialog).present(parent)` 之前。上游改动 `Target`、`present` 的签名，或调用方传入的父控件（`window.zig::windowCloseRequest`、`window.zig::tabViewClosePage`、`split_tree.zig::surfaceCloseRequest`、`application.zig::quit`）时，同步 `src/apprt/gtk/gx/confirm.zig::Processes.collect` 的取终端规则；上游自己给确认框加了 extra child 时，把进程列表并进去，不要覆盖。
 
 ### 移除条件
 
@@ -1281,7 +1293,7 @@ GTK 能显示 DMABUF 时（`presentation_health == .healthy`），上游 `OpenGL
 ```bash
 just test --filter gx.dmabuf_export                     # Windows 本机（win32 apprt），纯逻辑单测
 just wsl sync <worktree> --dirty
-just wsl build --gtk -Doptimize=ReleaseFast
+just wsl build --gtk -Doptimize=fast
 just wsl smoke --out <目录> --perf                      # <名字>-perf.txt 的 dmabuf_warnings 为 1
 python -m unittest scripts.test_fork_patches -v
 ```
@@ -1587,3 +1599,23 @@ python -m unittest scripts.test_fork_patches -v
 - 同步：上游改 `icon_sizes` 或图标来源时取上游版本，再把两处 `file_inputs` 与两处 `source` 指回 `dist/linux/gx/icons/`、补回两条 `ghostty-gx` 别名并保留标记；新增尺寸要同步加进 `scripts/gx_icon.py::LINUX_SIZES`（含 2x）并重新生成。
 - 移除条件：Ghostty GX 不再发布 Linux GTK 程序，或改用独立应用 ID 与自有资源前缀后，删除改动与标记，登记改为 removed。
 - 验证：`python scripts/gx_icon.py --check`；`python scripts/run_unittests.py test_gx_icon test_gx_package test_fork_patches`（`test_gx_icon` 锁定四处来源路径、`icon_sizes` 与 2x 都在 `LINUX_SIZES` 里，`test_gx_package` 锁定 deb 图标与渲染一致）；GTK 构建 `just wsl build --gtk` 后在 Xvfb 场景或真实 Ubuntu 24.04 桌面截图确认窗口图标，Dock/Activities 的启动器图标须在装好 GX Shell deb 的 GNOME 上验收，Xvfb 截图不能代替。
+
+## GX-0060 Zig 0.17 格式化与补全生成兼容
+
+- 文件：`src/terminal/formatter.zig`、`src/terminal/kitty/graphics_image.zig`。
+- 标记：`fork(gx): GX-0060`。
+- 状态：active。
+- 原因：fish 补全遍历额外 GX 配置键在 Zig 0.17 下超出 50000 编译期分支，限额增至 100000；只影响编译期。同步目标 `67edd20a` 中部分新代码仍调用已弃用的 `std.fmt.bufPrint` / `allocPrint`；改用 `std.mem.print` / `Allocator.print`，保持格式与所有权语义。
+- 移除条件：上游完成相同迁移后移除对应差异与标记。
+- 验证：lib-vt 构建、formatter 与 kitty 定向单测，以及完整 VT 回归；实际结果见本次交付。
+
+## GX-0059 同步上游后保留 GTK 4.14 / libadwaita 1.5
+
+- 文件：登记表列出的 GTK 版本门、资源及 CSS 文件。
+- 标记：`fork(gx): GX-0059`。
+- 状态：active。
+- 原因：上游提升最低版本至 GTK 4.18 / libadwaita 1.7，fork 仍支持 Ubuntu 24.04。恢复版本条件、资源选择、兼容 CSS 和旧版本 API 回退，同时保留上游其他修复。构建期 blueprint-compiler 升至 0.20。
+- 移除条件：fork 不再支持 Ubuntu 24.04 原生库时整体复核后删除。
+- 验证：模板契约测试、GTK 4.14 CSS 检查、Ubuntu 24.04 与 Debian 13 构建和截图；未执行项不得记通过。
+
+2026-10-21 同步备注：GX-0039 的页面挂载时连接 split-tree 监听、摘下时断开监听已由上游实现，移除重复钩子；runtime/session 与同窗口转移钩子仍保留。GX-0027 随上游改用 `adw.AlertDialog` / `adw.Dialog`，继续在正文之后附加进程列表。

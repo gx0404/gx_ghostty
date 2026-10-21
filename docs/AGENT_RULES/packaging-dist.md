@@ -25,9 +25,9 @@
 
 ### 下游渠道（上游维护，fork 原样保留）
 
-- `PACKAGING.md`：打包者以源码包为输入，唯一联网步骤是 `nix/build-support/fetch-zig-cache.sh`（按 `build.zig.zon.txt` 逐个 `zig fetch`），之后用 `DESTDIR=… zig build --prefix /usr --system <缓存>/p -Doptimize=ReleaseFast -Dcpu=baseline` 离线构建。它的「Zig Version」一节已过时（指向不存在的 `required_zig` 常量、写着 Zig 0.14.0），真源见 `build-system.md`；据归档的上游 `test.yml` 的 System Build 注释，Zig 0.16 起全局缓存只存压缩包，`--system` 要指向解包后的 `zig-pkg/` 式目录，`<缓存>/p` 的写法早于这一变化（本机未验证）。
+- `PACKAGING.md`：打包者以源码包为输入，唯一联网步骤是 `nix/build-support/fetch-zig-cache.sh`（按 `build.zig.zon.txt` 逐个 `zig fetch`），之后用 `DESTDIR=… zig build --prefix /usr --system <缓存>/p -Doptimize=fast -Dcpu=baseline` 离线构建。它的「Zig Version」一节已过时（指向不存在的 `required_zig` 常量、写着 Zig 0.14.0），真源见 `build-system.md`；据归档的上游 `test.yml` 的 System Build 注释，Zig 0.16 起全局缓存只存压缩包，`--system` 要指向解包后的 `zig-pkg/` 式目录，`<缓存>/p` 的写法早于这一变化（本机未验证）。
 - Flatpak：`flatpak/com.mitchellh.ghostty.yml`（ReleaseFast）与 `com.mitchellh.ghostty-debug.yml`（Debug）以仓库目录为源，用 `-Dflatpak=true --system $PWD/vendor/p` 构建，依赖源取自生成的 `flatpak/zig-packages.json`；`flatpak/dependencies.yml` 用 sha256 钉住 Zig 0.16.0 官方包。
-- Snap：`snap/snapcraft.yaml` 从 ziglang.org 下载 Zig 0.16.0（不校验摘要），用 `craftctl set version=$(cat VERSION)` 取版本，所以输入必须是源码包；`-Dsnap -Doptimize=ReleaseFast -Dcpu=baseline`，classic confinement，启动器 `snap/local/launcher`。
+- Snap：`snap/snapcraft.yaml` 从 ziglang.org 下载 Zig 0.16.0（不校验摘要），用 `craftctl set version=$(cat VERSION)` 取版本，所以输入必须是源码包；`-Dsnap -Doptimize=fast -Dcpu=baseline`，classic confinement，启动器 `snap/local/launcher`。
 - Nix：`nix/package.nix` 以 `build.zig.zon.nix` 为离线依赖，传硬编码的 `-Dversion-string=1.3.2-dev+<rev>-nix` 与 `-Dcpu=baseline`，只声明 Linux 平台。
 - 其余：`dist/macos/update_appcast_*.py` 属上游 Sparkle appcast 流程。图标：`images/gnome/` 供 Linux 安装与 `Doxyfile`，`images/icons/icon_512.png` 供 snap，`images/Ghostty.icon` 由 Xcode 工程引用。
 

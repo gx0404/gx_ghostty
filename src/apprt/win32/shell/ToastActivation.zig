@@ -12,7 +12,7 @@ pub const Token = struct { host_epoch: u128, nonce: u128 };
 
 pub fn encode(token: Token, buffer: *[token_length]u8) ![]const u8 {
     if (token.host_epoch == 0 or token.nonce == 0) return error.InvalidToken;
-    return try std.fmt.bufPrint(buffer, "{s}{x:0>32}:{x:0>32}", .{ prefix, token.host_epoch, token.nonce });
+    return try std.mem.print(buffer, "{s}{x:0>32}:{x:0>32}", .{ prefix, token.host_epoch, token.nonce });
 }
 pub fn parse(value: []const u8) !Token {
     if (value.len != token_length or !std.mem.startsWith(u8, value, prefix) or value[prefix.len + 32] != ':') return error.InvalidToken;
@@ -119,7 +119,7 @@ pub const Sink = struct {
     pub fn create(allocator: std.mem.Allocator, identity: *const Identity, hwnd: ?std.os.windows.HWND, message: u32) !*Sink {
         const self = try allocator.create(Sink);
         errdefer allocator.destroy(self);
-        self.* = .{ .allocator = allocator, .destination = hwnd, .message = message, .aumid = try allocator.dupeZ(u16, identity.aumid) };
+        self.* = .{ .allocator = allocator, .destination = hwnd, .message = message, .aumid = try allocator.dupeSentinel(u16, identity.aumid, 0) };
         return self;
     }
     pub fn retain(self: *Sink) void {

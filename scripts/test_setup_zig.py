@@ -75,7 +75,7 @@ class PinTests(unittest.TestCase):
                 self.assertEqual(f"zig-{key}-{setup_zig.ZIG_VERSION}{suffix}", pin["tarball"])
 
     def test_download_bases_order(self) -> None:
-        official = "https://ziglang.org/download/0.16.0/"
+        official = "https://ziglang.org/download/0.17.0/"
         self.assertEqual(official, setup_zig.DOWNLOAD_BASE)
         self.assertEqual(["https://pkg.machengine.org/zig/", official], setup_zig.download_bases({}))
         custom = setup_zig.download_bases({setup_zig.MIRROR_ENV: "https://example.cn/zig"})
@@ -107,7 +107,7 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(setup_zig.REPO_ROOT, ROOT)
         other = Path("/tmp/other-repo")
         self.assertEqual(
-            other / ".local" / "toolchains" / "zig" / "zig-0.16.0" / EXE_NAME,
+            other / ".local" / "toolchains" / "zig" / "zig-0.17.0" / EXE_NAME,
             setup_zig.zig_binary({}, other),
         )
 
@@ -115,7 +115,7 @@ class LayoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env = {setup_zig.HOME_ENV: tmp}
             self.assertEqual(Path(tmp), setup_zig.install_root(env))
-            self.assertEqual(Path(tmp) / "zig-0.16.0" / EXE_NAME, setup_zig.zig_binary(env))
+            self.assertEqual(Path(tmp) / "zig-0.17.0" / EXE_NAME, setup_zig.zig_binary(env))
 
     def test_which_on_path_searches_only_listed_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -309,7 +309,7 @@ class ExtractTests(unittest.TestCase):
             setup_zig.subprocess, "run", side_effect=AssertionError("zip 不应交给系统 tar")
         ):
             setup_zig.extract_archive(archive, out)
-        self.assertTrue((out / "zig-x86_64-windows-0.16.0" / "zig.exe").is_file())
+        self.assertTrue((out / "zig-x86_64-windows-0.17.0" / "zig.exe").is_file())
 
     def test_tar_xz_extracts_with_tarfile(self) -> None:
         try:
@@ -320,7 +320,7 @@ class ExtractTests(unittest.TestCase):
         out = self.tmp / "out"
         out.mkdir()
         setup_zig.extract_archive(archive, out)
-        self.assertTrue((out / "zig-x86_64-linux-0.16.0" / "zig").is_file())
+        self.assertTrue((out / "zig-x86_64-linux-0.17.0" / "zig").is_file())
 
     def test_unknown_archive_rejected(self) -> None:
         bogus = self.tmp / "zig.tar.gz"

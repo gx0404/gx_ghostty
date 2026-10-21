@@ -874,10 +874,10 @@ const LayoutKey = extern struct {
 
     fn of(style: TextStyle, max_w: f32, max_h: f32) LayoutKey {
         return .{
-            .font = @intFromEnum(style.font),
-            .weight = @intFromEnum(style.weight),
-            .align_x = @intFromEnum(style.align_x),
-            .align_y = @intFromEnum(style.align_y),
+            .font = @backingInt(style.font),
+            .weight = @backingInt(style.weight),
+            .align_x = @backingInt(style.align_x),
+            .align_y = @backingInt(style.align_y),
             .wrap = @intFromBool(style.wrap),
             .ellipsis = @intFromBool(style.ellipsis),
             .size = style.size,
@@ -1145,7 +1145,7 @@ pub const Factory = struct {
             self.dwrite,
             family,
             null,
-            @intFromEnum(key.weight),
+            @backingInt(key.weight),
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
             key.size,
@@ -1222,8 +1222,8 @@ pub const Factory = struct {
         const l = out orelse return null;
 
         const vt = &l.vtable.format;
-        _ = vt.SetTextAlignment(l, @intFromEnum(style.align_x));
-        _ = vt.SetParagraphAlignment(l, @intFromEnum(style.align_y));
+        _ = vt.SetTextAlignment(l, @backingInt(style.align_x));
+        _ = vt.SetParagraphAlignment(l, @backingInt(style.align_y));
         _ = vt.SetWordWrapping(l, if (style.wrap) DWRITE_WORD_WRAPPING_WRAP else DWRITE_WORD_WRAPPING_NO_WRAP);
         if (style.ellipsis) {
             _ = vt.SetTrimming(l, &.{ .granularity = DWRITE_TRIMMING_GRANULARITY_CHARACTER }, cached.ellipsis);
@@ -2221,7 +2221,7 @@ pub const Canvas = struct {
             if (run.len == 0) continue;
             const range: TextRange = .{ .start = run.start, .length = run.len };
             if (run.weight) |w| {
-                _ = l.vtable.SetFontWeight(l, @intFromEnum(w), range);
+                _ = l.vtable.SetFontWeight(l, @backingInt(w), range);
                 weighted = true;
             }
             if (run.underline) {
@@ -2238,7 +2238,7 @@ pub const Canvas = struct {
         // Leave the layout as it was: no brush of this target stays in it.
         const all: TextRange = .{ .start = 0, .length = layout.len };
         if (colored) _ = l.vtable.SetDrawingEffect(l, null, all);
-        if (weighted) _ = l.vtable.SetFontWeight(l, @intFromEnum(layout.weight), all);
+        if (weighted) _ = l.vtable.SetFontWeight(l, @backingInt(layout.weight), all);
         if (underlined) _ = l.vtable.SetUnderline(l, 0, all);
     }
 
@@ -2673,7 +2673,7 @@ test "middleEllipsis keeps the start and the file name" {
 
     // Characters stay whole: no accent without its letter, no emoji
     // sequence cut apart.
-    const accents = "e\u{301}" ** 12;
+    const accents = std.mem.asBytes(&@as([12]["e\u{301}".len]u8, @splat("e\u{301}".*)));
     var width: f32 = 4;
     while (width < accents.len) : (width += 1) {
         const fitted_accents = middleEllipsis(&buf, accents, width, {}, Measure.width);
@@ -2684,7 +2684,7 @@ test "middleEllipsis keeps the start and the file name" {
         }
     }
     const family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
-    const families = family ** 3;
+    const families = std.mem.asBytes(&@as([3][family.len]u8, @splat(family.*)));
     const fitted_families = middleEllipsis(&buf, families, 2 * family.len + 3, {}, Measure.width);
     try testing.expectEqualStrings(family ++ "\u{2026}" ++ family, fitted_families);
 }

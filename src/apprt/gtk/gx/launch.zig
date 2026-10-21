@@ -209,9 +209,9 @@ pub fn resolveDefault(
     };
     if (argv.len == 0) return null;
     const copy = try alloc.alloc([:0]const u8, argv.len);
-    for (argv, copy) |arg, *out| out.* = try alloc.dupeZ(u8, arg);
+    for (argv, copy) |arg, *out| out.* = try alloc.dupeSentinel(u8, arg, 0);
     return .{
-        .id = try alloc.dupeZ(u8, profile.id),
+        .id = try alloc.dupeSentinel(u8, profile.id, 0),
         .command = .{ .direct = copy },
     };
 }
@@ -260,8 +260,8 @@ fn fill(result: *List, profiles: []const gx.profiles.Profile, config: *const con
     for (profiles, items) |profile, *item| {
         const name = try gx.profiles.displayName(arena, profile);
         item.* = .{
-            .id = try arena.dupeZ(u8, profile.id),
-            .name = try arena.dupeZ(u8, name),
+            .id = try arena.dupeSentinel(u8, profile.id, 0),
+            .name = try arena.dupeSentinel(u8, name, 0),
             .args = try args(arena, profile.command),
         };
     }
@@ -284,12 +284,12 @@ pub fn args(alloc: Allocator, command: gx.profiles.Command) Allocator.Error![]co
         .argv => |argv| {
             const result = try alloc.alloc([:0]const u8, argv.len + 1);
             result[0] = "-e";
-            for (argv, result[1..]) |arg, *out| out.* = try alloc.dupeZ(u8, arg);
+            for (argv, result[1..]) |arg, *out| out.* = try alloc.dupeSentinel(u8, arg, 0);
             return result;
         },
         .command_line => |line| {
             const result = try alloc.alloc([:0]const u8, 1);
-            result[0] = try std.fmt.allocPrintSentinel(alloc, "--command={s}", .{line}, 0);
+            result[0] = try alloc.printSentinel("--command={s}", .{line}, 0);
             return result;
         },
     }

@@ -526,7 +526,7 @@ class CiWorkflowTests(unittest.TestCase):
             "retention-days": "14",
         })
         smoke = CI.job_text("gtk-smoke")
-        order = [smoke.index(needle) for needle in ("zig build -Doptimize=ReleaseFast -Dcpu=baseline",
+        order = [smoke.index(needle) for needle in ("zig build -Doptimize=fast -Dcpu=baseline",
                                                     'scrot "$evidence/ghostty-xvfb.png"',
                                                     FILTERED_TEST_COMMANDS["gtk-smoke"], "name: gx-gtk-smoke-evidence")]
         self.assertEqual(order, sorted(order))
@@ -688,7 +688,7 @@ class CiWorkflowTests(unittest.TestCase):
         text = CI.job_text("gtk-smoke")
         order = [text.index(needle) for needle in (
             "apt-get install", "uses: actions/checkout@", 'safe.directory "$GITHUB_WORKSPACE"',
-            "uses: mlugg/setup-zig@", "zig build -Doptimize=ReleaseFast -Dcpu=baseline",
+            "uses: mlugg/setup-zig@", "zig build -Doptimize=fast -Dcpu=baseline",
             "./zig-out/bin/ghostty +version", "xvfb-run", 'scrot "$evidence/ghostty-xvfb.png"',
             "uses: actions/upload-artifact@")]
         self.assertEqual(order, sorted(order))
@@ -844,7 +844,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "apt-get install", "uses: actions/checkout@", 'safe.directory "$GITHUB_WORKSPACE"',
             'zig build dist "-Dversion-string=$GX_VERSION_STRING"',
             'tar -xzf "$RUNNER_TEMP/gx-out/ghostty-$GX_VERSION_STRING.tar.gz"',
-            "test ! -e .git", "--prefix /usr -Doptimize=ReleaseFast -Dcpu=baseline",
+            "test ! -e .git", "--prefix /usr -Doptimize=fast -Dcpu=baseline",
             "+version", 'grep -Fx "  - version: $GX_VERSION_STRING"',
             # The license texts of the source the binary was built from (O3 finding F-1), written by the
             # extracted tarball's own scripts/gx_release.py into the tree that is archived next.
@@ -907,7 +907,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         order = [text.index(needle) for needle in (
             "git config --global core.autocrlf false", "uses: actions/checkout@", "uses: mlugg/setup-zig@",
             f"Invoke-WebRequest '{setup_env.INNOSETUP_URL}' -OutFile $installer",
-            WIN32_BUILD + ' -Doptimize=ReleaseFast "-Dversion-string=$env:GX_VERSION_STRING" --prefix $prefix',
+            WIN32_BUILD + ' -Doptimize=fast "-Dversion-string=$env:GX_VERSION_STRING" --prefix $prefix',
             "python scripts/gx_windows_package.py --prefix (Join-Path $env:RUNNER_TEMP 'gx-prefix') "
             "--version-string $env:GX_VERSION_STRING --output-dir $out",
             "Compare-Object $assets $expected", "uses: actions/upload-artifact@")]

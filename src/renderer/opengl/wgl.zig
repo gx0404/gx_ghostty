@@ -138,18 +138,22 @@ pub const Device = struct {
 
     pub const State = enum(u32) { probing, ready, unavailable };
 
+    pub const Options = struct {};
+
     const tw_spawn = @import("../../tripwire.zig").module(enum { spawn }, std.Thread.SpawnError);
 
     /// Start choosing the OpenGL implementation on a thread of its own.
     /// `wait` reports probe and thread-start failures after the apprt is ready.
-    pub fn init(self: *Device, alloc: Allocator) error{OpenGLUnavailable}!void {
-        _ = alloc;
+    pub fn init(alloc: Allocator, options: Options) Allocator.Error!*Device {
+        _ = options;
+        const self = try alloc.create(Device);
         self.* = .{ .owner_thread = std.Thread.getCurrentId() };
         self.thread = self.spawnProbe() catch |err| {
             self.state.store(.unavailable, .release);
             log.warn("cannot start a thread for the OpenGL probe err={}", .{err});
-            return;
+            return self;
         };
+        return self;
     }
 
     fn spawnProbe(self: *Device) std.Thread.SpawnError!std.Thread {
@@ -157,11 +161,11 @@ pub const Device = struct {
         return std.Thread.spawn(.{}, probeThread, .{self});
     }
 
-    pub fn deinit(self: *Device) void {
+    pub fn deinit(self: *Device, alloc: Allocator) void {
         self.assertOwnerThread();
         if (self.thread) |thread| thread.join();
         if (self.state.load(.acquire) == .ready) _ = FreeLibrary(self.lib.module);
-        self.* = undefined;
+        alloc.destroy(self);
     }
 
     /// Wait until the OpenGL implementation is chosen, on the initializing
@@ -963,7 +967,7 @@ fn dimColor(r: u8, g: u8, b: u8, a: u8) ?[4]f32 {
 /// every buffer it places) and would still format each one for the
 /// callback. glad must be loaded on this thread.
 pub fn quietDebugOutput() void {
-    if (comptime builtin.mode == .Debug) return;
+    if (comptime builtin.mode == .debug) return;
     const control = gl.glad.context.DebugMessageControl orelse return;
     control(gl.c.GL_DONT_CARE, gl.c.GL_DONT_CARE, gl.c.GL_DEBUG_SEVERITY_NOTIFICATION, 0, null, gl.c.GL_FALSE);
 }
@@ -1324,7 +1328,7 @@ fn basePixelFormat() PIXELFORMATDESCRIPTOR {
 }
 
 test "bell border failure latch resets with the context without touching GUI state" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     var context: Context = .{ .surface = undefined, .hdc = undefined, .vsync = false, .border_failed = true };
     context.border(.{ .r = 20, .g = 40, .b = 60, .width = 1, .active = true }, .{ .width = 8, .height = 8 });
     try std.testing.expect(context.border_failed);
@@ -1335,7 +1339,7 @@ test "bell border failure latch resets with the context without touching GUI sta
 }
 
 test "native bell border hidden FBO pixels state restore and context rebuild" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     if (GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_GX_BELL_BORDER_NATIVE"), null, 0) == 0) return error.SkipZigTest;
     var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer report.deinit();
@@ -1350,7 +1354,7 @@ test "native bell border hidden FBO pixels state restore and context rebuild" {
 }
 
 test "native bell border fixture first enter failure has no GLAD unload" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     if (GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_GX_BELL_BORDER_NATIVE"), null, 0) == 0) return error.SkipZigTest;
     var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer report.deinit();
@@ -1359,7 +1363,7 @@ test "native bell border fixture first enter failure has no GLAD unload" {
 }
 
 test "native bell border fixture reenter failure after unload has no second unload" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     if (GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_GX_BELL_BORDER_NATIVE"), null, 0) == 0) return error.SkipZigTest;
     var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer report.deinit();
@@ -1367,7 +1371,7 @@ test "native bell border fixture reenter failure after unload has no second unlo
 }
 
 test "native bell border fixture failed loads release only entered contexts" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     if (GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_GX_BELL_BORDER_NATIVE"), null, 0) == 0) return error.SkipZigTest;
     for ([_]NativeBellBorder.Fault{ .first_load, .reload }) |fault| {
         var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -1528,7 +1532,7 @@ const NativeBellBorder = struct {
 };
 
 test "native bell border idle worker publication reaches present without output or animation" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     if (GetEnvironmentVariableW(std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_GX_BELL_BORDER_NATIVE"), null, 0) == 0) return error.SkipZigTest;
     var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer report.deinit();
@@ -1554,7 +1558,7 @@ const NativeBellWorker = struct {
     const xev = global.xev;
     const width = 64;
     const height = 48;
-    const gl_callconv = @typeInfo(@typeInfo(@typeInfo(gl.c.PFNGLBINDFRAMEBUFFERPROC).optional.child).pointer.child).@"fn".calling_convention;
+    const gl_callconv = @typeInfo(@typeInfo(@typeInfo(gl.c.PFNGLBINDFRAMEBUFFERPROC).optional.child).pointer.child).@"fn".attrs.@"callconv";
 
     thread: *rendererpkg.Thread,
     renderer: *rendererpkg.Renderer,
@@ -1952,9 +1956,9 @@ const ResetTest = struct {
         renderer.swap_chain = null;
         renderer.size.screen = .{ .width = 640, .height = 480 };
         renderer.shaders = .{ .pipelines = undefined, .post_pipelines = &.{} };
-        inline for (@typeInfo(@TypeOf(renderer.shaders.pipelines)).@"struct".fields, 0..) |field, i| {
+        inline for (@typeInfo(@TypeOf(renderer.shaders.pipelines)).@"struct".field_names, 0..) |field, i| {
             program_owners[i + 11] = oldContext();
-            @field(renderer.shaders.pipelines, field.name) = .{
+            @field(renderer.shaders.pipelines, field) = .{
                 .program = .{ .id = @intCast(i + 11) },
                 .fbo = .{ .id = 0 },
                 .vao = .{ .id = 0 },
@@ -2126,8 +2130,10 @@ test "Device.wait waits for the probe thread and reports a missing OpenGL" {
             global.io().futexWake(Device.State, &device.state.raw, std.math.maxInt(u32));
         }
     };
-    var device: Device = .{ .owner_thread = std.Thread.getCurrentId() };
-    device.thread = try std.Thread.spawn(.{}, Probe.finish, .{&device});
+    const device = try testing.allocator.create(Device);
+    device.* = .{ .owner_thread = std.Thread.getCurrentId() };
+    defer device.deinit(testing.allocator);
+    device.thread = try std.Thread.spawn(.{}, Probe.finish, .{device});
 
     try testing.expectEqual(Device.AlphaFrames.no_alpha_channel, device.alphaFrames());
     try testing.expectEqualStrings("", device.backend().renderer);
@@ -2137,7 +2143,6 @@ test "Device.wait waits for the probe thread and reports a missing OpenGL" {
     try testing.expect(device.thread == null);
     try testing.expectError(error.OpenGLUnavailable, device.wait());
     try testing.expectError(error.OpenGLUnavailable, device.setPixelFormat(&hdc));
-    device.deinit();
 }
 
 test "Device.init defers probe thread startup failures to wait" {
@@ -2145,9 +2150,8 @@ test "Device.init defers probe thread startup failures to wait" {
     for ([_]std.Thread.SpawnError{ error.ThreadQuotaExceeded, error.SystemResources, error.OutOfMemory }) |err| {
         Device.tw_spawn.errorAlways(.spawn, err);
         defer Device.tw_spawn.reset();
-        var device: Device = undefined;
-        try device.init(testing.allocator);
-        defer device.deinit();
+        const device = try Device.init(testing.allocator, .{});
+        defer device.deinit(testing.allocator);
         try Device.tw_spawn.end(.reset);
         try testing.expectEqual(std.Thread.getCurrentId(), device.owner_thread);
         try testing.expectEqual(Device.State.unavailable, device.state.load(.acquire));
@@ -2166,10 +2170,11 @@ test "Device accessors wait from another thread without taking join ownership" {
             _ = device.alphaFrames();
         }
     };
-    var device: Device = .{ .state = .init(.unavailable), .owner_thread = std.Thread.getCurrentId() };
-    defer device.deinit();
+    const device = try testing.allocator.create(Device);
+    device.* = .{ .state = .init(.unavailable), .owner_thread = std.Thread.getCurrentId() };
+    defer device.deinit(testing.allocator);
     var thread_differs = false;
-    device.thread = try std.Thread.spawn(.{}, Reader.read, .{ &device, &thread_differs });
+    device.thread = try std.Thread.spawn(.{}, Reader.read, .{ device, &thread_differs });
     try testing.expectError(error.OpenGLUnavailable, device.wait());
     try testing.expect(thread_differs);
     try testing.expect(device.thread == null);

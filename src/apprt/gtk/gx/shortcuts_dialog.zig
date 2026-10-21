@@ -157,7 +157,7 @@ const BuiltRow = struct {
 };
 
 fn buildRow(arena: Allocator, row: sheet.Row, commands: []const input.Command) Allocator.Error!BuiltRow {
-    const text = try arena.dupeZ(u8, row.text);
+    const text = try arena.dupeSentinel(u8, row.text, 0);
     var titles: [3][]const u8 = .{ "", "", text };
 
     const widget = adw.ActionRow.new();

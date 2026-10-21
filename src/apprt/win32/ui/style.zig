@@ -111,8 +111,8 @@ pub const Tokens = struct {
     const chrome_fields = 7;
 
     comptime {
-        const shared = @typeInfo(ui_tokens.Tokens).@"struct".fields;
-        if (@typeInfo(Tokens).@"struct".fields.len != shared.len + chrome_fields) {
+        const shared = @typeInfo(ui_tokens.Tokens).@"struct".field_names;
+        if (@typeInfo(Tokens).@"struct".field_names.len != shared.len + chrome_fields) {
             @compileError("style.Tokens must have the fields of gx.ui_tokens.Tokens and the chrome colors");
         }
     }
@@ -147,8 +147,8 @@ pub const Tokens = struct {
 
     fn combine(shared: ui_tokens.Tokens, colors: chrome.Chrome) Tokens {
         var out: Tokens = undefined;
-        inline for (@typeInfo(ui_tokens.Tokens).@"struct".fields) |field| {
-            @field(out, field.name) = @field(shared, field.name);
+        inline for (@typeInfo(ui_tokens.Tokens).@"struct".field_names) |field| {
+            @field(out, field) = @field(shared, field);
         }
         out.title_bar = colors.title_bar;
         out.window_border = colors.window_border;
@@ -460,8 +460,8 @@ test "the tokens are the shared tokens and the chrome colors" {
         .blue = Color.hex(0x89b4fa),
         .bright_blue = Color.hex(0x89b4fa),
     });
-    inline for (@typeInfo(ui_tokens.Tokens).@"struct".fields) |field| {
-        try testing.expectEqual(@field(shared, field.name), @field(t, field.name));
+    inline for (@typeInfo(ui_tokens.Tokens).@"struct".field_names) |field| {
+        try testing.expectEqual(@field(shared, field), @field(t, field));
     }
     const colors: chrome.Chrome = .derive(&shared, .{});
     try testing.expectEqual(colors.title_bar, t.title_bar);

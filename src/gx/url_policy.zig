@@ -93,7 +93,7 @@ pub const Os = enum {
     windows,
     posix,
 
-    pub const native: Os = if (@import("builtin").os.tag == .windows) .windows else .posix;
+    pub const native: Os = if (@import("builtin").target.os.tag == .windows) .windows else .posix;
 };
 
 /// Where a URL is opened.
@@ -613,7 +613,7 @@ test "dialog texts are translated" {
     var missing: usize = 0;
     var texts: std.ArrayList([]const u8) = .empty;
     defer texts.deinit(testing.allocator);
-    inline for (@typeInfo(msg).@"struct".decls) |decl| try texts.append(testing.allocator, @field(msg, decl.name));
+    inline for (@typeInfo(msg).@"struct".decl_names) |decl| try texts.append(testing.allocator, @field(msg, decl));
     for (std.enums.values(Confirm)) |reason| try texts.append(testing.allocator, reason.msgid());
     for (std.enums.values(Deny)) |reason| try texts.append(testing.allocator, reason.msgid());
     for (texts.items) |text| {

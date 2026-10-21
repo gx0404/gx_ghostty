@@ -29,7 +29,7 @@ pub const Payload = struct {
     /// The result goes only through protected paste; this never appends Enter.
     pub fn toPaste(self: *const Payload, alloc: Allocator, style: quote.Style) Error![:0]u8 {
         switch (self.content) {
-            .text => |text| return alloc.dupeZ(u8, text),
+            .text => |text| return alloc.dupeSentinel(u8, text, 0),
             .files => |files| {
                 var out: std.ArrayList(u8) = .empty;
                 defer out.deinit(alloc);
@@ -42,7 +42,7 @@ pub const Payload = struct {
                     if (!try quote.appendQuoted(alloc, &out, file, style)) return error.UnsafePath;
                     if (out.items.len > max_bytes) return error.TooLarge;
                 }
-                return alloc.dupeZ(u8, out.items);
+                return alloc.dupeSentinel(u8, out.items, 0);
             },
         }
     }

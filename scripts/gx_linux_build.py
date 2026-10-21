@@ -15,15 +15,15 @@ deps
 build
   1. the deps check for the chosen source (--install-deps installs what is missing first), patchelf
      PATCHELF_VERSION (noble's patchelf package), and the GTK 4 / libadwaita versions from pkg-config;
-  2. Zig 0.16.0: the one scripts/zigw.py resolves when it reports the pinned version (for example
+  2. Zig 0.17.0: the one scripts/zigw.py resolves when it reports the pinned version (for example
      mlugg/setup-zig on PATH), else scripts/setup_zig.py --install (sha256-pinned, .local/toolchains/zig);
   3. the source:
      - checkout (default): this Git checkout. Ubuntu 24.04 ships blueprint-compiler 0.12 and the
-       build needs 0.16.0, so the BLUEPRINTS archive (GNOME GitLab's v0.16.0 tag archive, else
+       build needs 0.20.0, so the BLUEPRINTS archive (GNOME GitLab's v0.20.0 tag archive, else
        GNOME's GitHub mirror; both sha256-pinned and checked to be git archives of the tag commit)
        is cached like the other pinned downloads (--cache-dir, else $GX_GHOSTTY_PACKAGE_CACHE,
        else .local/cache/gx-package; --offline never downloads), installed with meson into
-       .local/tools/blueprint-compiler-0.16.0 and put first on PATH;
+       .local/tools/blueprint-compiler-0.20.0 and put first on PATH;
      - --source-tarball FILE: ghostty-VS.tar.gz from `zig build dist` (the gx-release asset),
        extracted below the work directory (--work-dir, kept; default a temporary directory next to
        PREFIX, removed afterwards). It must be the git archive of this checkout's HEAD (its pax
@@ -106,21 +106,21 @@ RESOURCE_PACKAGES = (
 )
 MODES = ("checkout", "tarball")
 
-BLUEPRINT_VERSION = "0.16.0"
-BLUEPRINT_COMMIT = "04ef0944db56ab01307a29aaa7303df6067cb3c0"  # refs/tags/v0.16.0^{}
+BLUEPRINT_VERSION = "0.20.0"
+BLUEPRINT_COMMIT = "aa5298cc1677cf855bd61f9671607362bd203f4f"  # refs/tags/v0.20.0^{}
 BLUEPRINT_LICENSE = "LGPL-3.0-or-later (build tool only, not shipped)"
 BLUEPRINTS = (
     windows.Download(
         f"blueprint-compiler-v{BLUEPRINT_VERSION}.tar.gz",
         "https://gitlab.gnome.org/GNOME/blueprint-compiler/-/archive/"
         f"v{BLUEPRINT_VERSION}/blueprint-compiler-v{BLUEPRINT_VERSION}.tar.gz",
-        "01feb8263fe7a450b0a9fed0fd54cf88947aaf00f86cc7da345f8b39a0e7bd30", 129792, "file",
+        "b6d43b474557dc5c591cca693f6d8a82e328fd125261a7e4fe702f2818106427", 157945, "file",
         f"blueprint-compiler {BLUEPRINT_VERSION} (GNOME GitLab tag archive)", BLUEPRINT_LICENSE,
     ),
     windows.Download(
         f"blueprint-compiler-{BLUEPRINT_VERSION}-github.tar.gz",
         f"https://github.com/GNOME/blueprint-compiler/archive/refs/tags/v{BLUEPRINT_VERSION}.tar.gz",
-        "521c6149fef9c4f254ea67af2f71bb5255baddb7ac99dc335736d236b4e4f3d8", 129774, "file",
+        "ae33796a513ec0b939fffc8f08098b11caa79d0d7a04e2502e32e490a4f6911b", 157938, "file",
         f"blueprint-compiler {BLUEPRINT_VERSION} (GNOME GitHub mirror tag archive)", BLUEPRINT_LICENSE,
     ),
 )
@@ -129,7 +129,7 @@ VERSION_MODULES = ("gtk4", "libadwaita-1")
 
 ORIGIN_RUNPATH = "$ORIGIN/../lib"
 BUILD_FLAGS = (
-    "-Doptimize=ReleaseFast",
+    "-Doptimize=fast",
     "-Dcpu=baseline",
     "-Dpie=true",
     "-Dapp-runtime=gtk",

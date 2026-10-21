@@ -240,7 +240,7 @@ pub const Descriptor = struct {
 };
 
 test "apprt.win32.ipc.Security reads real own token and process birth" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const facts = try inspect(n.GetCurrentProcessId());
     defer facts.deinit();
     try std.testing.expect(facts.identity.process.birth != 0);
@@ -263,12 +263,12 @@ test "apprt.win32.ipc.Security D27 drop ACL requires user and exact native logon
 }
 
 test "apprt.win32.ipc.Security D27 real drop pipe admits its own token" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const descriptor = try Descriptor.initDrop();
     defer descriptor.deinit();
     var attributes = descriptor.attributes();
     var name_buffer: [128]u8 = undefined;
-    const name = try std.fmt.bufPrint(&name_buffer, "\\\\.\\pipe\\gx-d27-test-{x}", .{try n.epoch()});
+    const name = try std.mem.print(&name_buffer, "\\\\.\\pipe\\gx-d27-test-{x}", .{try n.epoch()});
     const wide = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
     defer std.testing.allocator.free(wide);
     const server = n.CreateNamedPipeW(wide, 3 | 0x40000000 | 0x80000, 8, 1, 4096, 4096, 0, &attributes);
@@ -280,7 +280,7 @@ test "apprt.win32.ipc.Security D27 real drop pipe admits its own token" {
 }
 
 test "apprt.win32.ipc.Security D27 native conditional ACE rejects either mismatched principal" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const facts = try inspect(n.GetCurrentProcessId());
     defer facts.deinit();
     var token: n.HANDLE = undefined;
@@ -303,7 +303,7 @@ test "apprt.win32.ipc.Security D27 native conditional ACE rejects either mismatc
         defer descriptor.deinit();
         var attributes = descriptor.attributes();
         var name_buffer: [128]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buffer, "\\\\.\\pipe\\gx-d27-deny-{x}", .{try n.epoch()});
+        const name = try std.mem.print(&name_buffer, "\\\\.\\pipe\\gx-d27-deny-{x}", .{try n.epoch()});
         const name_w = try std.unicode.utf8ToUtf16LeAllocZ(std.testing.allocator, name);
         defer std.testing.allocator.free(name_w);
         const server = n.CreateNamedPipeW(name_w, 3 | 0x40000000 | 0x80000, 8, 1, 4096, 4096, 0, &attributes);

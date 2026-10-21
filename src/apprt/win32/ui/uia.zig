@@ -99,7 +99,7 @@ pub const Queue = struct {
     mutex: std.os.windows.SRWLOCK = .{},
     closed: bool = false,
     next_snapshot_id: u64 = 1,
-    items: [64]?Action = .{null} ** 64,
+    items: [64]?Action = @splat(null),
     head: usize = 0,
     length: usize = 0,
     pub fn create(alloc: Allocator, hwnd: w32.HWND) !*Queue {
@@ -472,7 +472,7 @@ pub const PendingAnnouncement = struct {
 };
 
 const FaceKind = enum { simple, fragment, root, invoke, selection_item, selection, value, toggle, expand_collapse, window };
-const face_count = @typeInfo(FaceKind).@"enum".fields.len;
+const face_count = @typeInfo(FaceKind).@"enum".field_names.len;
 pub const Face = extern struct { vtable: *const anyopaque, node: *Node };
 const Node = struct {
     snapshot: *Snapshot,
@@ -480,7 +480,7 @@ const Node = struct {
     spec: NodeSpec,
     faces: [face_count]Face,
     fn face(self: *Node, kind: FaceKind) *Face {
-        return &self.faces[@intFromEnum(kind)];
+        return &self.faces[@backingInt(kind)];
     }
     fn supported(self: *const Node, kind: FaceKind) bool {
         return switch (kind) {
@@ -584,12 +584,12 @@ const Snapshot = struct {
 /// Field by field, strings by content. `focused` is the one field a focus
 /// move changes (`Publisher.matchesExceptFocus`).
 fn sameExceptFocus(a: NodeSpec, b: NodeSpec) bool {
-    inline for (@typeInfo(NodeSpec).@"struct".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "focused")) continue;
-        const equal = if (field.type == []const u8)
-            std.mem.eql(u8, @field(a, field.name), @field(b, field.name))
+    inline for (@typeInfo(NodeSpec).@"struct".field_names) |field| {
+        if (comptime std.mem.eql(u8, field, "focused")) continue;
+        const equal = if (@FieldType(NodeSpec, field) == []const u8)
+            std.mem.eql(u8, @field(a, field), @field(b, field))
         else
-            std.meta.eql(@field(a, field.name), @field(b, field.name));
+            std.meta.eql(@field(a, field), @field(b, field));
         if (!equal) return false;
     }
     return true;
@@ -665,7 +665,7 @@ fn queryFace(face: *Face, iid: *const w32.GUID, out: *?*anyopaque) callconv(.win
         return S_OK;
     }
     for (iids, 0..) |candidate, index| {
-        if (equalGuid(iid, &candidate) and face.node.supported(@enumFromInt(index))) {
+        if (equalGuid(iid, &candidate) and face.node.supported(@fromBackingInt(@intCast(index)))) {
             out.* = &face.node.faces[index];
             _ = retainFace(face);
             return S_OK;
@@ -756,7 +756,7 @@ fn property(face: *Face, id: i32, out: *Variant) callconv(.winapi) HR {
             out.* = .{ .tag = 0x2005, .data = .{ .pointer = array } };
         },
         30002 => out.* = integer(@bitCast(GetCurrentProcessId())),
-        30003 => out.* = integer(@intFromEnum(node.role)),
+        30003 => out.* = integer(@backingInt(node.role)),
         30004 => if (node.localized_type.len > 0) return stringProperty(face, node.localized_type, out),
         30005 => return stringProperty(face, node.name, out),
         30008 => if (!hostState(face.node)) {
@@ -767,7 +767,7 @@ fn property(face: *Face, id: i32, out: *Variant) callconv(.winapi) HR {
         30011 => {
             if (node.automation_id.len > 0) return stringProperty(face, node.automation_id, out);
             var buffer: [32]u8 = undefined;
-            const id_text = std.fmt.bufPrint(&buffer, "gx-{d}", .{node.id}) catch return E_INVALIDARG;
+            const id_text = std.mem.print(&buffer, "gx-{d}", .{node.id}) catch return E_INVALIDARG;
             return stringProperty(face, id_text, out);
         },
         30016, 30017 => out.* = boolean(true),
@@ -1136,7 +1136,7 @@ fn testPost(_: w32.HWND, _: u32, _: usize, _: isize) i32 {
     return 1;
 }
 test "UIA snapshot owns strings old provider is inert and queue is bounded" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const api = try Api.load(alloc);
     defer api.release();
@@ -1178,7 +1178,7 @@ fn snapshotAllocationExercise(alloc: Allocator, api: *Api, queue: *Queue) !void 
     snapshot.release();
 }
 test "UIA snapshot allocation failure releases partial immutable arena" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const api = try Api.load(alloc);
     defer api.release();
@@ -1255,7 +1255,7 @@ test "UIA stable view allocation failures release snapshots and lifetime tokens"
 }
 
 test "UIA custom caption root alone refuses synthetic nonclient support" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const api = try Api.load(alloc);
     defer api.release();
@@ -1290,7 +1290,7 @@ fn expectStringProperty(face: *Face, id: i32, expected: []const u8) !void {
 }
 
 test "UIA a host-state root leaves its focus and rectangle to the window and names its type" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const api = try Api.load(alloc);
     defer api.release();
@@ -1403,7 +1403,7 @@ test "UIA a host-state root queues its focus event and raises it while its windo
 }
 
 test "UIA a search edit names the list it controls and selection events follow the snapshot" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const Recorder = struct {
         var raised: usize = 0;
@@ -1470,7 +1470,7 @@ test "UIA a search edit names the list it controls and selection events follow t
 }
 
 test "UIA announcement survives full queue and republication without duplicate delivery" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const api = try Api.load(alloc);
     defer api.release();

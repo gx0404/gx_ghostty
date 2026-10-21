@@ -1,3 +1,4 @@
+// fork(gx): GX-0060 Zig 0.17 formatting API compatibility.
 const std = @import("std");
 const assert = @import("../quirks.zig").inlineAssert;
 const fastprint = @import("../fastprint.zig");
@@ -1658,7 +1659,7 @@ pub const PageFormatter = struct {
                                 sameBackground(cell, &cells_subset[cell_i + run])) run += 1;
 
                             var buf: [32]u8 = undefined;
-                            const seq = std.fmt.bufPrint(
+                            const seq = std.mem.print(
                                 &buf,
                                 "\x1b[{d}X\x1b[{d}C",
                                 .{ run, run },
@@ -1999,7 +2000,7 @@ pub const PageFormatter = struct {
         y: size.CellCountInt,
     ) std.Io.Writer.Error!void {
         var buf: [32]u8 = undefined;
-        const seq = std.fmt.bufPrint(&buf, "\x1b[{d}C", .{count}) catch unreachable;
+        const seq = std.mem.print(&buf, "\x1b[{d}C", .{count}) catch unreachable;
         try writer.writeAll(seq);
         if (self.point_map) |*map| map.map.appendNTimes(
             map.alloc,

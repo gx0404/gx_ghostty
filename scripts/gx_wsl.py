@@ -40,7 +40,7 @@ Commands (all run inside `wsl.exe -d <distro>` against the clone, default ~/src/
         first screenshot and writes PREFIX-perf.txt: the time to the window and of the workload,
         CPU time and page faults per Ghostty thread (from /proc/<pid>/task/*/stat) and the DMABUF
         warnings in the log, as `metric NAME VALUE [UNIT]` lines that scripts/gx_perf.py reads.
-        --perf requires actual ReleaseFast; ordinary GUI smoke still accepts Debug. PID/starttime/exe
+        --perf requires actual fast; ordinary GUI smoke still accepts Debug. PID/starttime/exe
         and TID/starttime are guarded; process signals use an owned pidfd and unreaped Popen child.
         Invalid/incomplete windows retain raw evidence but no accepted metrics. PREFIX-meta.json
         records identity, source tree/dirty state, effective display environment and artifact hashes.
@@ -101,15 +101,15 @@ DEFAULT_CLONE = "~/src/gx_ghostty"
 DISTRO_ENV = "GX_WSL_DISTRO"
 CLONE_ENV = "GX_WSL_CLONE"
 
-# blueprint-compiler >= 0.16.0 is required (src/apprt/gtk/build/blueprint.zig); Ubuntu 24.04
-# ships 0.12.0. 0.16.0 is also what the gx-ci gtk-smoke job gets from Debian 13. GNOME publishes
+# blueprint-compiler >= 0.17.0 is required (src/apprt/gtk/build/blueprint.zig); Ubuntu 24.04
+# ships 0.12.0. 0.17.0 is also what the gx-ci gtk-smoke job gets from Debian 13. GNOME publishes
 # no 0.16 tarball on download.gnome.org, so the GitLab tag archive is pinned by its sha256.
-BLUEPRINT_VERSION = "0.16.0"
+BLUEPRINT_VERSION = "0.20.0"
 BLUEPRINT_URL = (
     "https://gitlab.gnome.org/GNOME/blueprint-compiler/-/archive/"
     f"v{BLUEPRINT_VERSION}/blueprint-compiler-v{BLUEPRINT_VERSION}.tar.gz"
 )
-BLUEPRINT_SHA256 = "01feb8263fe7a450b0a9fed0fd54cf88947aaf00f86cc7da345f8b39a0e7bd30"
+BLUEPRINT_SHA256 = "b6d43b474557dc5c591cca693f6d8a82e328fd125261a7e4fe702f2818106427"
 
 APT_PACKAGES = (
     "curl",
@@ -173,6 +173,10 @@ import re
 import subprocess
 import sys
 import tempfile
+import tarfile
+import time
+import shutil
+from pathlib import Path
 
 FORGE_GIT = re.compile(
     r"^git\+https://(github\.com|codeberg\.org)/([^/]+)/([^/?#]+?)(?:\.git)?/?(?:\?[^#]*)?#([0-9a-f]{40})$"
@@ -277,6 +281,64 @@ def fetch(root, workdir, package, url):
     return None
 
 
+def repair_cached_root(root, cache, package):
+    """Zig 0.17 fetch caches a tar root twice; re-fetch a verified directory.
+
+    Maker.Fetch.run uses tmp_directory_path instead of package_sub_path when
+    local_storage is null. Do not change expected hashes or patch the toolchain.
+    """
+    archive = Path(cache) / "p" / (package + ".tar.gz")
+    if not archive.is_file() or (Path(root) / "zig-pkg" / package).is_dir():
+        return None
+    with tarfile.open(archive) as bundle:
+        names = [name.rstrip("/").split("/") for name in bundle.getnames()]
+        if not names or any(len(name) < 2 or name[0] != package for name in names):
+            return None
+        second = {name[1] for name in names}
+        if len(second) != 1 or any(len(name) < 3 for name in names):
+            return None
+        if not hasattr(tarfile, "data_filter"):
+            return "safe tar extraction requires Python 3.10.12+"
+        with tempfile.TemporaryDirectory(prefix="gx-zig-cache-root-") as directory:
+            bundle.extractall(directory, filter="data")
+            bundle.close()
+            outer = Path(directory) / package
+            nested = outer / next(iter(second))
+            if not nested.is_dir() or nested.is_symlink():
+                return "cached archive root is not a directory"
+            isolated_cache = Path(directory) / "cache"
+            env = dict(os.environ, ZIG_GLOBAL_CACHE_DIR=str(isolated_cache))
+            for candidate in (nested, outer):
+                result = subprocess.run(
+                    [sys.executable, os.path.join(root, "scripts", "zigw.py"), "fetch", str(candidate)],
+                    cwd=root, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                )
+                words = result.stdout.split()
+                if result.returncode == 0 and words and words[-1] == package:
+                    normalized = isolated_cache / "p" / (package + ".tar.gz")
+                    if not normalized.is_file():
+                        return "verified package was not cached"
+                    with tempfile.NamedTemporaryFile(dir=archive.parent, prefix=archive.name + ".", suffix=".tmp", delete=False) as output:
+                        temporary = Path(output.name)
+                        with normalized.open("rb") as source:
+                            shutil.copyfileobj(source, output)
+                    try:
+                        for attempt in range(3):
+                            try:
+                                os.replace(temporary, archive)
+                                break
+                            except PermissionError:
+                                if os.name != "nt" or attempt == 2:
+                                    raise
+                                # Windows can briefly deny a concurrent replacement.
+                                time.sleep(0.025 * (attempt + 1))
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    print(f"[gx-wsl] verified cached archive root: {package}", flush=True)
+                    return None
+    return f"cached package does not match expected hash {package}"
+
+
 def main(argv):
     root = os.path.abspath(argv[1])
     check = "--check" in argv[2:]
@@ -301,6 +363,11 @@ def main(argv):
                     failures.append(f"{package}: {error}")
                     continue
                 fetched += 1
+            if not check:
+                error = repair_cached_root(root, cache, package)
+                if error is not None:
+                    failures.append(f"{package}: {error}")
+                    continue
             nested = os.path.join(root, "zig-pkg", package, "build.zig.zon")
             if os.path.isfile(nested):
                 with open(nested, encoding="utf-8") as handle:
@@ -538,7 +605,7 @@ def build_option(argv, key):
 
 
 def version_mode(version):
-    match = re.search(r"build mode\s*:\s*(?:\w+\.)?\.?(Debug|ReleaseFast|ReleaseSafe|ReleaseSmall)\b", version)
+    match = re.search(r"build mode\s*:\s*(?:\w+\.)?\.?(debug|Debug|fast|safe|small)\b", version)
     return match.group(1) if match else "unknown"
 
 
@@ -586,15 +653,15 @@ def validate_receipt(receipt, source, executable, version, version_exit):
     argv = receipt.get("build_argv", [])
     if receipt.get("schema") != "gx-gtk-build-v1" or receipt.get("producer") != "gx_wsl.py build" or \
             receipt.get("build_exit") != 0 or not isinstance(argv, list) or argv[:3] != ["python3", "scripts/zigw.py", "build"] or \
-            not all(isinstance(arg, str) for arg in argv) or build_option(argv, "optimize") != "ReleaseFast" or \
+            not all(isinstance(arg, str) for arg in argv) or build_option(argv, "optimize") != "fast" or \
             build_option(argv, "app-runtime") != "gtk":
-        raise ValueError("missing successful normal ReleaseFast GTK build receipt")
+        raise ValueError("missing successful normal fast GTK build receipt")
     if build_kind(argv[3:]) != "install":
         raise ValueError("build receipt does not describe the normal GTK install")
     if receipt.get("source_before") != source or receipt.get("source_after") != source:
         raise ValueError("source identity differs from build receipt")
     if receipt.get("executable") != executable or receipt.get("version") != version or \
-            receipt.get("version_exit") != version_exit or version_exit != 0 or version_mode(version) != "ReleaseFast":
+            receipt.get("version_exit") != version_exit or version_exit != 0 or version_mode(version) != "fast":
         raise ValueError("actual executable/version differs from build receipt")
     match = re.match(r"Ghostty (\S+)", version)
     built_version = match.group(1) if match else ""
@@ -623,7 +690,7 @@ def build_main(argv):
     try:
         receipt["source_before"] = source_identity()
         BUILD_RECEIPT.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
-        if standard_gtk and build_option(args, "optimize") == "ReleaseFast" and receipt["source_before"]["dirty"]:
+        if standard_gtk and build_option(args, "optimize") == "fast" and receipt["source_before"]["dirty"]:
             raise ValueError("perf build requires a clean committed source tree")
         code = subprocess.run([sys.executable, "scripts/zigw.py", "build", *args], check=False).returncode
         receipt["build_exit"] = code
@@ -644,7 +711,7 @@ def build_main(argv):
                 raise ValueError("build image changed during version query")
         finally:
             os.close(fd)
-        if build_option(args, "optimize") == "ReleaseFast":
+        if build_option(args, "optimize") == "fast":
             validate_receipt(receipt, receipt["source_after"], receipt["executable"], receipt["version"], receipt["version_exit"])
             receipt["perf_eligible"] = True
         print("[gx-wsl] build receipt: " + str(BUILD_RECEIPT), flush=True)
@@ -668,6 +735,14 @@ normal_build "$@"
 TEST_BODY = r"""enter_clone
 prefetch || warn "some Zig packages could not be prefetched; zig build will try to fetch them itself"
 log "python3 scripts/zig_test.py $*"
+for arg in "$@"; do
+  if [ "$arg" = "-Dapp-runtime=gtk" ]; then
+    for tool in xvfb-run xauth; do command -v "$tool" >/dev/null || die "$tool is required for GTK tests; run setup" 2; done
+    export GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1
+    unset WAYLAND_DISPLAY
+    exec xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" python3 scripts/zig_test.py "$@"
+  fi
+done
 exec python3 scripts/zig_test.py "$@"
 """
 
@@ -1204,10 +1279,10 @@ def smoke_main(argv):
         save("-version.txt", version.stdout + version.stderr)
         meta["version"] = version.stdout
         meta["version_exit"] = version.returncode
-        mode = re.search(r"build mode\s*:\s*(?:\w+\.)?\.?(Debug|ReleaseFast|ReleaseSafe|ReleaseSmall)\b", version.stdout)
+        mode = re.search(r"build mode\s*:\s*(?:\w+\.)?\.?(debug|Debug|fast|safe|small)\b", version.stdout)
         meta["build_mode"] = mode.group(1) if mode else "unknown"
-        if version.returncode != 0 or (perf and meta["build_mode"] != "ReleaseFast"):
-            raise ValueError("perf requires verified ReleaseFast" if perf else "version failed")
+        if version.returncode != 0 or (perf and meta["build_mode"] != "fast"):
+            raise ValueError("perf requires verified fast" if perf else "version failed")
         if perf and os.environ.get("GHOSTTY_GX_PERF", "").strip().lower() not in ("1", "true", "on", "yes"):
             raise ValueError("GHOSTTY_GX_PERF not enabled")
         if perf:

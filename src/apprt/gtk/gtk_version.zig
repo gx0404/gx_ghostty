@@ -17,7 +17,8 @@ pub const comptime_version: std.SemanticVersion = .{
 
 pub const minimum_version: std.SemanticVersion = .{
     .major = 4,
-    .minor = 18,
+    // fork(gx): GX-0059 keep Ubuntu 24.04 (GTK 4.14) supported
+    .minor = 14,
     .patch = 0,
 };
 

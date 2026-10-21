@@ -10,7 +10,7 @@ pub const Id = data.Id;
 pub const Cache = struct {
     factory: ?*d2d.Factory = null,
     alloc: ?std.mem.Allocator = null,
-    entries: [data.icons.len]?[]d2d.Path = .{null} ** data.icons.len,
+    entries: [data.icons.len]?[]d2d.Path = @splat(null),
 
     pub fn init(factory: *d2d.Factory) Cache {
         return .{ .factory = factory, .alloc = factory.alloc };
@@ -30,7 +30,7 @@ pub const Cache = struct {
 
     fn get(self: *Cache, id: Id) ?[]d2d.Path {
         const factory = self.factory orelse return null;
-        const index = @intFromEnum(id);
+        const index = @backingInt(id);
         if (self.entries[index]) |paths| return paths;
         const source = data.icons[index];
         const paths = self.alloc.?.alloc(d2d.Path, source.paths.len) catch return null;
@@ -81,7 +81,7 @@ pub const Cache = struct {
     pub fn draw(self: *Cache, canvas: *d2d.Canvas, id: Id, rect: d2d.Rect, color: d2d.Color) bool {
         const factory = self.factory orelse return false;
         if (canvas.factory != factory) return false;
-        const placement = model.fit(data.icons[@intFromEnum(id)], rect.x, rect.y, rect.w, rect.h) orelse return false;
+        const placement = model.fit(data.icons[@backingInt(id)], rect.x, rect.y, rect.w, rect.h) orelse return false;
         const paths = self.get(id) orelse return false;
         const transform: d2d.Matrix3x2 = .{
             .m11 = placement.scale,

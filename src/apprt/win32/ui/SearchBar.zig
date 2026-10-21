@@ -389,7 +389,7 @@ fn search(self: *SearchBar) void {
     const alloc = self.popup.alloc;
     const text = self.popup.input.text(alloc) catch return;
     defer alloc.free(text);
-    const needle = alloc.dupeZ(u8, text) catch return;
+    const needle = alloc.dupeSentinel(u8, text, 0) catch return;
     defer alloc.free(needle);
     _ = self.perform(.{ .search = needle }) catch |err| {
         log.err("search error: {}", .{err});
@@ -574,7 +574,7 @@ fn tooltipText(buf: []u8, which: Button) []const u8 {
         .next => .{ i18n.tr("Next Match"), "Enter" },
         .close => .{ i18n.tr("Close"), "Esc" },
     };
-    return std.fmt.bufPrint(buf, "{s} ({s})", .{ label, key }) catch label;
+    return std.mem.print(buf, "{s} ({s})", .{ label, key }) catch label;
 }
 
 /// Show the tooltip of the button the pointer rests on, below the bar
@@ -838,7 +838,7 @@ test "the button tooltips name the key" {
 test "F3 and Shift+F3 move through the matches from the terminal" {
     const testing = std.testing;
     const builtin = @import("builtin");
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
     const config_layers = @import("../../../gx/config_layers.zig");
     var cfg = try config_layers.defaultConfig(testing.allocator);
     defer cfg.deinit();

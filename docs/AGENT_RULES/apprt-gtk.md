@@ -21,14 +21,14 @@
 
 - `class.zig::Common`：`as`（编译期保证安全的上转）、`ref`/`unref`、`private`、私有字段属性访问器、`Class.bindTemplateChildPrivate`、`Class.bindTemplateCallback`。另有 `weak_ref.zig::WeakRef` 与 `ext/actions.zig`（action 名在编译期校验）。
 - `build/gresource.zig::blueprints` 是 UI 模板登记表，目录名即模板要求的最低 libadwaita 版本；`build/gresource.zig::blueprint` 在编译期把登记项映射为资源路径，未登记即 `@compileError`。同文件登记 `css` 与 `icon_sizes`（取自 `dist/linux/gx/icons/`，GX-0058）。
-- `build/blueprint.zig` 构建期检查 libadwaita 头文件版本，以及 `blueprint-compiler` 不低于 `required_blueprint_version`（当前 0.16.0）。
-- `src/build/SharedDeps.zig::gtkNgDistResources` 逐个 `blueprint-compiler compile`，再用 `glib-compile-resources` 生成 `ghostty_resources.{c,h}`。源码包内它们是预生成的 dist 资源（`src/build/GhosttyDist.zig::Resource`），Git 检出里出现会被忽略并告警。
+- `build/blueprint.zig` 构建期检查 libadwaita 头文件版本，以及 `blueprint-compiler` 不低于 `required_blueprint_version`（当前 0.20.0）。
+- `src/build/SharedDeps.zig::gtkDistResources` 逐个 `blueprint-compiler compile`，再用 `glib-compile-resources` 生成 `ghostty_resources.{c,h}`。源码包内它们是预生成的 dist 资源（`src/build/GhosttyDist.zig::Resource`），Git 检出里出现会被忽略并告警。
 - `build/info.zig`：`application_id` 在 Debug/ReleaseSafe 下追加 `-debug`，另有 `resource_path`、`object_path`。
 - 版本门 `adw_version.zig`、`gtk_version.zig`：`atLeast` 同查编译期头文件与运行期库，用于影响代码生成的分支；`runtimeAtLeast` 只查运行期，用于只影响行为的分支。
 
 ### 窗口系统与系统集成
 
-- `winproto.zig::App`、`winproto.zig::Window` 是 `none`/`wayland`/`x11` 的 tagged union，后端是否编入取决于 `build_options.wayland`/`x11`；`-Dgtk-x11`、`-Dgtk-wayland` 默认值来自 `src/build/gtk.zig::targets`（pkg-config 失败时全为 false，无 GTK 也能 `zig build --help`）。Wayland 协议在 `src/build/SharedDeps.zig::addGtkNg` 注册。
+- `winproto.zig::App`、`winproto.zig::Window` 是 `none`/`wayland`/`x11` 的 tagged union，后端是否编入取决于 `build_options.wayland`/`x11`；`-Dgtk-x11`、`-Dgtk-wayland` 默认值来自 `src/build/gtk.zig::targets`（pkg-config 失败时全为 false，无 GTK 也能 `zig build --help`）。Wayland 协议在 `src/build/SharedDeps.zig::addGtk` 注册。
 - quick terminal 依赖 gtk4-layer-shell：`src/build/Config.zig::init` 把它的系统集成默认设为 true（链接系统 `gtk4-layer-shell-0`），`-fno-sys=gtk4-layer-shell` 时构建并安装 `pkg/gtk4-layer-shell` 的动态库。
 - `ipc/*.zig` 经 D-Bus `org.gtk.Actions.Activate` 调用运行中实例的 app action，action 在 `Application.startupActionMap` 注册（如 `new-window`）。
 - cgroup：`cgroup.zig::createScope` 经 systemd `StartTransientUnit` 建 scope；`post_fork.zig::postFork`（父进程）与 `pre_exec.zig::preExec`（子进程，最多等 250ms，hard-fail 以 127 退出）由 `src/termio/Exec.zig` 经 `@hasDecl` 探测后挂到 `src/Command.zig` 的 `rt_post_fork`/`rt_pre_exec`；`src/os/cgroup.zig::current` 读 `/proc/<pid>/cgroup`。
@@ -77,7 +77,7 @@
 ## 验证
 
 - **Windows 主机经 WSL**（Ubuntu 24.04 克隆，`just wsl setup --apt` 装依赖与 zh_CN、en_US 的 UTF-8 locale）：`just wsl sync <worktree> --dirty` 同步，`just wsl build --gtk` 构建，`just wsl test --gtk --filter <name>` 跑单测（GX 层 `apprt.gtk.gx`），`just wsl smoke --out <目录> [--lang zh_CN|en] [--xdotool <脚本>]` 在 Xvfb 下截图，`just wsl scenario --out <目录> [G01 …]` 回放 `test/gui/gtk/G*.toml`；读图且日志无 `Theme parser error`、`css parsing failed` 才记 PASS。Windows 本身没有 GTK 与 gettext，只能跑 `just fmt-check` 与 `python scripts/run_unittests.py test_gtk_gx_contract`（GX 层对上游模板、菜单与 action 的引用；改 GX 层或同步上游后跑）。
-- **Linux 机器**（GTK4、libadwaita 头文件不低于登记表最高版本、blueprint-compiler ≥ 0.16、gettext、pkg-config）：
+- **Linux 机器**（GTK4、libadwaita 头文件不低于登记表最高版本、blueprint-compiler ≥ 0.20、gettext、pkg-config）：
   - 构建 `just build -Dapp-runtime=gtk`，需要时加 `-Dgtk-x11=`、`-Dgtk-wayland=`；单测 `just test -Dapp-runtime=gtk --filter <name>`；Ubuntu 24.04 的打包配方见 `packaging-dist.md`。
   - 翻译：`just zig build update-translations` 后审 `po/` diff，再跑 `.github/scripts/check-translations.sh`（脚本直接用 PATH 上的 `zig`，须为钉版 0.16.0）。
   - Blueprint：`nix/build-support/check-blueprints.sh` 后 `git diff --exit-code`（沿用上游 CI）。

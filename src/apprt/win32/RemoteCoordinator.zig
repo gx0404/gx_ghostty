@@ -1340,7 +1340,7 @@ fn reclaim(self: *Self, app: *App, source: *Source) !void {
         if (previous == null) {
             source.source_window = destination.ui_reference;
             if (source.description.window_override.len != 0) {
-                const title = try app.core_app.alloc.dupeZ(u8, source.description.window_override.slice());
+                const title = try app.core_app.alloc.dupeSentinel(u8, source.description.window_override.slice(), 0);
                 defer app.core_app.alloc.free(title);
                 destination.setWindowTitle(title);
             }
@@ -1533,7 +1533,7 @@ test "remote coordinator production control entrypoints compile" {
 }
 
 test "remote replacement keeps old native mapping readable until exact offer acknowledgement" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const security = @import("ipc/Security.zig");
     const domain: policy.Isolation = .{ .config_root = @splat(1), .build = @splat(2), .class = @splat(3), .install = @splat(4) };
@@ -1649,9 +1649,9 @@ test "remote coordinator refuses transfer and aggregate mapping budget before al
     var exports: [1]Export = undefined;
     exports[0].value.offer.bytes = transfer_budget;
     var first: Source = undefined;
-    first.exports = .{ .items = &exports, .capacity = exports.len };
+    first.exports = .{ .items = &exports, .capacity = exports.len, .pointer_stability = .{} };
     var second: Source = undefined;
-    second.exports = .{ .items = &exports, .capacity = exports.len };
+    second.exports = .{ .items = &exports, .capacity = exports.len, .pointer_stability = .{} };
     coordinator.sources[0] = &first;
     coordinator.sources[1] = &second;
     try std.testing.expectError(error.RemoteMemoryBudget, coordinator.checkBudget(0, 1));

@@ -91,8 +91,8 @@ GX0002_HUNKS = (
 CLOSE_DIALOG_ZIG = "src/apprt/gtk/class/close_confirmation_dialog.zig"
 GX0027 = "GX-0027"
 GX0027_CALL = '@import("../gx/confirm.zig").listProcesses(self, priv.target, parent);'
-GX0027_AFTER = "self.as(Dialog.Parent).setBody(priv.target.body());"
-GX0027_BEFORE = "self.as(Dialog).present(parent);"
+GX0027_AFTER = "self.as(adw.AlertDialog).setBody(priv.target.body());"
+GX0027_BEFORE = "self.as(adw.Dialog).present(parent);"
 
 APPLICATION_ZIG = "src/apprt/gtk/class/application.zig"
 GX0028 = "GX-0028"
@@ -537,7 +537,7 @@ def gx0029_problems(source: str) -> list[str]:
         problems.append("the DMABUF export must stay in present()")
     if None not in (condition, export) and not condition < export:
         problems.append("the DMABUF export must be inside the GX-0029 condition")
-    windows = next((i for i in range(start, end) if "builtin.os.tag == .windows" in lines[i]), None)
+    windows = next((i for i in range(start, end) if "builtin.target.os.tag == .windows" in lines[i]), None)
     if windows is None or (condition is not None and not windows < condition):
         problems.append("the Windows (GX-0004) branch of present() must return before the DMABUF export")
     return problems
@@ -688,8 +688,8 @@ TARGET_ZIG = "src/renderer/opengl/Target.zig"
 WGL_ZIG = "src/renderer/opengl/wgl.zig"
 GX0045 = "GX-0045"
 GX0045_CALLS = (
-    'if (comptime builtin.os.tag == .windows) @import("wgl.zig").targetLifetime(true);',
-    'if (comptime builtin.os.tag == .windows) @import("wgl.zig").targetLifetime(false);',
+    'if (comptime builtin.target.os.tag == .windows) @import("wgl.zig").targetLifetime(true);',
+    'if (comptime builtin.target.os.tag == .windows) @import("wgl.zig").targetLifetime(false);',
 )
 
 
@@ -1552,13 +1552,13 @@ class Gx0043ReadbackTests(unittest.TestCase):
 GX0050 = "GX-0050"
 GX0050_DISCARD = "    // fork(gx): GX-0050 replaces the now-invalid unused self discard."
 GX0050_BODIES = (
-    ("surfaceSize", """if (comptime builtin.os.tag == .windows) {
+    ("surfaceSize", """if (comptime builtin.target.os.tag == .windows) {
         if (!self.wgl_context.drawable()) return error.ContextLost;
     }"""),
-    ("setViewport", """if (comptime builtin.os.tag == .windows) {
+    ("setViewport", """if (comptime builtin.target.os.tag == .windows) {
         if (!self.wgl_context.drawable()) return;
     }"""),
-    ("drawFrameEnd", """if (comptime builtin.os.tag == .windows) {
+    ("drawFrameEnd", """if (comptime builtin.target.os.tag == .windows) {
         self.wgl_context.finishRecovery(self.device) catch |err| {
             log.err("cannot recreate the OpenGL context err={}", .{err});
         };
@@ -1907,7 +1907,7 @@ GX0057_TOKENS = {
         'if (@TypeOf(iter.*) == Replay.Iterator)',
         'if (iter.gxCursorStep()) |step|',
         'try self._replay_steps.append(alloc, try step.clone(alloc));',
-        '.gx_default_cursor_arg => |v| .{ .gx_default_cursor_arg = try alloc.dupeZ(u8, v) },',
+        '.gx_default_cursor_arg => |v| .{ .gx_default_cursor_arg = try alloc.dupeSentinel(u8, v, 0) },',
         '.gx_default_cursor_arg => |arg| return arg,',
         'gx_config_layers.isCursorKey(key)',
         'if (comptime !@import("../gx/cursor_policy.zig").enabledFor(build_config.app_runtime)) break :conditional null;',

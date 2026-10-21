@@ -66,11 +66,11 @@ def validate_manifest(args, exes, labels) -> dict:
         commit = arm['source_commit']
         if len(commit) != 40 or any(c not in '0123456789abcdef' for c in commit):
             reject('C6 source_commit must be a full Git SHA')
-        if (arm.get('optimize') != 'ReleaseFast' or arm.get('source_clean') is not True or
+        if (arm.get('optimize') != 'fast' or arm.get('source_clean') is not True or
                 arm.get('exe_sha256') != hashlib.sha256(exe.read_bytes()).hexdigest() or
                 not arm.get('build_command') or not arm.get('build_log') or
                 arm.get('source_exe_attested_by') != 'root'):
-            reject('C6 requires root-attested clean ReleaseFast source/exe build receipts')
+            reject('C6 requires root-attested clean fast source/exe build receipts')
         log = Path(arm['build_log'])
         if not log.is_file() or hashlib.sha256(log.read_bytes()).hexdigest() != arm.get('build_log_sha256'):
             reject('C6 build log missing or hash mismatch')
@@ -84,9 +84,9 @@ def validate_manifest(args, exes, labels) -> dict:
     validate_source_delta(*sources)
     build_options = [data['arms'][label].get('build_options') for label in labels]
     if (not isinstance(build_options[0], list) or build_options[0] != build_options[1] or
-            '-Doptimize=ReleaseFast' not in build_options[0] or
+            '-Doptimize=fast' not in build_options[0] or
             '-Dtarget=x86_64-windows-gnu' not in build_options[0]):
-        reject('C6 requires identical ReleaseFast Windows build_options (exclude output prefix)')
+        reject('C6 requires identical fast Windows build_options (exclude output prefix)')
     data['verified_source_diff'] = git('diff', commits[0], commits[1], '--', SOURCE)
     data['source_exe_binding'] = 'root build attestation; binary hash checked, not inferred from version'
     return data

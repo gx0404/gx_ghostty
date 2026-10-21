@@ -47,7 +47,7 @@ test "quotes spaces empty values quotes and trailing backslashes" {
 }
 
 test "native Windows argv decoder roundtrips UTF-8 and trailing slashes" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
     const args = [_][]const u8{ "C:\\Program Files\\Ghostty GX\\ghostty.exe", "--gx-shell-action=profile", "--gx-shell-profile=custom:\u{4e2d}\u{6587} \"quoted\"\\", "" };
     const command = try encode(testing.allocator, &args);
@@ -68,7 +68,7 @@ const Native = struct {
 };
 
 test "D18 native and Ghostty argv iterators preserve the quoting matrix" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const t = std.testing;
     const args = [_][]const u8{
         "C:\\Program Files\\Ghostty\\ghostty.exe",

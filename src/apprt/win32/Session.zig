@@ -197,7 +197,7 @@ fn confirmProfiles(app: *App, alloc: std.mem.Allocator, document: model.Document
             .command_line => |line| line,
             .argv => return error.InvalidProfile,
         };
-        const body = try std.fmt.allocPrint(alloc, "{s}\n{s}\n\n{s}", .{ profile.name, text, i18n.tr("This profile runs its current configured command. Restore it for this session?") });
+        const body = try alloc.print("{s}\n{s}\n\n{s}", .{ profile.name, text, i18n.tr("This profile runs its current configured command. Restore it for this session?") });
         const before = digest(profile.*);
         const answer = Dialogs.confirm(null, body, i18n.tr("Restore custom launch profile?"));
         if (app.quit_requested or app.ui_ids.epoch == 0) return error.Cancelled;
@@ -258,7 +258,7 @@ fn restore(self: *Session, app: *App, document: model.Document, cli: Cli) !bool 
             _ = staged.pop();
             continue;
         }
-        if (!cli.title) if (saved_window.title_override) |title| live.setWindowTitle(try alloc.dupeZ(u8, title));
+        if (!cli.title) if (saved_window.title_override) |title| live.setWindowTitle(try alloc.dupeSentinel(u8, title, 0));
         // Store reveal metadata in a bounded staging array below. App callbacks
         // must not show any parent during adoptSessionTab.
         try plans.append(alloc, .{ .reference = reference, .active = active, .geometry = saved_window.geometry });
@@ -290,7 +290,7 @@ fn buildTree(app: *App, window: *Window, current: *const profiles.List, approval
         defer arena.deinit();
         const alloc = arena.allocator();
         const command = try profileCommand(alloc, profile.*, leaf.cwd);
-        const title = if (!cli.title) if (leaf.title_override) |text| try alloc.dupeZ(u8, text) else null else null;
+        const title = if (!cli.title) if (leaf.title_override) |text| try alloc.dupeSentinel(u8, text, 0) else null else null;
         const cwd = try localCwd(alloc, profile.*, leaf.cwd);
         const surface = try app.core_app.alloc.create(Surface);
         surface.initWithOptions(app, window, .{
@@ -350,7 +350,7 @@ fn profileCommand(alloc: std.mem.Allocator, profile: profiles.Profile, cwd: ?mod
                 const args = try alloc.alloc([:0]const u8, argv.len + 2);
                 @memcpy(args[0..argv.len], argv);
                 args[argv.len] = "--cd";
-                args[argv.len + 1] = try alloc.dupeZ(u8, directory.path);
+                args[argv.len + 1] = try alloc.dupeSentinel(u8, directory.path, 0);
                 return .{ .direct = args };
             };
             return .{ .direct = argv };
@@ -374,7 +374,7 @@ fn localCwd(alloc: std.mem.Allocator, profile: profiles.Profile, cwd: ?model.Cwd
     defer alloc.free(wide);
     const attributes = GetFileAttributesW(wide);
     if (attributes == 0xffffffff or attributes & 0x10 == 0) return error.WorkingDirectoryUnavailable;
-    return try alloc.dupeZ(u8, directory.path);
+    return try alloc.dupeSentinel(u8, directory.path, 0);
 }
 
 extern "kernel32" fn GetDriveTypeW([*:0]const u16) callconv(.winapi) u32;

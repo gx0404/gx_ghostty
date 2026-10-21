@@ -233,7 +233,7 @@ pub const Table = struct {
     /// `/proc` (kept open until `deinit`) on Linux.
     /// `proc.snapshot` counts each system snapshot attempt, including failure.
     pub fn capture(alloc: Allocator, io: std.Io) SnapshotError!Table {
-        switch (builtin.os.tag) {
+        switch (builtin.target.os.tag) {
             .windows => return try windows.capture(alloc),
             .linux => {
                 @import("perf.zig").count("proc.snapshot", 1);
@@ -265,7 +265,7 @@ pub const Table = struct {
         while (it.next(io) catch null) |dir_entry| {
             const pid = std.fmt.parseInt(Pid, dir_entry.name, 10) catch continue;
             var path_buf: [32]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "{d}/stat", .{pid}) catch continue;
+            const path = std.mem.print(&path_buf, "{d}/stat", .{pid}) catch continue;
             var stat_buf: [1024]u8 = undefined;
             const data = proc_dir.readFile(io, path, &stat_buf) catch continue;
             const stat = parseStat(data) orelse continue;
@@ -420,7 +420,7 @@ pub const Table = struct {
     fn createdAt(self: *Table, i: usize) ?u64 {
         const entry = &self.entries[i];
         if (!entry.created_read) {
-            entry.created = if (builtin.os.tag == .windows) windows.creationTime(entry.pid) else null;
+            entry.created = if (builtin.target.os.tag == .windows) windows.creationTime(entry.pid) else null;
             entry.created_read = true;
         }
         return entry.created;
@@ -553,7 +553,7 @@ fn parseStat(data: []const u8) ?Stat {
 /// leading `-`, or null if it is unavailable.
 fn argv0Name(arena: Allocator, io: std.Io, proc_dir: std.Io.Dir, pid: Pid) Allocator.Error!?[]const u8 {
     var path_buf: [32]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{d}/cmdline", .{pid}) catch return null;
+    const path = std.mem.print(&path_buf, "{d}/cmdline", .{pid}) catch return null;
     var buf: [4096]u8 = undefined;
     const data = proc_dir.readFile(io, path, &buf) catch return null;
     const argv0 = std.mem.sliceTo(data, 0);
@@ -586,7 +586,7 @@ fn fullName(
 /// does not exist. The caller owns the returned name.
 pub fn processName(alloc: Allocator, io: std.Io, proc_dir: std.Io.Dir, pid: Pid) Allocator.Error!?[]u8 {
     var path_buf: [32]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{d}/comm", .{pid}) catch return null;
+    const path = std.mem.print(&path_buf, "{d}/comm", .{pid}) catch return null;
     var buf: [256]u8 = undefined;
     const data = proc_dir.readFile(io, path, &buf) catch return null;
     var arena: std.heap.ArenaAllocator = .init(alloc);
@@ -595,7 +595,7 @@ pub fn processName(alloc: Allocator, io: std.Io, proc_dir: std.Io.Dir, pid: Pid)
     return try alloc.dupe(u8, name);
 }
 
-const windows = if (builtin.os.tag == .windows) struct {
+const windows = if (builtin.target.os.tag == .windows) struct {
     const win = std.os.windows;
 
     const TH32CS_SNAPPROCESS: win.DWORD = 0x00000002;
@@ -967,9 +967,9 @@ test "Table.readProc reads the names of kept processes only" {
 
 test "snapshot of the current process" {
     const testing = std.testing;
-    if (builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
-    const self_pid: Pid = switch (builtin.os.tag) {
+    const self_pid: Pid = switch (builtin.target.os.tag) {
         .windows => std.os.windows.GetCurrentProcessId(),
         else => @intCast(std.os.linux.getpid()),
     };
@@ -983,7 +983,7 @@ test "snapshot of the current process" {
 
 test "Shared reuses a table until it is ttl old" {
     const testing = std.testing;
-    if (builtin.os.tag != .windows and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     var shared: Shared = .{};
     defer shared.deinit();

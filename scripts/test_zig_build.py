@@ -25,8 +25,8 @@ class BuildArgsTests(unittest.TestCase):
     def test_windows_adds_the_gnu_target_first(self):
         self.assertEqual(["build", TARGET], zig_build.build_args([], windows=True))
         self.assertEqual(
-            ["build", TARGET, "-Doptimize=ReleaseFast", "run", "--", "-e", "cmd"],
-            zig_build.build_args(["-Doptimize=ReleaseFast", "run", "--", "-e", "cmd"], windows=True),
+            ["build", TARGET, "-Doptimize=fast", "run", "--", "-e", "cmd"],
+            zig_build.build_args(["-Doptimize=fast", "run", "--", "-e", "cmd"], windows=True),
         )
 
     def test_explicit_target_is_kept(self):
@@ -45,7 +45,7 @@ class BuildArgsTests(unittest.TestCase):
 
     def test_other_hosts_are_unchanged(self):
         self.assertEqual(["build"], zig_build.build_args([], windows=False))
-        self.assertEqual(["build", "-Doptimize=Debug"], zig_build.build_args(["-Doptimize=Debug"], windows=False))
+        self.assertEqual(["build", "-Doptimize=debug"], zig_build.build_args(["-Doptimize=debug"], windows=False))
 
     def test_target_lookalikes_do_not_count(self):
         self.assertEqual(
@@ -58,8 +58,8 @@ class MainTests(unittest.TestCase):
     def test_delegates_to_zigw_and_returns_its_exit_code(self):
         with mock.patch.object(zig_build.zigw, "main", return_value=3) as zigw_main, \
                 mock.patch.object(zig_build.sys, "platform", "win32"):
-            self.assertEqual(3, zig_build.main(["-Doptimize=ReleaseFast"]))
-        zigw_main.assert_called_once_with(["build", TARGET, "-Doptimize=ReleaseFast"])
+            self.assertEqual(3, zig_build.main(["-Doptimize=fast"]))
+        zigw_main.assert_called_once_with(["build", TARGET, "-Doptimize=fast"])
 
     def test_non_windows_passes_arguments_through(self):
         with mock.patch.object(zig_build.zigw, "main", return_value=0) as zigw_main, \

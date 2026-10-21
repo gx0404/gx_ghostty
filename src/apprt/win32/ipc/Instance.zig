@@ -29,7 +29,7 @@ pub fn elect(allocator: std.mem.Allocator, isolation: security.policy.Isolation,
 pub const freshEpoch = n.epoch;
 
 test "apprt.win32.ipc.Instance native election delivery and replay ACK" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const w32 = @import("../win32.zig");
     const Client = @import("Client.zig");
     const host_epoch = try freshEpoch();

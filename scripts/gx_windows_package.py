@@ -3,7 +3,7 @@
 
 Inputs
   --prefix PREFIX         install prefix of `zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
-                          -Doptimize=ReleaseFast -Dversion-string=VS --prefix PREFIX` (default zig-out):
+                          -Doptimize=fast -Dversion-string=VS --prefix PREFIX` (default zig-out):
                           bin/ghostty.exe (x64 PE that embeds VS) and share/ with share/ghostty/ and
                           share/terminfo/ghostty.terminfo. bin/ DLLs that ghostty.exe imports ship
                           next to it; other bin/ files (ghostty-vt.dll, *.pdb), share/pkgconfig/ and
@@ -11,7 +11,7 @@ Inputs
   --version-string VS     <build.zig.zon X.Y.Z>-gx.<fork X.Y.Z>; defaults to, and must equal,
                           scripts/gx_release.py::ReleaseInfo.version_string of this checkout.
   --output-dir DIR        default zig-out/dist; existing outputs with the same names are replaced.
-  --build                 first run that ReleaseFast win32 build into PREFIX via scripts/zigw.py.
+  --build                 first run that fast win32 build into PREFIX via scripts/zigw.py.
 
 Pinned third-party inputs (DOWNLOADS, PAYLOAD) are fetched once into the cache directory (--cache-dir,
 else $GX_GHOSTTY_PACKAGE_CACHE, else .local/cache/gx-package; --offline never downloads). Every
@@ -97,7 +97,7 @@ VERSION_STRING_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-gx\.(
 PE_MACHINE_AMD64 = 0x8664
 ZIP_TIMESTAMP = (2026, 1, 1, 0, 0, 0)
 REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-BUILD_FLAGS = ("-Dapp-runtime=win32", f"-Dtarget={TARGET}-gnu", "-Doptimize=ReleaseFast")
+BUILD_FLAGS = ("-Dapp-runtime=win32", f"-Dtarget={TARGET}-gnu", "-Doptimize=fast")
 README = "README.txt"
 FONTS_DIR = "fonts"
 
@@ -943,7 +943,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--iscc", help="Inno Setup 7.1 ISCC.exe (default $ISCC, .local/tools/innosetup, PATH)")
     parser.add_argument("--skip-installer", action="store_true", help="only build the portable zip")
     parser.add_argument("--offline", action="store_true", help="use only cached downloads")
-    parser.add_argument("--build", action="store_true", help="run the ReleaseFast win32 build into --prefix first")
+    parser.add_argument("--build", action="store_true", help="run the fast win32 build into --prefix first")
     args = parser.parse_args(argv)
     try:
         version_string = args.version_string or gx_release.release_info(ROOT).version_string

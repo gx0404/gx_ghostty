@@ -18,7 +18,8 @@ pub const comptime_version: std.SemanticVersion = .{
 
 pub const minimum_version: std.SemanticVersion = .{
     .major = 1,
-    .minor = 7,
+    // fork(gx): GX-0059 keep Ubuntu 24.04 (libadwaita 1.5) supported
+    .minor = 5,
     .patch = 0,
 };
 

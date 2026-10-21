@@ -238,7 +238,7 @@ fn buildSurfaceMenu(
     const root = &menu.root;
     var buf: [64]u8 = undefined;
     try menu.add(root, .{
-        .id = @intFromEnum(SurfaceItem.copy),
+        .id = @backingInt(SurfaceItem.copy),
         .label = i18n.tr("Copy"),
         .icon = icons.copy,
         .access = 'C',
@@ -246,7 +246,7 @@ fn buildSurfaceMenu(
         .enabled = state.selection,
     });
     try menu.add(root, .{
-        .id = @intFromEnum(SurfaceItem.paste),
+        .id = @backingInt(SurfaceItem.paste),
         .label = i18n.tr("Paste"),
         .icon = icons.paste,
         .access = 'P',
@@ -254,17 +254,17 @@ fn buildSurfaceMenu(
         .enabled = state.clipboard_text,
     });
     try menu.add(root, .{
-        .id = @intFromEnum(SurfaceItem.select_all),
+        .id = @backingInt(SurfaceItem.select_all),
         .label = i18n.tr("Select All"),
         .icon = icons.select_all,
         .access = 'A',
         .shortcut = hints.text(.select_all, &buf),
     });
     try menu.separator(root);
-    const split = try addSplitMenu(menu, root, hints, @intFromEnum(SurfaceItem.split_right));
+    const split = try addSplitMenu(menu, root, hints, @backingInt(SurfaceItem.split_right));
     try menu.separator(split);
     try menu.add(split, .{
-        .id = @intFromEnum(SurfaceItem.zoom_split),
+        .id = @backingInt(SurfaceItem.zoom_split),
         .label = i18n.tr("Toggle Split Zoom"),
         .icon = icons.zoom,
         .access = 'Z',
@@ -273,7 +273,7 @@ fn buildSurfaceMenu(
         .enabled = state.split,
     });
     try menu.add(split, .{
-        .id = @intFromEnum(SurfaceItem.equalize_splits),
+        .id = @backingInt(SurfaceItem.equalize_splits),
         .label = i18n.tr("Equalize Splits"),
         .access = 'E',
         .shortcut = hints.text(.equalize_splits, &buf),
@@ -281,7 +281,7 @@ fn buildSurfaceMenu(
     });
     try menu.separator(split);
     try menu.add(split, .{
-        .id = @intFromEnum(SurfaceItem.move_split_to_tab),
+        .id = @backingInt(SurfaceItem.move_split_to_tab),
         .label = i18n.tr("Move Split to New Tab"),
         .icon = icons.new_tab,
         .access = 'M',
@@ -289,7 +289,7 @@ fn buildSurfaceMenu(
         .enabled = state.split,
     });
     try menu.add(split, .{
-        .id = @intFromEnum(SurfaceItem.move_split_to_window),
+        .id = @backingInt(SurfaceItem.move_split_to_window),
         .label = i18n.tr("Move Split to New Window"),
         .icon = icons.move_to_window,
         .access = 'W',
@@ -298,7 +298,7 @@ fn buildSurfaceMenu(
     });
     try menu.separator(split);
     try menu.add(split, .{
-        .id = @intFromEnum(SurfaceItem.close_split),
+        .id = @backingInt(SurfaceItem.close_split),
         .label = i18n.tr("Close Split"),
         .icon = icons.close,
         .access = 'C',
@@ -306,21 +306,21 @@ fn buildSurfaceMenu(
     });
     try menu.separator(root);
     try menu.add(root, .{
-        .id = @intFromEnum(SurfaceItem.search),
+        .id = @backingInt(SurfaceItem.search),
         .label = i18n.tr("Search"),
         .icon = icons.search,
         .access = 'E',
         .shortcut = hints.text(.start_search, &buf),
     });
     try menu.add(root, .{
-        .id = @intFromEnum(SurfaceItem.clear_screen),
+        .id = @backingInt(SurfaceItem.clear_screen),
         .label = i18n.tr("Clear Screen"),
         .icon = icons.clear,
         .access = 'L',
         .shortcut = hints.text(.clear_screen, &buf),
     });
     try menu.add(root, .{
-        .id = @intFromEnum(SurfaceItem.reset),
+        .id = @backingInt(SurfaceItem.reset),
         .label = i18n.tr("Reset Terminal"),
         .icon = icons.reset,
         .access = 'R',
@@ -328,13 +328,13 @@ fn buildSurfaceMenu(
     });
     try menu.separator(root);
     if (state.pwd) try menu.add(root, .{
-        .id = @intFromEnum(SurfaceItem.open_pwd),
+        .id = @backingInt(SurfaceItem.open_pwd),
         .label = i18n.tr("Open Current Directory in File Explorer"),
         .icon = icons.folder,
         .access = 'O',
     });
     try menu.add(root, .{
-        .id = @intFromEnum(SurfaceItem.settings),
+        .id = @backingInt(SurfaceItem.settings),
         .label = i18n.tr("Settings…"),
         .icon = icons.settings,
         .access = 'T',
@@ -504,7 +504,7 @@ fn buildTabMenu(
     var buf: [64]u8 = undefined;
     if (tab) |index| {
         try menu.add(root, .{
-            .id = @intFromEnum(TabCommand.rename),
+            .id = @backingInt(TabCommand.rename),
             .label = i18n.tr("Rename Tab"),
             .icon = icons.rename,
             .access = 'R',
@@ -512,21 +512,21 @@ fn buildTabMenu(
         });
         try menu.separator(root);
         try menu.add(root, .{
-            .id = @intFromEnum(TabCommand.close),
+            .id = @backingInt(TabCommand.close),
             .label = i18n.tr("Close Tab"),
             .icon = icons.close,
             .access = 'C',
             .shortcut = hints.text(.{ .close_tab = .this }, &buf),
         });
         try menu.add(root, .{
-            .id = @intFromEnum(TabCommand.close_others),
+            .id = @backingInt(TabCommand.close_others),
             .label = i18n.tr("Close Other Tabs"),
             .access = 'O',
             .shortcut = hints.text(.{ .close_tab = .other }, &buf),
             .enabled = tab_count > 1,
         });
         try menu.add(root, .{
-            .id = @intFromEnum(TabCommand.close_right),
+            .id = @backingInt(TabCommand.close_right),
             .label = i18n.tr("Close Tabs to the Right"),
             .access = 'G',
             .shortcut = hints.text(.{ .close_tab = .right }, &buf),
@@ -534,7 +534,7 @@ fn buildTabMenu(
         });
         try menu.separator(root);
         try menu.add(root, .{
-            .id = @intFromEnum(TabCommand.move_to_new_window),
+            .id = @backingInt(TabCommand.move_to_new_window),
             .label = i18n.tr("Move Tab to New Window"),
             .icon = icons.move_to_window,
             .access = 'M',
@@ -542,7 +542,7 @@ fn buildTabMenu(
             .enabled = tab_count > 1,
         });
         try menu.add(root, .{
-            .id = @intFromEnum(TabCommand.duplicate),
+            .id = @backingInt(TabCommand.duplicate),
             .label = i18n.tr("Duplicate Tab"),
             .icon = icons.duplicate,
             .access = 'D',
@@ -550,7 +550,7 @@ fn buildTabMenu(
         try menu.separator(root);
     }
     try menu.add(root, .{
-        .id = @intFromEnum(TabCommand.new_tab),
+        .id = @backingInt(TabCommand.new_tab),
         .label = i18n.tr("New Tab"),
         .icon = icons.new_tab,
         .access = 'N',
@@ -836,12 +836,12 @@ const InvalidationFixture = struct {
         self.window.hwnd = null;
         self.window.palette = .{};
         self.windows = .{ &self.primary, &self.window };
-        self.app.windows = .{ .items = &self.windows, .capacity = self.windows.len };
+        self.app.windows = .{ .items = &self.windows, .capacity = self.windows.len, .pointer_stability = .{} };
     }
 
     fn settle(self: *InvalidationFixture) void {
         for (self.windows) |owner| {
-            owner.palette.preparation.pending = .initEmpty();
+            owner.palette.preparation.pending = .empty;
             owner.palette.popup.reuse_invalid = false;
             owner.palette.item_cache.stamp = 123;
         }
@@ -898,12 +898,12 @@ test "P4 broadcasts that change nothing popups draw with keep every hidden host"
     window.hwnd = null;
     window.palette = .{};
     var windows = [_]*Window{ &primary, &window };
-    app.windows = .{ .items = &windows, .capacity = windows.len };
+    app.windows = .{ .items = &windows, .capacity = windows.len, .pointer_stability = .{} };
     // Whatever the first broadcast of this process does, the next ones see
     // the same system state.
     app.onSystemSettingChange(&window, .theme);
     for (windows) |owner| {
-        owner.palette.preparation.pending = .initEmpty();
+        owner.palette.preparation.pending = .empty;
         owner.palette.popup.reuse_invalid = false;
         owner.palette.item_cache.stamp = 123;
     }
@@ -1078,7 +1078,7 @@ const IdleFixture = struct {
 
     fn run(window: *Window, unit: Popup.Preparation.Unit) void {
         served += 1;
-        runs[count] = 10 * window.ui_reference.id + @intFromEnum(unit);
+        runs[count] = 10 * window.ui_reference.id + @backingInt(unit);
         count += 1;
         if (destroy) |gone| {
             destroy = null;
@@ -1111,7 +1111,7 @@ const IdleFixture = struct {
             window.ui_reference = .{ .epoch = 1, .kind = .window, .id = id, .generation = 1 };
             slot.* = window;
         }
-        app.windows = .{ .items = list, .capacity = list.len };
+        app.windows = .{ .items = list, .capacity = list.len, .pointer_stability = .{} };
     }
 };
 
@@ -1278,14 +1278,14 @@ fn buildMainMenu(menu: *MenuPopup.Builder, app: *App, launch: *ProfileItems) All
     var buf: [64]u8 = undefined;
 
     try menu.add(root, .{
-        .id = @intFromEnum(MainItem.new_tab),
+        .id = @backingInt(MainItem.new_tab),
         .label = i18n.tr("New Tab"),
         .icon = icons.new_tab,
         .access = 'T',
         .shortcut = hints.text(.new_tab, &buf),
     });
     try menu.add(root, .{
-        .id = @intFromEnum(MainItem.new_window),
+        .id = @backingInt(MainItem.new_window),
         .label = i18n.tr("New Window"),
         .icon = icons.new_window,
         .access = 'N',
@@ -1297,25 +1297,25 @@ fn buildMainMenu(menu: *MenuPopup.Builder, app: *App, launch: *ProfileItems) All
         .access = 'P',
     });
     try launch.append(menu, profile_menu, hints, .tab);
-    _ = try addSplitMenu(menu, root, hints, @intFromEnum(MainItem.split_right));
+    _ = try addSplitMenu(menu, root, hints, @backingInt(MainItem.split_right));
     try menu.separator(root);
 
     try menu.add(root, .{
-        .id = @intFromEnum(MainItem.command_palette),
+        .id = @backingInt(MainItem.command_palette),
         .label = i18n.tr("Command Palette"),
         .icon = icons.command_palette,
         .access = 'C',
         .shortcut = hints.text(.toggle_command_palette, &buf),
     });
     try menu.add(root, .{
-        .id = @intFromEnum(MainItem.settings),
+        .id = @backingInt(MainItem.settings),
         .label = i18n.tr("Settings…"),
         .icon = icons.settings,
         .access = 'E',
         .shortcut = settingsShortcut(&app.config, hints, &buf),
     });
     try menu.add(root, .{
-        .id = @intFromEnum(MainItem.keybinds),
+        .id = @backingInt(MainItem.keybinds),
         .label = i18n.tr("Keyboard Shortcuts"),
         .icon = icons.keyboard,
         .access = 'K',
@@ -1324,7 +1324,7 @@ fn buildMainMenu(menu: *MenuPopup.Builder, app: *App, launch: *ProfileItems) All
     const languages = try menu.submenu(root, .{ .label = i18n.tr("Language"), .icon = icons.language, .access = 'L' });
     for (std.enums.values(i18n.Language)) |lang| {
         try menu.add(languages, .{
-            .id = language_ids + @intFromEnum(lang),
+            .id = language_ids + @backingInt(lang),
             .label = lang.nativeName(),
             .access = switch (lang) {
                 .en => 'E',
@@ -1336,7 +1336,7 @@ fn buildMainMenu(menu: *MenuPopup.Builder, app: *App, launch: *ProfileItems) All
     try menu.separator(root);
 
     try menu.add(root, .{
-        .id = @intFromEnum(MainItem.reload_config),
+        .id = @backingInt(MainItem.reload_config),
         .label = i18n.tr("Reload Configuration"),
         .icon = icons.reload,
         .access = 'R',
@@ -1344,7 +1344,7 @@ fn buildMainMenu(menu: *MenuPopup.Builder, app: *App, launch: *ProfileItems) All
     });
     // `open_config` opens the settings with `gx-open-config-ui = settings`.
     try menu.add(root, .{
-        .id = @intFromEnum(MainItem.open_config_file),
+        .id = @backingInt(MainItem.open_config_file),
         .label = i18n.tr("Open Configuration File"),
         .icon = icons.open_file,
         .access = 'O',
@@ -1358,7 +1358,7 @@ fn buildMainMenu(menu: *MenuPopup.Builder, app: *App, launch: *ProfileItems) All
     if (app.drop_bridge.available()) {
         try menu.separator(root);
         try menu.add(root, .{
-            .id = @intFromEnum(MainItem.drop_receiver),
+            .id = @backingInt(MainItem.drop_receiver),
             .label = i18n.tr("Drop into Elevated Terminal…"),
             .icon = d2d.icons.shield,
             .access = 'D',
@@ -1366,13 +1366,13 @@ fn buildMainMenu(menu: *MenuPopup.Builder, app: *App, launch: *ProfileItems) All
     }
     try menu.separator(root);
     try menu.add(root, .{
-        .id = @intFromEnum(MainItem.about),
+        .id = @backingInt(MainItem.about),
         .label = i18n.tr("About Ghostty GX"),
         .icon = icons.about,
         .access = 'A',
     });
     try menu.add(root, .{
-        .id = @intFromEnum(MainItem.quit),
+        .id = @backingInt(MainItem.quit),
         .label = i18n.tr("Quit"),
         .icon = icons.quit,
         .access = 'Q',
@@ -1486,10 +1486,10 @@ fn buildProfileMenu(
         .access = 'W',
     });
     try launch.append(menu, window_menu, hints, .window);
-    _ = try addSplitMenu(menu, root, hints, @intFromEnum(ProfileMenuItem.split_right));
+    _ = try addSplitMenu(menu, root, hints, @backingInt(ProfileMenuItem.split_right));
     try menu.separator(root);
     try menu.add(root, .{
-        .id = @intFromEnum(ProfileMenuItem.set_default_shell),
+        .id = @backingInt(ProfileMenuItem.set_default_shell),
         .label = i18n.tr("Set Default Shell…"),
         .icon = icons.settings,
         .access = 'D',
@@ -1553,7 +1553,7 @@ const ProfileItems = struct {
             .tab => tab_ids,
             .window => window_ids,
         };
-        var used: MenuPopup.AccessSet = .initEmpty();
+        var used: MenuPopup.AccessSet = .empty;
         for (self.all(), 0..) |profile, i| {
             const action: input.Binding.Action = .{ .gx = switch (where) {
                 .tab => .{ .new_tab_profile = profile.id },
@@ -1617,7 +1617,7 @@ fn profileIcon(kind: profiles.Kind) ProfileIcon {
 fn defaultTag(alloc: Allocator, shortcut: ?[]const u8) Allocator.Error![]const u8 {
     const tag = i18n.tr("Default");
     const keys = shortcut orelse return tag;
-    return try std.fmt.allocPrint(alloc, "{s} · {s}", .{ tag, keys });
+    return try alloc.print("{s} · {s}", .{ tag, keys });
 }
 
 // -----------------------------------------------------------------------
@@ -1863,7 +1863,7 @@ test "the access keys of a menu are distinct and in its English labels" {
     try buildWindowMenu(&window_menu, .{ .zoomed = false, .fullscreen = false });
 
     for ([_]*const MenuPopup.List{ &tab_menu.root, &window_menu.root }) |list| {
-        var seen: MenuPopup.AccessSet = .initEmpty();
+        var seen: MenuPopup.AccessSet = .empty;
         for (list.items.items) |item| {
             const key = item.access orelse continue;
             const bit: usize = if (key >= 'A') 10 + key - 'A' else key - '0';

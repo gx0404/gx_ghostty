@@ -1294,7 +1294,7 @@ fn scrollbarWndProc(
             6 => self.grow,
             7 => self.fade,
             8 => @intCast(self.scroll_requests),
-            else => @intFromEnum(self.visibility),
+            else => @backingInt(self.visibility),
         },
 
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),

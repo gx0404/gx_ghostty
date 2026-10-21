@@ -30,7 +30,7 @@ FAKE_ZIG_SOURCE = """\
 import json, os, sys
 args = sys.argv[1:]
 if args == ["version"]:
-    print(os.environ.get("FAKE_ZIG_VERSION", "0.16.0"))
+    print(os.environ.get("FAKE_ZIG_VERSION", "0.17.0"))
     sys.exit(0)
 record = os.environ.get("FAKE_ZIG_RECORD")
 if record:
@@ -41,7 +41,7 @@ sys.exit(int(os.environ.get("FAKE_ZIG_EXIT", "0")))
 
 
 def make_fake_zig(directory: Path) -> Path:
-    """可执行的伪 zig：`zig version` 打印 $FAKE_ZIG_VERSION（默认 0.16.0），其余调用记录参数与缓存目录。"""
+    """可执行的伪 zig：`zig version` 打印 $FAKE_ZIG_VERSION（默认 0.17.0），其余调用记录参数与缓存目录。"""
     directory.mkdir(parents=True, exist_ok=True)
     script = directory / "fake_zig.py"
     script.write_text(FAKE_ZIG_SOURCE, encoding="utf-8")
@@ -73,7 +73,7 @@ class ResolveTests(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.root = self.tmp / "repo"
         self.root.mkdir()
-        self.pinned = make_dummy(self.root / ".local" / "toolchains" / "zig" / "zig-0.16.0" / EXE_NAME)
+        self.pinned = make_dummy(self.root / ".local" / "toolchains" / "zig" / "zig-0.17.0" / EXE_NAME)
         self.path_zig = make_dummy(self.tmp / "path-bin" / EXE_NAME)
         self.gx_zig = make_dummy(self.tmp / "gx" / EXE_NAME)
         self.env_zig = make_dummy(self.tmp / "env" / EXE_NAME)
@@ -126,7 +126,7 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual("pinned", resolved.source)
 
     def test_zig_home_moves_pinned_dir(self) -> None:
-        home_zig = make_dummy(self.tmp / "shared" / "zig-0.16.0" / EXE_NAME)
+        home_zig = make_dummy(self.tmp / "shared" / "zig-0.17.0" / EXE_NAME)
         resolved = zigw.resolve_zig(self.env(GX_GHOSTTY_ZIG_HOME=str(self.tmp / "shared")), self.root)
         self.assertEqual("pinned", resolved.source)
         self.assertTrue(same(home_zig, resolved.path))

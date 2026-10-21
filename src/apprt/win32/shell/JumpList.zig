@@ -30,14 +30,14 @@ pub const Snapshot = struct {
         for (profiles, tasks) |profile, *task| {
             try Identity.validateProfile(profile.id);
             if (profile.title.len > 2048 or std.mem.indexOfScalar(u8, profile.title, 0) != null or !std.unicode.utf8ValidateSlice(profile.title)) return error.InvalidTitle;
-            const id_argument = try std.fmt.allocPrint(owned, "{s}{s}", .{ Identity.profile_switch, profile.id });
+            const id_argument = try owned.print("{s}{s}", .{ Identity.profile_switch, profile.id });
             task.* = .{ .profile_id = try owned.dupe(u8, profile.id), .title = try std.unicode.utf8ToUtf16LeAllocZ(owned, profile.title), .arguments = try argv.encode(owned, &.{ Identity.profile_argument, id_argument }) };
             hash.update(profile.id);
             hash.update(&.{0});
             hash.update(profile.title);
             hash.update(&.{0});
         }
-        const executable = try owned.dupeZ(u16, identity.exe);
+        const executable = try owned.dupeSentinel(u16, identity.exe, 0);
         return .{ .arena = arena, .tasks = tasks, .executable = executable, .fingerprint = hash.finalResult() };
     }
     pub fn deinit(self: *Snapshot) void {
@@ -208,7 +208,7 @@ test "owned task snapshot carries stable IDs only and rejects host publication w
 }
 
 test "D18 ShellLink arguments preserve profile IDs through Ghostty argv parsing" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const t = std.testing;
     const Com = struct {
         extern "ole32" fn CoInitializeEx(?*anyopaque, u32) callconv(.winapi) HRESULT;
@@ -243,7 +243,7 @@ test "D18 ShellLink arguments preserve profile IDs through Ghostty argv parsing"
         defer iter.deinit();
         try t.expectEqualStrings("ghostty.exe", iter.next().?);
         try t.expectEqualStrings(Identity.profile_argument, iter.next().?);
-        const expected = try std.fmt.allocPrint(t.allocator, "{s}{s}", .{ Identity.profile_switch, task.profile_id });
+        const expected = try t.allocator.print("{s}{s}", .{ Identity.profile_switch, task.profile_id });
         defer t.allocator.free(expected);
         try t.expectEqualStrings(expected, iter.next().?);
         try t.expect(iter.next() == null);
@@ -409,7 +409,7 @@ test "apprt.win32.shell.D28 real saved links migrate only empty matching pin and
     defer alloc.free(other_w);
     try tmp.dir.createDir(t.io, "nested", .default_dir);
     for (0..4) |index| {
-        const name = if (index == 0) try alloc.dupe(u8, "nested/0.LNK") else try std.fmt.allocPrint(alloc, "{d}.lnk", .{index});
+        const name = if (index == 0) try alloc.dupe(u8, "nested/0.LNK") else try alloc.print("{d}.lnk", .{index});
         defer alloc.free(name);
         const path = try std.fs.path.join(alloc, &.{ root, name });
         defer alloc.free(path);

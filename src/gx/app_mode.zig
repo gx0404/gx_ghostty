@@ -36,7 +36,7 @@ pub const Root = enum {
     /// The terminal's child process, normally the shell (Windows).
     child,
 
-    pub const native: Root = if (builtin.os.tag == .windows) .child else .leader;
+    pub const native: Root = if (builtin.target.os.tag == .windows) .child else .leader;
 };
 
 /// How many checks in a row must find herdr before a window enters herdr
@@ -162,7 +162,7 @@ pub fn treeRunsHerdr(alloc: Allocator, tree: proc.Tree, root: ?u64, kind: Root) 
 /// errors and systems other than Linux and Windows answer false.
 pub fn terminalRunsHerdr(alloc: Allocator, io: std.Io, root: ?u64, scan: bool) ?bool {
     const pid = std.math.cast(proc.Pid, root orelse return false) orelse return false;
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux => {
             var dir = std.Io.Dir.openDirAbsolute(io, "/proc", .{ .iterate = true }) catch |err| {
                 log.warn("cannot open /proc err={}", .{err});
@@ -318,13 +318,13 @@ fn writeTestProcess(dir: std.Io.Dir, pid: proc.Pid, ppid: proc.Pid, started: u64
     var data_buf: [256]u8 = undefined;
     try writeTestFile(
         dir,
-        try std.fmt.bufPrint(&path_buf, "{d}/stat", .{pid}),
-        try std.fmt.bufPrint(&data_buf, "{d} ({s}) S {d} 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {d} 0 0\n", .{ pid, comm, ppid, started }),
+        try std.mem.print(&path_buf, "{d}/stat", .{pid}),
+        try std.mem.print(&data_buf, "{d} ({s}) S {d} 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {d} 0 0\n", .{ pid, comm, ppid, started }),
     );
     try writeTestFile(
         dir,
-        try std.fmt.bufPrint(&path_buf, "{d}/comm", .{pid}),
-        try std.fmt.bufPrint(&data_buf, "{s}\n", .{comm}),
+        try std.mem.print(&path_buf, "{d}/comm", .{pid}),
+        try std.mem.print(&data_buf, "{s}\n", .{comm}),
     );
 }
 

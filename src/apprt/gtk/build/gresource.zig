@@ -27,7 +27,8 @@ pub const icon_sizes: []const comptime_int = &.{ 16, 32, 128, 256, 512, 1024 };
 /// against whichever of the two is higher.
 pub const minimum_adwaita: struct { major: u16, minor: u16 } = .{
     .major = 1,
-    .minor = 7,
+    // fork(gx): GX-0059 keep Ubuntu 24.04 (libadwaita 1.5) buildable
+    .minor = 5,
 };
 
 /// The blueprint files that we will embed into the gresource file.
@@ -68,6 +69,11 @@ pub const blueprints: []const Blueprint = &.{
 /// CSS files in css_path
 pub const css = [_][]const u8{
     "style.css",
+    // fork(gx): GX-0059 begin: libadwaita 1.5 lacks the CSS variables
+    "style-dark.css",
+    "style-hc.css",
+    "style-hc-dark.css",
+    // fork(gx): GX-0059 end
 };
 
 pub const Blueprint = struct {

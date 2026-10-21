@@ -210,7 +210,7 @@ pub fn showPaneIn(self: *ResizeOverlay, pane: Pane, area: w32.RECT) void {
     const leaf = win.leafForPane(grid.pane) orelse return;
     const tab = win.findTabIndex(leaf) orelse return;
 
-    const text = std.fmt.bufPrint(&self.text_buf, "{d} \u{00D7} {d}", .{ grid.columns, grid.rows }) catch return;
+    const text = std.mem.print(&self.text_buf, "{d} \u{00D7} {d}", .{ grid.columns, grid.rows }) catch return;
     self.text_len = text.len;
 
     const factory = win.app.uiFactory() orelse return;

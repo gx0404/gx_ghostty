@@ -138,7 +138,7 @@ def main():
             open(marker, "w").close()
         sys.stderr.write("startup failure\n")
         sys.exit(5)
-    send(0, b"0.16.0")
+    send(0, SPEC.get("zig_version", "0.16.0").encode())
     while True:
         header = IN.read(8)
         if len(header) < 8:
@@ -742,6 +742,18 @@ class SelectionTests(FakeRunnerTestCase):
 
 
 class ProtocolArgumentTests(FakeRunnerTestCase):
+    def test_zig_017_handshake_preserves_result_flags(self) -> None:
+        binary = self.fake("zig017", [
+            {"name": "pass"},
+            {"name": "skip", "status": "skip"},
+            {"name": "leak", "leak": 1},
+            {"name": "log", "log_err": 1},
+        ], zig_version="0.17.0")
+        code, report, text = self.run_json("--binary", str(binary), "--jobs", "2", "--seed", "0")
+        self.assertEqual(code, 1, text)
+        self.assertEqual(report["binaries"][0]["zig_version"], "0.17.0")
+        self.assertEqual([row["outcome"] for row in report["tests"]], ["pass", "skip", "leak", "log_err"])
+
     def test_seed_cache_dir_and_cwd_reach_the_binary(self) -> None:
         binary = self.fake("args", [{"name": "only"}])
         code, out, err = self.run_main("--binary", str(binary), "--seed", "0xdeadbeef", "--jobs", "1")

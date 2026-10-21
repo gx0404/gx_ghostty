@@ -37,7 +37,7 @@
 | valgrind | `just zig build test-valgrind` | 运行期内存错误 / 其他平台 | 无 | 不可 |
 | fuzz | `test/fuzz-libghostty` 下 `zig build run-<name>` | 给定语料与时长内无崩溃 / 不存在崩溃 | 无 | 不可（AFL++） |
 | esctest | `test/esctest` 下 `zig build run` | 一致性计数 / 不是通过门 | 无 | 不可（`forkpty`） |
-| 基准 | `just build -Demit-bench -Doptimize=ReleaseFast` 后用 hyperfine | 同机同输入的耗时对比 / 正确性 | 无 | 可构建（2026-10 本机实测） |
+| 基准 | `just build -Demit-bench -Doptimize=fast` 后用 hyperfine | 同机同输入的耗时对比 / 正确性 | 无 | 可构建（2026-10 本机实测） |
 | NixOS VM | `nix run .#checks.<system>.<test>.driver` | GUI 与 ssh 集成 / 非 NixOS 环境 | 无 | 不可 |
 
 ## 不变量
@@ -90,7 +90,7 @@
 
 ## 验证
 
-- 改 `src/benchmark/**` 或 `src/synthetic/**`：`just test --filter <模块测试名>`，再 `just build -Demit-bench -Doptimize=ReleaseFast` 确认工具能构建（Windows 本机冷缓存约 4 min）。
+- 改 `src/benchmark/**` 或 `src/synthetic/**`：`just test --filter <模块测试名>`，再 `just build -Demit-bench -Doptimize=fast` 确认工具能构建（Windows 本机冷缓存约 4 min）。
 - 改 `scripts/zig_test.py` 或 `scripts/gx_wsl.py`：`python scripts/run_unittests.py test_zig_test test_gx_wsl`，再真实跑一次 `just test-vt` 与 `just test`（WSL 驱动另跑 `just wsl test --filter <名>`），核对计数表。
 - 改 `scripts/gx_win_gui.py`、`scripts/gx_perf.py` 或 `test/gui/**`：`python scripts/run_unittests.py test_gx_win_gui test_gx_perf test_gx_wsl`（含场景编号、`expect` 与 `language` 的检查），再真实跑一次受影响的场景（`just win-gui run …` 或 `just wsl scenario …`）并读图。
 - 新增或移动带 `test` 的 fork Zig 文件：`python scripts/run_unittests.py test_gx_test_roots`（`src/apprt/win32.zig`、`src/gx/main.zig`、`src/apprt/gtk/gx/main.zig` 的 `test` 块须引用它）。

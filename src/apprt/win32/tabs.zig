@@ -126,11 +126,11 @@ test "displayTitle prefers the override, then the terminal title" {
 
 test "Title cuts long titles at a codepoint boundary" {
     const testing = std.testing;
-    const long: Title = .fromUtf8("\u{6C49}" ** 300);
+    const long: Title = .fromUtf8(std.mem.asBytes(&@as([300]["\u{6C49}".len]u8, @splat("\u{6C49}".*))));
     try testing.expectEqual(@as(usize, max_title_len), long.slice().len);
-    const cjk: Title = .fromUtf8("\u{6C49}" ** 200);
+    const cjk: Title = .fromUtf8(std.mem.asBytes(&@as([200]["\u{6C49}".len]u8, @splat("\u{6C49}".*))));
     try testing.expectEqual(@as(usize, 200), cjk.slice().len);
-    const pair_at_end: Title = .fromUtf8("x" ** 254 ++ "\u{1F47B}");
+    const pair_at_end: Title = .fromUtf8(std.mem.asBytes(&@as([254]["x".len]u8, @splat("x".*))) ++ "\u{1F47B}");
     try testing.expectEqual(@as(usize, 254), pair_at_end.slice().len);
 
     var units: [300]u16 = undefined;

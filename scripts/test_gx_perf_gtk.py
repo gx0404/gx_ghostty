@@ -31,9 +31,9 @@ class CaptureTests(unittest.TestCase):
                                 "menu.open.total": "ms", "settings.open.total": "ms"}}
         self.spec = {"case": "p4", "tabs": 1, "run": 1, "capabilities": self.cap}
         self.receipt = {"schema": "gx-gtk-build-v1", "producer": "gx_wsl.py build", "build_exit": 0,
-                        "build_argv": ["python3", "scripts/zigw.py", "build", "-Dapp-runtime=gtk", "-Doptimize=ReleaseFast"],
+                        "build_argv": ["python3", "scripts/zigw.py", "build", "-Dapp-runtime=gtk", "-Doptimize=fast"],
                         "source_before": self.source, "source_after": self.source, "executable": self.exe,
-                        "version": "Ghostty 0.0.3+aaaaaaaaa\nbuild mode: ReleaseFast\n", "version_exit": 0,
+                        "version": "Ghostty 0.0.3+aaaaaaaaa\nbuild mode: fast\n", "version_exit": 0,
                         "perf_eligible": True}
         self.capture = {"schema": "gx-gtk-action-capture-v1", "case": "p4", "tabs": 1,
                         "status": "CAPTURED", "capabilities": self.cap, "source": self.source,
@@ -85,7 +85,7 @@ class CaptureTests(unittest.TestCase):
             self.reduce()
 
     def test_debug_rejected_even_with_eligible_flag(self):
-        self.receipt["version"] = self.capture["version"] = self.receipt["version"].replace("ReleaseFast", "Debug")
+        self.receipt["version"] = self.capture["version"] = self.receipt["version"].replace("fast", "Debug")
         self.save()
         with self.assertRaises(ValueError):
             self.reduce()

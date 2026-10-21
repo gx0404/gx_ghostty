@@ -2,6 +2,14 @@
 
 本仓的命令入口是根目录的 `justfile`，用 `just` 调用，不是 make；文件名与其他 GX 仓库的命令手册一致。上游 `Makefile` 原样保留，不承载任何 fork 命令。流程上怎么组合这些命令见 [DEVELOPMENT.md](DEVELOPMENT.md)，每条测试命令能证明什么见 [TESTING.md](TESTING.md)。
 
+## Windows 日常快速验证
+
+源码或构建输入变化后运行 `just quick-prepare`，构建完整 main、vt、vt_c 产物并记录内容摘要。随后以 `just quick-check` 运行固定快速清单，编译不计入 60 秒。过期、缺失或被替换的产物会失败并提示重新准备；测试期间改动源码同样使结论无效。
+
+快速门覆盖规则、版本、格式、diff、九组框架模块，以及 Windows/GX 和 VT Parser/C ABI 固定用例；完整清单以 `scripts/quick_check.py::FRAMEWORK` / `FILTERS` 为真源。执行预算 55 秒，预留 5 秒终止进程树和保存报告。失败、超时、零命中与未完成不得算通过。记录在 `.local/quick-check/`；独立测试产物位于其中的 `build/`，完整性校验涵盖实际 `ZIG_LIB_DIR` 内容。
+
+这取代旧的日常全量耗时目标；`test`、`test-vt`、`framework-check`、`ci-check` 和每次 push 的完整 CI 保持原意。上游同步、发版与跨平台/GUI验收仍执行相应完整检查。60 秒需在当前工具链和当前源码上连续三次实际验收，历史缓存和计数不能代证。
+
 ## 约定
 
 - `just`（不带参数）执行默认配方，即 `just --list`，列出全部配方及其说明。
@@ -65,7 +73,7 @@
 | `just test-vt <参数…>` | `zig_test.py --suite vt …`：先 `zig build test-lib-vt-bin`（fork 补丁 GX-0002 的步骤，只编译并安装），再把 `zig-out/test/vt/`、`zig-out/test/vt_c/` 两个测试二进制（`ghostty-vt`、`ghostty-vt-c` 模块）的用例分片到 `--jobs` 个进程。参数：`--filter <子串>`（按用例全名在运行期过滤，可重复，不重编）、`--seed <n>`、`--json <文件>`、`--list`、`--jobs <n>`（默认逻辑核数）、`--timeout <秒>`（单条用例，默认 600）、`--no-build`（直接跑已安装的二进制）、`--dedupe`、`--serial-filter <子串>`；`-D<选项>=<值>` 透传给 zig build（`-Dtest-filter` 是编译期裁剪，换值就要重编），其他以 `-` 开头的 zig 参数写成 `--zig-arg=<参数>` | 钉版 Zig；Windows 需 MSVC 与 Windows SDK（本机目标默认 MSVC），还需开启「开发者模式」（允许非管理员创建符号链接），否则 `src/lib/tinyio` 的 2 个符号链接用例（两个测试二进制各跑一次，共 4 处）以 `PermissionDenied` 失败；`just doctor` 的可选项 symlink 报告这项前置 | 同 `just build`，另写 `zig-out/test/`、耗时缓存 `.local/test-timings/vt.json` 与 `vt_c.json`、`--json` 指定的文件 | 0 全部通过（跳过不算失败）；1 有用例 fail、leak、log_err、crash、timeout 或未运行；2 用法错误、构建失败（含找不到 Zig）、缺测试二进制、读不到用例清单，或没有可运行的用例（报错写明是运行期 `--filter` 没命中、构建期 `-Dtest-filter` 裁掉了全部用例，还是二进制本身没有用例）；130 被中断：Ctrl+C，POSIX 上 SIGTERM、SIGHUP 也按 Ctrl+C 处理，杀掉测试进程后退出 |
 | `just test <参数…>` | `zig_test.py --suite main …`：先构建 `test-bin`，再把以 `src/main.zig` 为根的完整单测 `ghostty-test` 分片运行，参数同 `just test-vt`。Windows 主机上给构建补 `-Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu`（`-D` 或 `--zig-arg` 里已写的同名选项以使用者为准），与 `just build` 同一组合；Linux/macOS 原样，CI 的 `linux-main` 加 `-Dapp-runtime=none`。macOS 上只跑 `ghostty-test`：上游 `zig build test` 不带 `-Dtest-filter` 时还经 `addTestStepDependencies` 挂上 macOS app 的 `xcodebuild test`（跳过 `GhosttyUITests`），`just test` 不含它，app 单测用 `macos/build.nu --action test` | 同 `just build`；Windows 未开开发者模式时 tinyio 的 2 个符号链接用例以 `PermissionDenied` 失败 | 同上，产物 `zig-out/test/ghostty-test(.exe)`，耗时缓存 `.local/test-timings/ghostty-test.json` | 同 `just test-vt` |
 | `just build-vt <参数…>` | `zig build -Demit-lib-vt …`：只构建 libghostty-vt；交叉编译加 `-Dtarget=<triple>` | 钉版 Zig；Windows 本机目标需 MSVC 与 Windows SDK | 同 `just build` | 透传 zig；找不到 Zig 时 2 |
-| `just vt-wasm` | `zig build -Demit-lib-vt -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall` | 钉版 Zig | `zig-out/bin/ghostty-vt.wasm` | 同上 |
+| `just vt-wasm` | `zig build -Demit-lib-vt -Dtarget=wasm32-freestanding -Doptimize=small` | 钉版 Zig | `zig-out/bin/ghostty-vt.wasm` | 同上 |
 | `just dist-vt` | `zig build dist -Demit-lib-vt=true`：libghostty-vt 源码包 | 钉版 Zig、Git | 用 `git archive` 打包 HEAD（未提交的改动不在内），输出 `zig-out/dist/libghostty-vt-<版本>.tar.gz` | 同上 |
 | `just fmt` | `zig fmt --exclude .local --exclude zig-pkg --exclude zig-out --exclude .zig-cache .`：格式化全仓 Zig 文件；`zig-pkg/` 是 Zig 0.16 构建时拉进仓库根的第三方依赖，必须排除 | 钉版 Zig | **改写文件** | 同上 |
 | `just fmt-check` | 同上加 `--check`：只检查 | 钉版 Zig | 只读，列出未格式化的文件 | 0 / 非 0 |
@@ -103,7 +111,7 @@
 |---|---|
 | `setup [--check] [--apt]` | 幂等：克隆不存在时从本仓 `git clone`；克隆内 `python3 scripts/setup_zig.py --install`；下载钉版 blueprint-compiler 0.16.0（GNOME GitLab 的 `v0.16.0` tag 归档，按 sha256 校验），用 meson 装到 `~/.local/opt/blueprint-compiler-0.16.0` 并写 `~/.local/bin/blueprint-compiler` shim（不覆盖别人写的同名文件）；最后预取 Zig 包。`--check` 只读报告；`--apt` 先以 root 安装缺失的 apt 包与 locale，只装缺的、不升级已装的 |
 | `sync [<ref> \| <worktree 目录>] [--dirty]` | 把本仓的一个提交取进克隆并 detached 检出：目录参数按 worktree 处理（取其 HEAD），其余按本仓 ref 解析，省略时取脚本所在的 worktree。`--dirty` 用临时 index 把该 worktree 的未提交与未跟踪（未被忽略）文件快照成一个提交对象再同步，不动它的 index、ref 与文件，快照对象留在对象库里直到 gc。克隆有本地改动、或检出会孤立克隆里的本地提交时拒绝；同步结果记在克隆的 `refs/gx-wsl/synced` |
-| `build [--gtk] <zig build 参数…>` | 克隆内钉版 `python3 scripts/zigw.py build …`；`--gtk` 追加 `-Dapp-runtime=gtk -fno-sys=gtk4-layer-shell`。正常 GTK install 自动生成 `.local/gx-wsl/gtk-build-receipt.json`，绑定构建 argv/退出、构建前后源树及实际 exe SHA/版本；性能需精确提交后 `-Doptimize=ReleaseFast`，默认目标/唯一 install 支持合法 `--summary all` 与 `-j4`；钉版不接受 `-j 4`。help/list 查询照常输出且透传退出 0，但写 ineligible attempt，不给旧映像新凭证；test/custom step、未知 flag、prefix/target/emit 等不签收。普通 Debug smoke 仍可用；CPU 差额/候选界仅诊断，非有效性或收益门，完整合同见 TESTING.md |
+| `build [--gtk] <zig build 参数…>` | 克隆内钉版 `python3 scripts/zigw.py build …`；`--gtk` 追加 `-Dapp-runtime=gtk -fno-sys=gtk4-layer-shell`。正常 GTK install 自动生成 `.local/gx-wsl/gtk-build-receipt.json`，绑定构建 argv/退出、构建前后源树及实际 exe SHA/版本；性能需精确提交后 `-Doptimize=fast`，默认目标/唯一 install 支持合法 `--summary all` 与 `-j4`；钉版不接受 `-j 4`。help/list 查询照常输出且透传退出 0，但写 ineligible attempt，不给旧映像新凭证；test/custom step、未知 flag、prefix/target/emit 等不签收。普通 Debug smoke 仍可用；CPU 差额/候选界仅诊断，非有效性或收益门，完整合同见 TESTING.md |
 | `test [--suite main\|vt] [--gtk] [--filter <子串>]… <zig_test 参数…>` | 克隆内 `python3 scripts/zig_test.py`；`main`（默认）与 gx-ci `linux-main` 一样加 `-Dapp-runtime=none`，`--gtk` 改为 GTK 运行时（含 `src/apprt/gtk/gx/` 的单测） |
 | `smoke --out <Windows 目录> [--lang zh_CN\|en] [--xdotool <文件>] [--config <文件>] [--wait <秒>] [--settle <秒>] [--name <前缀>] [--env <名>=<值>]… [--perf] [-- <ghostty 参数…>]` | Xvfb `1280x800x24`，默认 `GDK_BACKEND=x11 LIBGL_ALWAYS_SOFTWARE=1 NO_AT_BRIDGE=1`；记录实际生效的环境，不能用这些名字代证渲染路径。每 50 ms 查窗口，最多等 20 s，出现后默认再等 3 s 截图；可执行隔离 display 上的 xdotool 脚本（`$1` 为受控 PID）。普通 smoke 支持 Debug；`--perf` 验证实际映像为 ReleaseFast、设 `GHOSTTY_GX_PERF=1`，原负载 `seq 1 3000000`、1 s CPU 尾窗不变。新 v2 元数据与 times 原件保存单调纳秒端点，window/workload 秒值由整数差归约并核验；realtime 仅作溯源，旧 v1 保留原判。PID/创建时间/实际 exe 与 TID/创建时间严格守门；持有 Popen child/pidfd，拒绝未知身份信号。PNG、日志、version、原始 tasks/status/times、`*-perf.txt`、`*-meta.txt/json`（含 SHA256/commit/tree/dirty/退出/finished）复制回 out；同名前缀已存在或正在使用则退出 2，不覆盖。身份、线程人口、统计、负载、截图或运行退出失败时为 1，raw 保留但不可采集。`--env` 不允许绕过 DISPLAY、Wayland、XDG 配置/状态隔离或把 GDK 改成非 x11；完整采集/比较合同见 TESTING.md「耗时度量与基线」 |
 | `scenario --out <Windows 目录> [<场景>…]` | 逐个运行 `test/gui/gtk/G*.toml`（编号如 `G01` 或 `.toml` 路径，省略时全部；格式见 `test/gui/README.md`）：场景的配置与 xdotool 脚本写到 `<目录>/<id>/`，再在那里跑一次名为 `<id>` 的 `smoke`；日志有一行匹配场景的 `forbid` 正则（默认 `Theme parser error`、`css parsing failed`）就判失败。每个场景写 `notes.txt`（读图要点与状态），`<目录>/SUMMARY.txt` 每个场景一行；任一场景失败时退出 1 |

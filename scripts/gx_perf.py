@@ -17,7 +17,7 @@ Usage: python scripts/gx_perf.py COMMAND [ARGS...]      (just perf COMMAND [ARGS
         DIR/<label>/run-NN.txt and a copy of its log; the summary or comparison follows.
         --env sets variables for every run, e.g. GHOSTTY_GX_PERF=1.
   gtk --clone PATH [--clone PATH] [--label NAME]... --out DIR [--runs N] [--env NAME=VALUE]...
-        Verified ReleaseFast GTK images through `scripts/gx_wsl.py smoke --perf` in WSL clones.
+        Verified fast GTK images through `scripts/gx_wsl.py smoke --perf` in WSL clones.
         New/empty DIR only; no automatic warm-up; AB/BA order. DIR/<label>/run-NN/ holds raw evidence,
         gtk-runs.json preserves every planned run, RESULT.json records validity (not a performance verdict).
         Missing/failed/changed-identity runs cannot be filtered into success.
@@ -283,7 +283,7 @@ def _gtk_evidence(path: Path) -> tuple[dict, Samples]:
         return meta, Samples()
     if meta.get("perf") is not True or \
             meta.get("workload_finished") is not True or meta.get("workload_exit") != "0" or \
-            meta.get("build_mode") != "ReleaseFast" or meta.get("cleanup_identity") != "verified":
+            meta.get("build_mode") != "fast" or meta.get("cleanup_identity") != "verified":
         raise PerfError(f"{path}: rejected GTK run: {meta.get('errors', [])}")
     for key, kind in (("identity", dict), ("identity_checks", list), ("files", list), ("artifact_sha256", dict),
                       ("version", str), ("effective_env", dict)):
@@ -327,8 +327,8 @@ def _gtk_evidence(path: Path) -> tuple[dict, Samples]:
         return (path.parent / name).read_text(encoding="utf-8", errors="strict")
     try:
         version = raw("-version.txt")
-        if not re.search(r"build mode\s*:\s*(?:\w+\.)?\.?ReleaseFast\b", version):
-            raise ValueError("version does not verify ReleaseFast")
+        if not re.search(r"build mode\s*:\s*(?:\w+\.)?\.?fast\b", version):
+            raise ValueError("version does not verify fast")
         import gx_wsl
         namespace: dict = {"__name__": "gx_perf_validator"}
         exec(compile(gx_wsl.PERF_PROGRAM + gx_wsl.RECEIPT_PROGRAM, "gx_perf_validator", "exec"), namespace)
@@ -4061,7 +4061,7 @@ def build_parser() -> argparse.ArgumentParser:
             experiment.set_defaults(windows=1, state='visible')
         if name == 'win32-c6':
             experiment.add_argument('--font-manifest', type=Path, required=True,
-                                    help='root-attested same-source ReleaseFast build manifest')
+                                    help='root-attested same-source fast build manifest')
             experiment.set_defaults(tabs=1, windows=1, state='visible')
     return parser
 

@@ -97,7 +97,7 @@ pub fn Export(comptime gl: type) type {
 
         fn switchedOff(comptime fmt: []const u8, args: anytype) void {
             var buf: [256]u8 = undefined;
-            const reason = std.fmt.bufPrint(&buf, fmt, args) catch fmt;
+            const reason = std.mem.print(&buf, fmt, args) catch fmt;
             if (!firstToSwitchOff()) {
                 log.debug("DMABUF export off ({s}), presenting frames from CPU memory", .{reason});
                 return;

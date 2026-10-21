@@ -1,5 +1,7 @@
 # ci-release：CI、发版、版本与上游治理文件
 
+日常 Windows 快速门见 `docs/TESTING.md`；编译独立，完整 CI 与同步验收保留。
+
 ## 范围
 
 - `.github/**`：两个启用的 workflow、归档目录 `workflows-archive/`，以及其余上游文件（`VOUCHED.td`、`dependabot.yml`、`pinact.yml`、`DISCUSSION_TEMPLATE/` 等；`scripts/` 里的翻译与 Apple 检查脚本另属 `apprt-gtk`、`libghostty-vt`）。

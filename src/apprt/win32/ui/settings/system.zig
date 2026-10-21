@@ -136,7 +136,7 @@ pub fn terminalFontFamilies(alloc: Allocator, options: ListOptions) !FontFamilie
 
         const gop = try seen.getOrPut(arena, name);
         if (gop.found_existing) continue;
-        const copy = try arena.dupeZ(u8, name);
+        const copy = try arena.dupeSentinel(u8, name, 0);
         gop.key_ptr.* = copy;
         try entries.append(arena, .{ .name = copy, .local = try localName(arena, family_names, english, copy, options.locales) });
     }
@@ -180,7 +180,7 @@ fn localName(
         const len = std.unicode.utf16LeToUtf8(&utf8_buf, name16) catch continue;
         const name = utf8_buf[0..len];
         if (name.len == 0 or std.mem.eql(u8, name, english)) return null;
-        return try arena.dupeZ(u8, name);
+        return try arena.dupeSentinel(u8, name, 0);
     }
     return null;
 }
@@ -216,7 +216,7 @@ pub const Picker = struct {
         } else names.len;
         @memcpy(out_names[0..at], names[0..at]);
         @memcpy(out_local[0..at], local_names[0..at]);
-        out_names[at] = try alloc.dupeZ(u8, extra);
+        out_names[at] = try alloc.dupeSentinel(u8, extra, 0);
         out_local[at] = null;
         @memcpy(out_names[at + 1 ..], names[at..]);
         @memcpy(out_local[at + 1 ..], local_names[at..]);
@@ -341,7 +341,7 @@ fn isMonospace(family: *com.IDWriteFontFamily) bool {
 /// fonts whose wide icons make DirectWrite report them as proportional.
 fn looksMonospace(name: []const u8) bool {
     for ([_][]const u8{ "mono", "code", "nerd font", "console", "consolas", "courier", "terminal", "fixed" }) |word| {
-        if (std.ascii.indexOfIgnoreCase(name, word) != null) return true;
+        if (std.ascii.findIgnoreCase(name, word) != null) return true;
     }
     return false;
 }
@@ -356,7 +356,7 @@ test "looksMonospace" {
 
 test "terminalFontFamilies lists installed monospace families" {
     const builtin = @import("builtin");
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
     var families = try terminalFontFamilies(testing.allocator, .{
         .locales = &.{std.unicode.utf8ToUtf16LeStringLiteral("zh-cn")},
@@ -408,7 +408,7 @@ test "the picker adds the configured family in order" {
 
 test "FontLoader lists on its thread and is freed by the last owner" {
     const builtin = @import("builtin");
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
 
     // Taken by the owner: the owner frees the list.
@@ -582,7 +582,7 @@ fn appendQuoted(alloc: Allocator, out: *std.ArrayList(u8), arg: []const u8) Allo
 
 test "HerdrRun reports the exit code of the process" {
     const builtin = @import("builtin");
-    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
     // where.exe rejects the unknown option and exits with an error code.
     var run = try HerdrRun.start(testing.allocator, "C:\\Windows\\System32\\where.exe", "C:\\no such\\gx-zsh.exe");

@@ -265,7 +265,7 @@ pub const Read = struct {
 };
 
 test "remote channel native mapping duplicates restricted handles and pins borrowed frames" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     try std.testing.expect(@intFromPtr(&BoundPeer.fromPipe) != 0);
     // Production constructs BoundPeer only via fromPipe. This native mapping
     // test binds both endpoints to the independently inspected test process.
@@ -299,7 +299,7 @@ test "remote channel native mapping duplicates restricted handles and pins borro
 }
 
 test "remote channel refuses wrong recipient before consuming handle and rejects false capacity" {
-    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .windows) return error.SkipZigTest;
     const isolation: policy.Isolation = .{ .config_root = @splat(1), .build = @splat(2), .class = @splat(3), .install = @splat(4) };
     var target_peer: BoundPeer = .{ .facts = try security.inspect(n.GetCurrentProcessId()), .epoch = 2, .isolation = isolation };
     defer target_peer.deinit();

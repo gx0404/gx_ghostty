@@ -39,61 +39,40 @@ pub fn present(window: *Window) void {
     var debug_buf: [1024]u8 = undefined;
     const debug = debugInfo(&debug_buf, backend);
 
-    if (adw_version.supportsDialogs()) {
-        const dialog = adw.AboutDialog.new();
-        dialog.as(gtk.Widget).addCssClass("gx-dialog");
-        dialog.setApplicationIcon(icon_name);
-        dialog.setApplicationName(branding.name);
-        dialog.setDeveloperName(tr(byline));
-        dialog.setVersion(build_config.version_string);
-        dialog.setComments(tr(branding.notice));
-        dialog.setLicenseType(.mit_x11);
-        dialog.setWebsite(branding.home_url);
-        dialog.setIssueUrl(branding.issues_url);
-        dialog.setDebugInfo(debug);
-        dialog.setDebugInfoFilename("ghostty-gx-debug-info.txt");
-        dialog.as(adw.Dialog).present(window.as(gtk.Widget));
-    } else {
-        gtk.showAboutDialog(
-            window.as(gtk.Window),
-            "program-name",
-            branding.name,
-            "title",
-            tr("About Ghostty GX").ptr,
-            "logo-icon-name",
-            icon_name,
-            "version",
-            build_config.version_string.ptr,
-            "comments",
-            tr(branding.notice).ptr,
-            "license-type",
-            @as(c_int, @intFromEnum(gtk.License.mit_x11)),
-            "website",
-            branding.home_url,
-            "system-information",
-            debug.ptr,
-            @as(?*anyopaque, null),
-        );
-    }
+    const dialog = adw.AboutDialog.new();
+    dialog.as(gtk.Widget).addCssClass("gx-dialog");
+    dialog.setApplicationIcon(icon_name);
+    dialog.setApplicationName(branding.name);
+    dialog.setDeveloperName(tr(byline));
+    dialog.setVersion(build_config.version_string);
+    dialog.setComments(tr(branding.notice));
+    dialog.setLicenseType(.mit_x11);
+    dialog.setWebsite(branding.home_url);
+    dialog.setIssueUrl(branding.issues_url);
+    dialog.setDebugInfo(debug);
+    dialog.setDebugInfoFilename("ghostty-gx-debug-info.txt");
+    dialog.as(adw.Dialog).present(window.as(gtk.Widget));
 }
 
 /// The debug information: the version, the graphics backend and the GTK
 /// and libadwaita versions the dialog runs with.
 fn debugInfo(buf: []u8, backend: []const u8) [:0]const u8 {
-    return std.fmt.bufPrintZ(buf, "{s} {s}\n{s}\nGTK {f}\nlibadwaita {f}\n", .{
+    return std.mem.printSentinel(buf, "{s} {s}\n{s}\nGTK {f}\nlibadwaita {f}\n", .{
         branding.name,
         build_config.version_string,
         backend,
         gtk_version.getRuntimeVersion(),
         adw_version.getRuntimeVersion(),
-    }) catch branding.name;
+    }, 0) catch branding.name;
 }
 
 fn graphicsBackend(window: *Window, buf: []u8) [:0]const u8 {
-    const vendor = Application.default().core().device.display.queryString(.vendor) orelse "unknown";
+    // The device is created with the first surface; About can open before that.
+    const device = Application.default().core().device orelse return std.mem.printSentinel(buf, "OpenGL (no device yet)", .{}, 0) catch "OpenGL / GTK";
+    const vendor = device.display.queryString(.vendor) orelse "unknown";
     const renderer = gtk_native_get_renderer(@ptrCast(window));
     const toolkit = if (renderer) |r| std.mem.span(g_type_name_from_instance(r)) else "unknown";
-    return std.fmt.bufPrintZ(buf, "OpenGL (EGL: {s}); GTK renderer: {s}", .{ vendor, toolkit }) catch "OpenGL / GTK";
+    return std.mem.printSentinel(buf, "OpenGL (EGL: {s}); GTK renderer: {s}", .{ vendor, toolkit }, 0) catch "OpenGL / GTK";
 }
 
 extern fn gtk_native_get_renderer(native: *anyopaque) ?*anyopaque;

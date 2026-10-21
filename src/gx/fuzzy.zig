@@ -230,14 +230,14 @@ pub const Positions = std.StaticBitSet(max_text);
 /// alignment of each term matched (all of them, for terms that overlap).
 /// `out` is empty when there is no match or the query is empty.
 pub fn positions(query: *const Query, p: *const Prepared, out: *Positions) ?i32 {
-    out.* = .initEmpty();
+    out.* = .empty;
     if (query.isEmpty()) return 0;
     var trace: Trace = undefined;
     var total: i32 = 0;
     for (0..query.term_count) |i| {
         const t = query.termCps(i);
         const m = matchTerm(t, query.terms[i].pinyin, p, &trace) orelse {
-            out.* = .initEmpty();
+            out.* = .empty;
             return null;
         };
         total += m.score;
@@ -472,7 +472,7 @@ const Prefix = enum(u2) { none, prefix, exact };
 fn nameBonus(q: []const u21, p: *const Prepared) i32 {
     const whole = prefixAt(q, p.cps, 0);
     const name = if (p.name_start == 0) .none else prefixAt(q, p.cps, p.name_start);
-    const best: Prefix = @enumFromInt(@max(@intFromEnum(whole), @intFromEnum(name)));
+    const best: Prefix = @fromBackingInt(@max(@backingInt(whole), @backingInt(name)));
     return switch (best) {
         .none => 0,
         .prefix => bonus_prefix,
@@ -931,9 +931,9 @@ test "full pinyin trace follows variable length syllables and UTF16 emoji offset
 }
 
 test "full pinyin bounded query text and term limits without allocation" {
-    const query = Query.init("a" ** max_query);
+    const query = Query.init(std.mem.asBytes(&@as([max_query]["a".len]u8, @splat("a".*))));
     var buffer: Buffer = undefined;
-    const prepared = buffer.prepare("阿" ** (max_text + 1));
+    const prepared = buffer.prepare(std.mem.asBytes(&@as([(max_text + 1)]["阿".len]u8, @splat("阿".*))));
     try std.testing.expectEqual(@as(usize, max_text), prepared.cps.len);
     var marked: Positions = undefined;
     const result = positions(&query, &prepared, &marked);
@@ -1050,7 +1050,7 @@ test "Frecency replaces the weakest key when full" {
     var f: Frecency = .{};
     var buf: [16]u8 = undefined;
     for (0..Frecency.capacity) |i| {
-        const key = try std.fmt.bufPrint(&buf, "key{d}", .{i});
+        const key = try std.mem.print(&buf, "key{d}", .{i});
         f.record(key);
         if (i == 0) f.record(key);
     }
@@ -1062,14 +1062,14 @@ test "Frecency replaces the weakest key when full" {
 }
 
 test "long texts and patterns, and invalid UTF-8" {
-    const long = "x" ** 400 ++ "abc";
+    const long = std.mem.asBytes(&@as([400]["x".len]u8, @splat("x".*))) ++ "abc";
     try testing.expect(testScore("abc", long) == null);
-    try testing.expect(testScore("aaa", "a" ** 300) != null);
-    try testing.expect(testScore("a" ** 100, "abc") == null);
+    try testing.expect(testScore("aaa", std.mem.asBytes(&@as([300]["a".len]u8, @splat("a".*)))) != null);
+    try testing.expect(testScore(std.mem.asBytes(&@as([100]["a".len]u8, @splat("a".*))), "abc") == null);
     try testing.expect(testScore("abc", "a\xffb\xfec") != null);
     try testing.expect(testScore("a", "\xff\xff") == null);
     _ = testScore("ab", "\xe4");
     _ = testScore("\xe4", "a");
     var buf: Buffer = undefined;
-    try testing.expectEqual(@as(usize, max_text), buf.prepare("x" ** 400).cps.len);
+    try testing.expectEqual(@as(usize, max_text), buf.prepare(std.mem.asBytes(&@as([400]["x".len]u8, @splat("x".*)))).cps.len);
 }

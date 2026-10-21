@@ -503,7 +503,7 @@ test "Ctrl+F1 with NumLock matches the specification" {
 
 test "AltGr reports RIGHT_ALT_PRESSED with LEFT_CTRL_PRESSED" {
     // AltGr+Q on a German layout types '@'.
-    var keyboard_state = [_]u8{0} ** 256;
+    var keyboard_state = @as([256]u8, @splat(0));
     keyboard_state[0x11] = 0x80; // VK_CONTROL
     keyboard_state[0x12] = 0x80; // VK_MENU
     keyboard_state[0xA2] = 0x80; // VK_LCONTROL
@@ -523,7 +523,7 @@ test "AltGr reports RIGHT_ALT_PRESSED with LEFT_CTRL_PRESSED" {
 }
 
 test "fromKeyboardState reads pressed and toggled bits" {
-    var keyboard_state = [_]u8{0} ** 256;
+    var keyboard_state = @as([256]u8, @splat(0));
     keyboard_state[0x10] = 0x81; // VK_SHIFT, pressed (toggle bit ignored)
     keyboard_state[0x14] = 0x01; // VK_CAPITAL toggled
     keyboard_state[0x90] = 0x81; // VK_NUMLOCK toggled (press bit ignored)
@@ -726,7 +726,7 @@ test "writeReq uses a small request when the records fit" {
 test "writeReq allocates for long text input" {
     const alloc = testing.allocator;
     const pending: Pending = .{ .key = .unidentified, .action = .press, .message = null };
-    const text = "\u{4F60}\u{597D}" ** 8;
+    const text = std.mem.asBytes(&@as([8]["\u{4F60}\u{597D}".len]u8, @splat("\u{4F60}\u{597D}".*)));
 
     const req = (try writeReq(alloc, pending, .{ .utf8 = text })).?;
     defer req.deinit();

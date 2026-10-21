@@ -11,8 +11,8 @@ const log = std.log.scoped(.gtk_gx_environment);
 fn prepare(alloc: std.mem.Allocator, name: []const u8, current: []const u8, flags: anytype, modern: bool) std.mem.Allocator.Error![:0]u8 {
     var required: std.ArrayList([]const u8) = .empty;
     defer required.deinit(alloc);
-    inline for (@typeInfo(@TypeOf(flags)).@"struct".fields) |field| {
-        if (@field(flags, field.name)) try required.append(alloc, field.name);
+    inline for (@typeInfo(@TypeOf(flags)).@"struct".field_names) |field_name| {
+        if (@field(flags, field_name)) try required.append(alloc, field_name);
     }
     if (!modern and std.mem.eql(u8, name, "GDK_DEBUG")) try required.append(alloc, "vulkan-disable");
     return environment.appendFlags(alloc, current, required.items);

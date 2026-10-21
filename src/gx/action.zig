@@ -68,26 +68,26 @@ pub const Action = union(enum) {
         const name = input[0 .. colon orelse input.len];
         const argument: ?[]const u8 = if (colon) |i| input[i + 1 ..] else null;
 
-        inline for (@typeInfo(Action).@"union".fields) |field| {
-            if (std.mem.eql(u8, name, field.name)) switch (field.type) {
+        inline for (@typeInfo(Action).@"union".field_names) |field| {
+            if (std.mem.eql(u8, name, field)) switch (@FieldType(Action, field)) {
                 void => {
                     if (argument != null) return error.InvalidFormat;
-                    return @unionInit(Action, field.name, {});
+                    return @unionInit(Action, field, {});
                 },
 
                 []const u8 => {
                     const value = argument orelse return error.InvalidFormat;
                     if (value.len == 0) return error.InvalidFormat;
-                    return @unionInit(Action, field.name, value);
+                    return @unionInit(Action, field, value);
                 },
 
-                else => switch (@typeInfo(field.type)) {
+                else => switch (@typeInfo(@FieldType(Action, field))) {
                     .@"enum" => {
                         const value = argument orelse return error.InvalidFormat;
-                        const parsed = std.meta.stringToEnum(field.type, value) orelse return error.InvalidFormat;
-                        return @unionInit(Action, field.name, parsed);
+                        const parsed = std.meta.stringToEnum(@FieldType(Action, field), value) orelse return error.InvalidFormat;
+                        return @unionInit(Action, field, parsed);
                     },
-                    else => @compileError("unsupported GX action argument: " ++ @typeName(field.type)),
+                    else => @compileError("unsupported GX action argument: " ++ @typeName(@FieldType(Action, field))),
                 },
             };
         }
@@ -174,7 +174,7 @@ pub const SettingsPage = enum {
 };
 
 fn expectFormat(expected: []const u8, value: anytype) !void {
-    const text = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{value});
+    const text = try std.testing.allocator.print("{f}", .{value});
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(expected, text);
 }
@@ -195,7 +195,7 @@ test "parse GX actions" {
     try testing.expectEqual(SettingsPage.font, (try Action.parse("settings_page:font")).settings_page);
     for (std.enums.values(SettingsPage)) |page| {
         var buf: [64]u8 = undefined;
-        const input = try std.fmt.bufPrint(&buf, "settings_page:{t}", .{page});
+        const input = try std.mem.print(&buf, "settings_page:{t}", .{page});
         try testing.expect((try Action.parse(input)).equal(.{ .settings_page = page }));
     }
     try testing.expect((try Action.parse("new_tab_menu")).equal(.new_tab_menu));
@@ -280,11 +280,11 @@ test "clone copies the argument and equal compares it" {
 
 test "every GX action has a translated title" {
     const i18n = @import("i18n.zig");
-    inline for (@typeInfo(Action).@"union".fields) |field| {
-        const action = @unionInit(Action, field.name, switch (field.type) {
+    inline for (@typeInfo(Action).@"union".field_names) |field| {
+        const action = @unionInit(Action, field, switch (@FieldType(Action, field)) {
             void => {},
             []const u8 => "x",
-            else => std.enums.values(field.type)[0],
+            else => std.enums.values(@FieldType(Action, field))[0],
         });
         const msgid = action.title();
         if (i18n.lookup(.zh_CN, msgid) == null) {
