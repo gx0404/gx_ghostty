@@ -19,7 +19,13 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             .optimize = cfg.optimize,
             .strip = cfg.strip,
             .omit_frame_pointer = cfg.omitFramePointer(),
-            .unwind_tables = if (cfg.strip) .none else .sync,
+            // fork(gx): GX-0061 MinGW SEH handlers require unwind frames.
+            .unwind_tables = if (cfg.target.result.os.tag == .windows)
+                .sync
+            else if (cfg.strip)
+                .none
+            else
+                .sync,
         }),
         // Crashes on x86_64 self-hosted on 0.15.1
         .use_llvm = true,

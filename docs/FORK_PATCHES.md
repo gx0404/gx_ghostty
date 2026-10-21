@@ -5,7 +5,7 @@
 ## 规则
 
 - 范围：`src/`、`include/`、`pkg/`、`macos/` 下的文件与 `build.zig`。改动这些上游文件必须登记；能用新路径或构建参数解决的问题，不改上游源码。
-- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0060）之后的号。在册的 53 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053～GX-0060，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
+- 编号：`GX-NNNN`，四位数字，按登记顺序递增，永不复用。GX-0013、GX-0017～GX-0020、GX-0025 与 GX-0052 没有对应补丁：这些号已跳过，不补登、不回收；新补丁取当前最大编号（GX-0061）之后的号。在册的 54 个 ID 是 GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024、GX-0026～GX-0051 与 GX-0053～GX-0061，每个 ID 在下文都有一节，写明文件、标记方式、状态、原因、移除条件与验证。
 - 标记：每处改动紧邻处写英文注释 `fork(gx): GX-NNNN <说明>`（Zig、C、Swift 用 `//`，CSS 用独占一行的 `/* … */`，shell 脚本用 `#`；Zig 多行字符串里的改动，把 `//` 标记行写在改动行之上，注释不进入字符串）。纯新增的多行 Zig/C/Swift 代码用独占一行的 `// fork(gx): GX-NNNN begin: <说明>` 与 `// fork(gx): GX-NNNN end`（`end` 行不带说明）整块包住，块外不改上游行：删掉这些块就得到上游原文，测试据此校验最小化；改写上游 Zig 文档注释时，把被替换的上游原文以 `// ///` 普通注释留在同一 begin/end 块内（不进入生成文档）。CSS 与 shell 脚本没有 begin/end 块标记，每处改动都写单行标记，被替换的上游注释原样保留。一个补丁改多个文件时，每个文件都要有标记，并在登记表中各占一行。
 - 最小化：只改必要的行，不重排、不重新注释上游正文，让上游同步时的冲突面最小。
 - 提交：补丁单独成一个提交（例如 `fix(build): 非 v 前缀 tag 不再触发版本号 panic`），不与框架或文档改动混在一起。
@@ -149,6 +149,7 @@
 | GX-0060 | `src/renderer/OpenGL.zig` | `fork(gx): GX-0060` | active |
 | GX-0060 | `src/terminal/formatter.zig` | `fork(gx): GX-0060` | active |
 | GX-0060 | `src/terminal/kitty/graphics_image.zig` | `fork(gx): GX-0060` | active |
+| GX-0061 | `src/build/GhosttyExe.zig` | `fork(gx): GX-0061` | active |
 <!-- fork-patches:end -->
 
 闭集：范围内的 Git 可见文件（已跟踪的文件，加上未跟踪但未被忽略的文件）中，每个 `fork(gx)` 都必须写成 `fork(gx): GX-NNNN`，且 (ID, 文件) 在表中为 `active`。新增补丁不登记，测试就会失败。
@@ -1619,3 +1620,11 @@ python -m unittest scripts.test_fork_patches -v
 - 验证：模板契约测试、GTK 4.14 CSS 检查、Ubuntu 24.04 与 Debian 13 构建和截图；未执行项不得记通过。
 
 2026-10-21 同步备注：GX-0039 的页面挂载时连接 split-tree 监听、摘下时断开监听已由上游实现，移除重复钩子；runtime/session 与同窗口转移钩子仍保留。GX-0027 随上游改用 `adw.AlertDialog` / `adw.Dialog`，继续在正文之后附加进程列表。
+
+## GX-0061 Windows 发布构建保留 SEH unwind tables
+
+- 文件：`src/build/GhosttyExe.zig`；单行标记 `fork(gx): GX-0061`，active。
+- 原因：Zig 0.17 的 Windows GNU 发布构建在 `strip=true` 时关闭 unwind tables，MinGW CRT 与 winpthreads 的 `.seh_handler` 因缺少活动 frame 而编译失败。GX Shell 的 `scripts/gx_package.py windows --build` 消费入口没有单独覆盖 unwind 策略的参数。
+- 行为：Windows exe 的根模块始终选择 `.sync`，其他目标保留原来的 strip 条件；优化级别、strip 与 frame-pointer 策略不变。不修改 `GhosttyLib` 或承诺支持 Windows 内部嵌入库。
+- 同步与移除条件：上游为 Windows 保留等价 SEH frame 后，先验证 fast、strip 的消费者构建和 stage，再移除本补丁并将登记改为 removed。
+- 验证：`scripts/test_fork_patches.py` 校验补丁登记闭集；`test_gx_workflows.py` 锁定 Windows app 的 `-Doptimize=fast -Dstrip=true`，既有 Debug 单测不变。该优化构建须真实通过，并运行 `scripts/gx_package.py windows --build` 和 `verify-stage` 验证消费者产物；其他平台通过既有构建与核心测试回归。静态契约不代替 Zig 编译，未执行项保留 PENDING。
