@@ -58,6 +58,9 @@ exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G06-s08-preview-rev
 key ctrl+shift+n
 sleep 2.0
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G06-s09-new-window-no-repeat.png"
+key ctrl+shift+t
+sleep 1.2
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G06-s10-tab-signature.png"
 '''
 expect = [
   "G06.png and G06-s01-diagnostics.png: the light Catppuccin Latte window shows the Configuration Errors dialog once at startup, naming gx-o6-not-a-key",
@@ -69,4 +72,5 @@ expect = [
   "G06-s07-search-keeps-focus.png: typing rose goes into the theme search, proving the previews did not move the focus",
   "G06-s08-preview-reverted.png: leaving the subpage and closing the dialog ends the preview and the window is back to Catppuccin Latte",
   "G06-s09-new-window-no-repeat.png: a new window does not show the already reported diagnostics again",
+  "G06-s10-tab-signature.png: a second tab in that window shows the tab bar; the selected tab joins the light terminal and carries the 2 px brand purple signature bar along its rounded top edge (default gx-accent-color = brand), the other tab has none",
 ]

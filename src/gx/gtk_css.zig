@@ -18,6 +18,22 @@
 //!   Over a translucent background with `background-blur`, the bars,
 //!   selected tab and popovers are frosted (`min_bar_opacity`); dialog
 //!   surfaces stay opaque so their headers and bodies match.
+//! - The brand signature: a bar of `ui_metrics.signature.bar` px in the
+//!   accent along the top of the selected tab (an inset box shadow, inside
+//!   the rounded corners), also with a single tab and on a dragged tab,
+//!   kept at 3:1 on the tab in every state and on tinted strips
+//!   (`signature`). `style.css` has a fallback in libadwaita's accent.
+//! - The terminal overlays that upstream's `css/style.css` draws in fixed
+//!   colors: the find, key table, resize and link overlays on
+//!   `surface_raised` with `text` and a `border` outline, the bell border
+//!   in the caution color, the child exited banners in the success and
+//!   critical colors and a failed progress bar in the critical color. The
+//!   shapes are static rules in `style.css`.
+//! - Links (`label` link nodes, link buttons) in the main window and in
+//!   the Ghostty GX dialogs, which carry the `gx-dialog` class, in
+//!   `tokens.link` at 4.5:1 (`linkColor`); the dialogs' banners on the
+//!   neutral `control_fill` instead of libadwaita's accent tint, and their
+//!   source badges (`.gx-badge`) in the border and text tokens.
 //! - Dialogs, popovers and the rest of libadwaita through its named colors
 //!   (`@define-color`, which libadwaita 1.5 on GTK 4.14 reads): one raised
 //!   surface for dialog bodies, their header bars, popovers and views, so
@@ -38,11 +54,15 @@
 //! in the title bar background above this stylesheet, so the strip and the
 //! dialog surfaces take that color too. `style.zig` appends the output to
 //! the static rules in `src/apprt/gtk/gx/style.css`. It is plain text
-//! generation without GTK so the core test suite covers it.
+//! generation without GTK so the core test suite covers it. Every rule
+//! after the named colors selects below `toolbarview.gx-chrome` (or a
+//! session class above it), below `.gx-dialog`, or the dragged tab
+//! (`dnd tab`), never a whole window or every dialog.
 const std = @import("std");
 const Config = @import("../config/Config.zig");
 const chrome = @import("chrome.zig");
 const ui_color = @import("ui_color.zig");
+const ui_metrics = @import("ui_metrics.zig");
 const ui_tokens = @import("ui_tokens.zig");
 const Color = ui_color.Color;
 const floor = ui_tokens.floor;
@@ -54,6 +74,10 @@ pub const status_tint: f32 = 0.24;
 /// The least opacity of the window's bars, selected tab and popovers over a blurred
 /// translucent background, so their text stays readable.
 pub const min_bar_opacity: f32 = 0.85;
+
+/// The opacity of the bell border and of the child exited banners over the
+/// terminal, as upstream's fixed colors have.
+pub const overlay_tint_opacity: f32 = 0.5;
 
 /// A color as CSS: `rgb()` when opaque, else `rgba()`, with the components
 /// rounded to 8 bits.
@@ -283,6 +307,31 @@ pub const Tint = struct {
     }
 };
 
+/// The accent bar of the brand signature on the selected tab: the accent,
+/// moved to 3:1 against every fill it is drawn on (`fills`, taken as
+/// opaque: a frosted fill shows the terminal or the strip through, which
+/// are among the fills).
+pub fn signature(accent: Color, fills: []const Color) Color {
+    var opaque_fills: [8]Color = undefined;
+    const n = @min(fills.len, opaque_fills.len);
+    for (fills[0..n], opaque_fills[0..n]) |fill, *out| out.* = fill.withAlpha(1);
+    return ui_color.ensureContrastAll(accent.withAlpha(1), opaque_fills[0..n], floor.non_text);
+}
+
+/// The color of links in the main window and the Ghostty GX dialogs:
+/// `tokens.link` at 4.5:1 on the dialog surface, cards, the tab strip and
+/// the terminal background.
+pub fn linkColor(colors: Colors) Color {
+    const t = &colors.tokens;
+    return ui_color.ensureContrastAll(t.link, &.{
+        colors.surface,
+        t.surface,
+        t.surface_raised,
+        colors.chrome.title_bar.withAlpha(1),
+        t.background,
+    }, floor.text);
+}
+
 /// Writes the color rules for `colors`, all of which GTK 4.14 parses.
 pub fn write(writer: *std.Io.Writer, colors: Colors) std.Io.Writer.Error!void {
     const named: Named = .fromColors(colors);
@@ -348,11 +397,125 @@ pub fn write(writer: *std.Io.Writer, colors: Colors) std.Io.Writer.Error!void {
         .divider = css(bars.divider),
         .split_focus = css(ui_color.ensureContrast(t.focus_stroke_accent, t.background, floor.non_text)),
     });
-    try writeTint(writer, "gx-superuser", .derive(bars, colors.superuser), colors.bar_opacity);
-    try writeTint(writer, "gx-remote", .derive(bars, colors.remote), colors.bar_opacity);
+
+    // The brand signature, over the selected tab in every state; a single
+    // tab and a dragged one sit on the strip, frosted over the terminal.
+    const active_hover = ui_color.over(bars.hover, active);
+    const active_pressed = ui_color.over(bars.pressed, active);
+    try writer.print(
+        \\toolbarview.gx-chrome tabbar tabbox:not(.single-tab) tab:selected {{
+        \\  box-shadow: inset 0 {[bar]d}px 0 0 {[tabs]f};
+        \\}}
+        \\toolbarview.gx-chrome tabbar tabbox.single-tab tab:selected {{
+        \\  box-shadow: inset 0 {[bar]d}px 0 0 {[single]f};
+        \\}}
+        \\dnd tab {{
+        \\  box-shadow: inset 0 {[bar]d}px 0 0 {[dragged]f};
+        \\}}
+        \\
+    , .{
+        .bar = ui_metrics.signature.bar,
+        .tabs = css(signature(t.accent, &.{ active, active_hover, active_pressed, t.background })),
+        .single = css(signature(t.accent, &.{ bars.title_bar, t.background })),
+        .dragged = css(signature(t.accent, &.{bars.title_bar})),
+    });
+
+    // Upstream's terminal overlays (`src/apprt/gtk/css/style.css`).
+    try writer.print(
+        \\toolbarview.gx-chrome label.url-overlay,
+        \\toolbarview.gx-chrome .search-overlay,
+        \\toolbarview.gx-chrome .key-state-overlay,
+        \\toolbarview.gx-chrome label.resize-overlay {{
+        \\  background-color: {[raised]f};
+        \\  color: {[text]f};
+        \\  outline-color: {[border]f};
+        \\}}
+        \\toolbarview.gx-chrome .surface .bell-overlay {{
+        \\  border-color: {[bell]f};
+        \\}}
+        \\toolbarview.gx-chrome .child-exited.normal revealer widget {{
+        \\  background-color: {[exited]f};
+        \\}}
+        \\toolbarview.gx-chrome .child-exited.abnormal revealer widget {{
+        \\  background-color: {[failed]f};
+        \\}}
+        \\toolbarview.gx-chrome .surface progressbar.error trough progress {{
+        \\  background-color: {[progress]f};
+        \\}}
+        \\
+    , .{
+        .raised = css(t.surface_raised),
+        .text = css(t.text),
+        .border = css(t.border),
+        .bell = css(t.caution.withAlpha(overlay_tint_opacity)),
+        .exited = css(t.success.withAlpha(overlay_tint_opacity)),
+        .failed = css(t.critical.withAlpha(overlay_tint_opacity)),
+        .progress = css(t.critical),
+    });
+
+    // Links, and the banners and badges of the Ghostty GX dialogs.
+    try writer.print(
+        \\toolbarview.gx-chrome *:link,
+        \\toolbarview.gx-chrome *:visited,
+        \\toolbarview.gx-chrome button.link,
+        \\toolbarview.gx-chrome button.link > label,
+        \\.gx-dialog *:link,
+        \\.gx-dialog *:visited,
+        \\.gx-dialog button.link,
+        \\.gx-dialog button.link > label {{
+        \\  color: {[link]f};
+        \\}}
+        \\.gx-dialog banner > revealer > widget {{
+        \\  background-color: {[banner]f};
+        \\  color: {[text]f};
+        \\}}
+        \\.gx-dialog .gx-badge.gx-source-defaults {{
+        \\  color: {[tertiary]f};
+        \\  box-shadow: inset 0 0 0 1px {[border]f};
+        \\}}
+        \\.gx-dialog .gx-badge.gx-source-settings,
+        \\.gx-dialog .gx-badge.gx-advanced {{
+        \\  color: {[secondary]f};
+        \\  box-shadow: inset 0 0 0 1px {[border]f};
+        \\}}
+        \\.gx-dialog .gx-badge.gx-source-user {{
+        \\  color: {[text]f};
+        \\  background-color: {[fill]f};
+        \\}}
+        \\.gx-dialog .gx-badge.gx-source-cli {{
+        \\  color: {[text]f};
+        \\  background-color: {[fill_strong]f};
+        \\  box-shadow: inset 0 0 0 1px {[border]f};
+        \\}}
+        \\.gx-dialog .gx-badge.gx-mark:not(.gx-accent) {{
+        \\  color: {[secondary]f};
+        \\  background-color: {[fill]f};
+        \\}}
+        \\
+    , .{
+        .link = css(linkColor(colors)),
+        .banner = css(t.control_fill),
+        .text = css(t.text),
+        .tertiary = css(t.text_tertiary),
+        .secondary = css(t.text_secondary),
+        .border = css(t.border),
+        .fill = css(t.control_fill),
+        .fill_strong = css(t.control_fill_hover),
+    });
+
+    try writeTint(writer, "gx-superuser", bars, colors.superuser, t.accent, colors.bar_opacity);
+    try writeTint(writer, "gx-remote", bars, colors.remote, t.accent, colors.bar_opacity);
 }
 
-fn writeTint(writer: *std.Io.Writer, class: []const u8, tint: Tint, opacity: f32) std.Io.Writer.Error!void {
+fn writeTint(
+    writer: *std.Io.Writer,
+    class: []const u8,
+    bars: chrome.Chrome,
+    color: Color,
+    accent: Color,
+    opacity: f32,
+) std.Io.Writer.Error!void {
+    const tint: Tint = .derive(bars, color);
     try writer.print(
         \\.{[class]s} toolbarview.gx-chrome > .top-bar,
         \\.{[class]s} toolbarview.gx-chrome > .bottom-bar {{
@@ -362,12 +525,17 @@ fn writeTint(writer: *std.Io.Writer, class: []const u8, tint: Tint, opacity: f32
         \\.{[class]s} toolbarview.gx-chrome tabbar tab:not(:selected) {{
         \\  color: {[inactive]f};
         \\}}
+        \\.{[class]s} toolbarview.gx-chrome tabbar tabbox.single-tab tab:selected {{
+        \\  box-shadow: inset 0 {[size]d}px 0 0 {[signature]f};
+        \\}}
         \\
     , .{
         .class = class,
         .bar = css(tint.bar.withAlpha(opacity)),
         .text = css(tint.text),
         .inactive = css(tint.text_inactive),
+        .size = ui_metrics.signature.bar,
+        .signature = css(signature(accent, &.{ tint.bar, bars.title_bar })),
     });
 }
 
@@ -659,14 +827,19 @@ test "write scopes the window chrome to gx-chrome and parses on GTK 4.14" {
     try testing.expect(has(out, "tabbox:not(.single-tab) tab:selected {\n  background-color: rgb(31,31,40);"));
     try testing.expect(has(out, "tabbox:not(.single-tab) tab:hover {\n  background-color: rgba(255,255,255,0.08);"));
     try testing.expect(has(out, "tabbox:not(.single-tab) tab:active {\n  background-color: rgba(255,255,255,0.05);"));
-    try testing.expect(!has(out, "box-shadow: inset"));
+    // Inset shadows only draw the signature and the badge outlines.
+    var shadows = std.mem.splitSequence(u8, out, "box-shadow: inset ");
+    _ = shadows.next();
+    while (shadows.next()) |rest| {
+        try testing.expect(std.mem.startsWith(u8, rest, "0 2px 0 0 ") or std.mem.startsWith(u8, rest, "0 0 0 1px "));
+    }
     try testing.expect(has(out, "background-image: image(rgb(65,65,72));\n  box-shadow: none;"));
     try testing.expect(has(out, ".split .surface:focus-within {\n  outline: 1px solid rgb(137,180,250);"));
     try testing.expect(has(out, ".gx-superuser toolbarview.gx-chrome > .top-bar,"));
     try testing.expect(has(out, ".gx-remote toolbarview.gx-chrome tabbar tab:not(:selected) {"));
 
-    // Every rule but the dragged tab selects below the main toolbar view
-    // or the session classes, never the whole window.
+    // Every rule but the dragged tab selects below the main toolbar view,
+    // the session classes or the Ghostty GX dialogs, never a whole window.
     const first_rule = std.mem.indexOf(u8, out, "toolbarview.gx-chrome > .top-bar") orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.lastIndexOf(u8, out, "@define-color").? < first_rule);
     var rules = std.mem.splitSequence(u8, out[first_rule..], "}\n");
@@ -676,7 +849,9 @@ test "write scopes the window chrome to gx-chrome and parses on GTK 4.14" {
         while (selectors.next()) |raw| {
             const selector = std.mem.trim(u8, raw, " \n");
             if (selector.len == 0 or std.mem.startsWith(u8, selector, "/*")) continue;
-            try testing.expect(std.mem.eql(u8, selector, "dnd tab") or has(selector, "toolbarview.gx-chrome "));
+            try testing.expect(std.mem.eql(u8, selector, "dnd tab") or
+                has(selector, "toolbarview.gx-chrome ") or
+                std.mem.startsWith(u8, selector, ".gx-dialog "));
         }
     }
     try testing.expectEqual(std.mem.count(u8, out, "{"), std.mem.count(u8, out, "}"));
@@ -704,4 +879,170 @@ test "Css formats opaque and translucent colors" {
     var buf: [64]u8 = undefined;
     try testing.expectEqualStrings("rgb(137,180,250)", try std.fmt.bufPrint(&buf, "{f}", .{css(Color.hex(0x89b4fa))}));
     try testing.expectEqualStrings("rgba(255,255,255,0.08)", try std.fmt.bufPrint(&buf, "{f}", .{css(Color.white.withAlpha(0.08))}));
+}
+
+fn gxLatteConfig() !Config {
+    var config = try Config.default(testing.allocator);
+    errdefer config.deinit();
+    config.background = .{ .r = 0xef, .g = 0xf1, .b = 0xf5 };
+    config.foreground = .{ .r = 0x4c, .g = 0x4f, .b = 0x69 };
+    config.@"cursor-color" = .{ .color = .{ .r = 0xdc, .g = 0x8a, .b = 0x78 } };
+    config.palette.value[1] = .{ .r = 0xd2, .g = 0x0f, .b = 0x39 };
+    config.palette.value[2] = .{ .r = 0x40, .g = 0xa0, .b = 0x2b };
+    config.palette.value[3] = .{ .r = 0xdf, .g = 0x8e, .b = 0x1d };
+    config.palette.value[4] = .{ .r = 0x1e, .g = 0x66, .b = 0xf5 };
+    config.palette.value[5] = .{ .r = 0xea, .g = 0x76, .b = 0xcb };
+    config.palette.value[12] = .{ .r = 0x1e, .g = 0x66, .b = 0xf5 };
+    config.@"gx-accent-color" = .brand;
+    return config;
+}
+
+/// The declarations of the first rule in `out` whose selector list is
+/// exactly `selectors`.
+fn ruleBody(out: []const u8, selectors: []const u8) ?[]const u8 {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, out, start, selectors)) |at| {
+        start = at + selectors.len;
+        const line_start = at == 0 or out[at - 1] == '\n' or out[at - 1] == '}';
+        if (!line_start or !std.mem.startsWith(u8, out[start..], " {\n")) continue;
+        const body = start + " {\n".len;
+        const end = std.mem.indexOfPos(u8, out, body, "}") orelse return null;
+        return out[body..end];
+    }
+    return null;
+}
+
+/// The color of `property` in `body` (as `Css` writes it).
+fn declared(body: []const u8, property: []const u8, buf: []u8) ![]const u8 {
+    const at = std.mem.indexOf(u8, body, property) orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfScalarPos(u8, body, at, ';') orelse return error.TestUnexpectedResult;
+    return std.fmt.bufPrint(buf, "{s}", .{body[at + property.len .. end]});
+}
+
+test "the signature bar marks the selected tab at 3:1 in every state" {
+    var mocha = try gxMochaConfig();
+    defer mocha.deinit();
+    mocha.@"gx-accent-color" = .brand;
+    var latte = try gxLatteConfig();
+    defer latte.deinit();
+    for ([_]*Config{ &mocha, &latte }) |config| {
+        for ([_]Config.WindowTheme{ .auto, .ghostty }) |theme| {
+            for ([_]bool{ false, true }) |frosted| {
+                config.@"window-theme" = theme;
+                config.@"background-opacity" = if (frosted) 0.6 else 1;
+                config.@"background-blur" = if (frosted) .true else .false;
+                const colors = fromConfig(config).?;
+                const bars = colors.chrome;
+                const active = selectedTab(bars).withAlpha(1);
+                const tabs = signature(colors.tokens.accent, &.{
+                    active,
+                    ui_color.over(bars.hover, active),
+                    ui_color.over(bars.pressed, active),
+                });
+                for ([_]Color{ active, ui_color.over(bars.hover, active), ui_color.over(bars.pressed, active) }) |fill| {
+                    try testing.expect(contrast(tabs, fill) >= floor.non_text);
+                }
+                try testing.expect(contrast(signature(colors.tokens.accent, &.{bars.title_bar}), bars.title_bar) >= floor.non_text);
+
+                const out = try written(colors, false);
+                defer testing.allocator.free(out);
+                for ([_][]const u8{
+                    "toolbarview.gx-chrome tabbar tabbox:not(.single-tab) tab:selected",
+                    "toolbarview.gx-chrome tabbar tabbox.single-tab tab:selected",
+                    "dnd tab",
+                    ".gx-superuser toolbarview.gx-chrome tabbar tabbox.single-tab tab:selected",
+                    ".gx-remote toolbarview.gx-chrome tabbar tabbox.single-tab tab:selected",
+                }) |selectors| {
+                    var found = false;
+                    var start: usize = 0;
+                    while (std.mem.indexOfPos(u8, out, start, selectors)) |at| {
+                        start = at + selectors.len;
+                        const rest = out[start..];
+                        if (!std.mem.startsWith(u8, rest, " {\n  box-shadow: inset 0 2px 0 0 ")) continue;
+                        found = true;
+                        break;
+                    }
+                    try testing.expect(found);
+                }
+            }
+        }
+    }
+    // The brand purple on the GX Mocha terminal background needs no change.
+    mocha.@"window-theme" = .auto;
+    mocha.@"background-opacity" = 1;
+    mocha.@"background-blur" = .false;
+    const colors = fromConfig(&mocha).?;
+    const out = try written(colors, false);
+    defer testing.allocator.free(out);
+    try testing.expect(has(out, "tabbox:not(.single-tab) tab:selected {\n  box-shadow: inset 0 2px 0 0 rgb(203,166,247);"));
+    try testing.expectEqual(@as(f32, 2), ui_metrics.signature.bar);
+}
+
+test "the terminal overlays take the interface tokens" {
+    var latte = try gxLatteConfig();
+    defer latte.deinit();
+    const colors = fromConfig(&latte).?;
+    const t = colors.tokens;
+    const out = try written(colors, false);
+    defer testing.allocator.free(out);
+    var buf: [256]u8 = undefined;
+    const overlays = ruleBody(out,
+        \\toolbarview.gx-chrome label.url-overlay,
+        \\toolbarview.gx-chrome .search-overlay,
+        \\toolbarview.gx-chrome .key-state-overlay,
+        \\toolbarview.gx-chrome label.resize-overlay
+    ) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "  background-color: {f};\n  color: {f};\n  outline-color: {f};\n", .{
+        css(t.surface_raised), css(t.text), css(t.border),
+    }), overlays);
+    // Light themes lift the overlay surface toward white.
+    try testing.expect(t.surface_raised.r > t.background.r);
+
+    var color: [64]u8 = undefined;
+    const bell = ruleBody(out, "toolbarview.gx-chrome .surface .bell-overlay") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{f}", .{css(t.caution.withAlpha(overlay_tint_opacity))}), try declared(bell, "border-color: ", &color));
+    try testing.expect(!has(bell, "border-width"));
+    const exited = ruleBody(out, "toolbarview.gx-chrome .child-exited.normal revealer widget") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{f}", .{css(t.success.withAlpha(0.5))}), try declared(exited, "background-color: ", &color));
+    const failed = ruleBody(out, "toolbarview.gx-chrome .child-exited.abnormal revealer widget") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{f}", .{css(t.critical.withAlpha(0.5))}), try declared(failed, "background-color: ", &color));
+    const progress = ruleBody(out, "toolbarview.gx-chrome .surface progressbar.error trough progress") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{f}", .{css(t.critical)}), try declared(progress, "background-color: ", &color));
+    // Upstream's fixed gray outline and colors are gone from the GX output.
+    try testing.expect(!has(out, "#555555"));
+    try testing.expect(!has(out, "rgba(192,28,40"));
+}
+
+test "links keep 4.5:1, banners and badges stay neutral" {
+    var mocha = try gxMochaConfig();
+    defer mocha.deinit();
+    mocha.@"gx-accent-color" = .brand;
+    var latte = try gxLatteConfig();
+    defer latte.deinit();
+    for ([_]*Config{ &mocha, &latte }) |config| {
+        for ([_]Config.WindowTheme{ .auto, .ghostty }) |theme| {
+            config.@"window-theme" = theme;
+            const colors = fromConfig(config).?;
+            const t = colors.tokens;
+            const link = linkColor(colors);
+            for ([_]Color{ colors.surface, t.surface, t.surface_raised, colors.chrome.title_bar, t.background }) |on| {
+                try testing.expect(contrast(link, on) >= floor.text);
+            }
+            const out = try written(colors, false);
+            defer testing.allocator.free(out);
+            var buf: [128]u8 = undefined;
+            try testing.expect(has(out, try std.fmt.bufPrint(&buf, ".gx-dialog button.link > label {{\n  color: {f};", .{css(link)})));
+            try testing.expect(has(out, "toolbarview.gx-chrome *:link,\ntoolbarview.gx-chrome *:visited,"));
+            const banner = ruleBody(out, ".gx-dialog banner > revealer > widget") orelse return error.TestUnexpectedResult;
+            try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "  background-color: {f};\n  color: {f};\n", .{ css(t.control_fill), css(t.text) }), banner);
+            // The badges use no accent or status color.
+            const first = std.mem.indexOf(u8, out, ".gx-dialog .gx-badge") orelse return error.TestUnexpectedResult;
+            const tints = std.mem.indexOfPos(u8, out, first, ".gx-superuser") orelse return error.TestUnexpectedResult;
+            const badges = out[first..tints];
+            for ([_]Color{ t.accent, t.accent_text, t.caution, t.success, t.critical }) |colorful| {
+                try testing.expect(!has(badges, try std.fmt.bufPrint(&buf, "{f};", .{css(colorful)})));
+            }
+            try testing.expect(has(badges, ".gx-dialog .gx-badge.gx-mark:not(.gx-accent) {"));
+        }
+    }
 }

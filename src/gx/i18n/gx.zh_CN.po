@@ -1418,7 +1418,6 @@ msgid "The remote terminal was closed."
 msgstr "远程终端已关闭。"
 
 #. Windows: the RemotePane terminal inspector (RemotePaneUi.zig).
-
 msgid "Refresh"
 msgstr "刷新"
 
@@ -1436,7 +1435,6 @@ msgstr "清空记录并导出更小的捕获。"
 
 #. Windows UIA names (uia_bridge.zig): popup menus, the command palette
 #. list, and the settings steppers and buttons.
-
 msgid "Menu"
 msgstr "菜单"
 
@@ -1458,7 +1456,6 @@ msgstr "应用字体"
 #. Upstream words "Clear" and "Reset" for the GTK context menu (clear the
 #. screen, reset the terminal). GX needs them for the inspector's
 #. clear-the-recording button and the settings UIA reset names.
-
 msgid "Clear"
 msgstr "清空"
 
@@ -1466,7 +1463,6 @@ msgid "Reset"
 msgstr "重置"
 
 #. Windows: the elevated-terminal drop receiver (ui/Menu.zig).
-
 msgid "Drop into Elevated Terminal…"
 msgstr "拖入管理员终端…"
 
@@ -1478,3 +1474,165 @@ msgstr "以普通权限运行的拖放接收器需要启用了用户账户控制
 
 msgid "The drop receiver could not be started."
 msgstr "无法启动拖放接收器。"
+
+#. GTK settings dialog: the line under the accent color row (settings_map.accentHint).
+msgid "Stays Ghostty GX purple whatever the theme."
+msgstr "固定为 Ghostty GX 紫，不随主题变化。"
+
+msgid "Takes the accent color of the current theme."
+msgstr "使用当前主题的强调色。"
+
+#. GTK: launch profiles on the Shell page of the settings dialog
+#. (launch_profiles_page.zig).
+msgid "The menu next to the new tab button lists these launch profiles."
+msgstr "新建标签页按钮旁的下拉菜单会列出这些启动配置。"
+
+msgid "New Launch Profile"
+msgstr "新建启动配置"
+
+msgid "From the command line"
+msgstr "来自命令行"
+
+msgid "Delete Launch Profile"
+msgstr "删除启动配置"
+
+msgid "Use as Default only writes the settings file and leaves the configuration files unchanged."
+msgstr "设为默认只写入设置文件，不改动配置文件。"
+
+msgid "{name} is already the default launch profile."
+msgstr "{name} 已是默认启动配置。"
+
+msgid "The default shell is set on the command line and cannot be changed here."
+msgstr "默认 Shell 由命令行设置，无法在此更改。"
+
+msgid "This launch profile is detected on this system and cannot be edited."
+msgstr "此启动配置由系统自动检测，无法编辑。"
+
+msgid "This launch profile comes from the configuration file and is read-only."
+msgstr "此启动配置来自配置文件，只读。"
+
+msgid "To change it, edit the configuration file and reload the configuration."
+msgstr "要修改，请编辑配置文件后重新加载配置。"
+
+msgid "This launch profile is set on the command line and is read-only."
+msgstr "此启动配置由命令行设置，只读。"
+
+msgid "Launch profiles cannot be changed here while the Ghostty GX settings are turned off."
+msgstr "Ghostty GX 设置已关闭，无法在此更改启动配置。"
+
+msgid "The profile changed outside the settings. Go back and open it again before saving."
+msgstr "启动配置已在设置之外被修改。请返回并重新打开后再保存。"
+
+msgid "Enter a name and a command. Names cannot contain “=”, and neither can contain line breaks."
+msgstr "请输入名称和命令。名称不能包含“=”，两者都不能包含换行。"
+
+msgid "Unable to read the launch profiles."
+msgstr "无法读取启动配置。"
+
+msgid "This launch profile no longer exists."
+msgstr "此启动配置已不存在。"
+
+#. Shortcut editor (src/apprt/gtk/gx/shortcut_editor.zig)
+msgid "New Shortcut"
+msgstr "新建快捷键"
+
+msgid "New Advanced Shortcut"
+msgstr "新建高级快捷键"
+
+msgid "Key sequences, key tables and action chains in the configuration syntax"
+msgstr "用配置语法编写按键序列、键表和动作链"
+
+msgid "Other Overrides"
+msgstr "其他覆盖项"
+
+msgid "Advanced"
+msgstr "高级"
+
+msgid "Shortcuts are read-only because the configuration layers are unavailable."
+msgstr "无法加载配置分层，快捷键为只读。"
+
+msgid "Edit Shortcut"
+msgstr "编辑快捷键"
+
+msgid "Advanced Shortcut"
+msgstr "高级快捷键"
+
+msgid "Action"
+msgstr "动作"
+
+msgid "Parameter"
+msgstr "参数"
+
+msgid "Optional. One of: {values}."
+msgstr "可选。可填 {values}。"
+
+msgid "Required. One of: {values}."
+msgstr "必填。可填 {values}。"
+
+msgid "Optional."
+msgstr "可选。"
+
+msgid "Required."
+msgstr "必填。"
+
+msgid "Shortcut"
+msgstr "快捷键"
+
+msgid "Press a key combination"
+msgstr "按下组合键"
+
+msgid "Click to record a shortcut"
+msgstr "点击录制快捷键"
+
+msgid "Not set"
+msgstr "未设置"
+
+msgid "Flags"
+msgstr "标志"
+
+msgid "Take the key only when the action can run; otherwise pass it to the program"
+msgstr "只在动作能执行时才占用按键，否则照常传给程序"
+
+msgid "Work even when the app is not focused, if the desktop supports it"
+msgstr "应用未聚焦时也生效，需要桌面环境支持"
+
+msgid "Apply to every terminal, not just the focused one"
+msgstr "作用于所有终端，而不只是当前聚焦的终端"
+
+msgid "Also pass the key to the program in the terminal after the action"
+msgstr "执行动作后，按键仍然传给终端里的程序"
+
+msgid "Restore Default"
+msgstr "恢复默认"
+
+msgid "Delete Shortcut"
+msgstr "删除快捷键"
+
+msgid "Record a key combination first."
+msgstr "请先录制组合键。"
+
+msgid "This action needs a parameter."
+msgstr "此动作需要参数。"
+
+msgid "The parameter is not valid for this action."
+msgstr "参数对此动作无效。"
+
+msgid "Conflicts with “{title}” ({source})"
+msgstr "与「{title}」冲突（{source}）"
+
+#. Shortcut source badges in the shortcut editor
+msgctxt "shortcut source"
+msgid "Default"
+msgstr "默认"
+
+msgctxt "shortcut source"
+msgid "User Config"
+msgstr "用户配置"
+
+msgctxt "shortcut source"
+msgid "Settings"
+msgstr "设置"
+
+msgctxt "shortcut source"
+msgid "Command Line"
+msgstr "命令行"

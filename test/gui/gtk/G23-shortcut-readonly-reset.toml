@@ -1,9 +1,10 @@
 id = "G23"
 title = "CLI-controlled shortcuts are readonly; resetting an override restores the lower binding"
-lang = "en"
+lang = "zh_CN"
 config = """
 command = direct:/bin/bash --noprofile --norc
-language = en
+language = zh-CN
+theme = GX Mocha
 confirm-close-surface = false
 env = HISTFILE=/dev/null
 keybind = clear
@@ -11,58 +12,66 @@ keybind = ctrl+alt+k=gx:keybinds
 keybind = ctrl+alt+u=text:LOWER-RESTORED
 keybind = ctrl+shift+q=quit
 """
+# Coordinates follow the 1100x740 window: the editor dialog is centered and
+# 720x560; the Chinese cheat sheet's edit button sits at 794,113 and a search that
+# leaves one row puts it at 550,266.
 script = '''
 overlay = config_home / "ghostty/gui-settings.ghostty"
 seed = "# R6 unrelated line\nfont-size = 12\n# gx-keybind-editor begin 1\nkeybind = ctrl+alt+u=text:OWNED-OVERRIDE\n# gx-keybind-editor end 1\n"
 overlay.write_text(seed)
-def editor():
+def click(x, y, wait=0.4):
+    xdo("mousemove", x, y, "click", 1)
+    sleep(wait)
+def editor(label):
     xdo("windowsize", window(), 1100, 740)
     sleep(1)
-    xdo("mousemove", 400, 300, "click", 1)
+    click(400, 300)
     xdo("key", "ctrl+alt+k")
     sleep(1)
-    xdo("mousemove", 730, 110, "click", 1)
-    sleep(1)
-    capture("editor-open-" + str(pid()))
-    xdo("mousemove", 500, 150, "click", 1)
-    sleep(0.3)
-    capture("combo-open-" + str(pid()))
-    xdo("key", "--repeat", 3, "--delay", 150, "Down")
-    xdo("key", "Return")
-    sleep(0.4)
+    click(794, 113, 1)
+    capture("list-" + label)
+    xdo("type", "--delay", 40, "ctrl+alt+u")
+    sleep(0.6)
+    click(550, 266, 1)
 def close_editor():
-    xdo("mousemove", 937, 93, "click", 1)
-    sleep(0.5)
-    xdo("mousemove", 867, 113, "click", 1)
-    sleep(0.5)
-xdo("mousemove", 400, 300, "click", 1)
+    for _ in range(3):
+        xdo("key", "Escape")
+        sleep(0.5)
+click(400, 300)
 restart(["--keybind=ctrl+alt+u=text:CLI-CONTROLLED"])
-editor()
+editor("cli")
 capture("cli-readonly")
-xdo("mousemove", 650, 537, "click", 1)
-sleep(0.3)
+click(828, 112)
+click(550, 392)
 assert overlay.read_text() == seed
 close_editor()
-xdo("mousemove", 400, 300, "click", 1)
+click(400, 300)
 restart([])
-editor()
+editor("overlay")
 capture("overlay-editable")
-xdo("mousemove", 650, 537, "click", 1)
-sleep(0.5)
-assert "OWNED-OVERRIDE" not in overlay.read_text()
-assert "font-size = 12" in overlay.read_text()
+xdo("mousemove", 550, 450)
+xdo("click", "--repeat", 15, 5)
+sleep(0.6)
+capture("overlay-restore")
+click(550, 604, 1)
+text = overlay.read_text()
+assert "OWNED-OVERRIDE" not in text, text
+assert "font-size = 12" in text and "# R6 unrelated line" in text, text
 capture("override-reset")
 close_editor()
-xdo("mousemove", 400, 300, "click", 1)
+click(400, 300)
 xdo("key", "ctrl+alt+u")
 sleep(0.3)
 capture("lower-key-runs")
 save("-overlay.txt", overlay.read_text())
 '''
 expect = [
-  "G23.png: initial private terminal",
-  "G23-cli-readonly.png: the CLI warning is visible and edit/save/reset controls are disabled",
-  "G23-overlay-editable.png: the same saved override becomes editable after removing the CLI argument",
-  "G23-override-reset.png: reset succeeds while unrelated overlay content remains",
+  "G23.png: initial private terminal in the dark GX Mocha theme",
+  "G23-list-cli.png: the Chinese editor list; Send Text: CLI-CONTROLLED carries the 命令行 badge and a lock, the others 用户配置",
+  "G23-cli-readonly.png: the read-only banner explains the command line controls the shortcut; action, parameter, recorder, flags and Save are disabled and there is no Restore Default",
+  "G23-list-overlay.png: after a restart without the argument the row shows OWNED-OVERRIDE with the 设置 badge and no lock",
+  "G23-overlay-editable.png: the same override opens as an editable structured page",
+  "G23-overlay-restore.png: scrolled to the 恢复默认 button below the flags",
+  "G23-override-reset.png: reset returned to the list with the saved banner; the row shows LOWER-RESTORED from 用户配置 while unrelated overlay content remains",
   "G23-lower-key-runs.png and G23-after.png: the restored key writes LOWER-RESTORED",
 ]

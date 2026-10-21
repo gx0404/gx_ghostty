@@ -19,24 +19,35 @@ def read_only(on):
     if overlay.exists():
         os.chmod(overlay, 0o444 if on else 0o644)
 def search(query):
-    xdo("mousemove", 400, 96, "click", 1)
+    xdo("mousemove", 400, 95, "click", 1)
     xdo("key", "ctrl+a")
     xdo("type", "--delay", 1, query)
     sleep(1.0)
+# The 920 x 680 dialog sits at (90, 36) in the 1100 x 740 window, its page
+# switcher in the header bar. The appearance page scrolls: the theme rows
+# are at its top, Blinking Cursor at its bottom.
+def scroll(button):
+    xdo("mousemove", 550, 400)
+    xdo("click", "--repeat", 12, "--delay", 40, button)
+    sleep(0.5)
 def theme_list():
-    xdo("mousemove", 550, 170, "click", 1)
+    scroll(4)
+    xdo("mousemove", 550, 186, "click", 1)
     sleep(0.8)
+def blink():
+    scroll(5)
+    xdo("mousemove", 800, 575, "click", 1)
 def apply_theme():
-    xdo("mousemove", 845, 96, "click", 1)
+    xdo("mousemove", 843, 95, "click", 1)
     sleep(0.8)
 def revert():
-    xdo("mousemove", 755, 96, "click", 1)
+    xdo("mousemove", 757, 95, "click", 1)
     sleep(0.8)
 def back():
     xdo("mousemove", 113, 58, "click", 1)
     sleep(0.8)
 def close():
-    xdo("mousemove", 987, 59, "click", 1)
+    xdo("mousemove", 987, 58, "click", 1)
     sleep(0.8)
 def open_appearance():
     xdo("mousemove", 400, 300, "click", 1)
@@ -76,7 +87,7 @@ try:
 finally:
     read_only(False)
 back()
-xdo("mousemove", 800, 507, "click", 1)
+blink()
 sleep(1.2)
 capture("06-later-save")
 text = overlay_text()
@@ -91,7 +102,7 @@ read_only(True)
 try:
     apply_theme()
     capture("07-save-failed-again")
-    search("GX Mocha")
+    search("GX Latte")
     capture("08-saved-theme-selected")
     failures = (evidence / "G26.log").read_text().count("cannot save ")
     close()
@@ -120,7 +131,7 @@ sleep(1.0)
 capture("11-retried")
 text = overlay_text()
 save("-overlay-retried.txt", text)
-assert "theme = Chalkboard" in text, text
+assert "theme = light:Chalkboard,dark:GX Mocha" in text, text
 back()
 capture("12-theme-row")
 close()
@@ -136,10 +147,10 @@ expect = [
   "G26-06-later-save.png: after another failed Apply, Revert and going back, turning Blinking Cursor off is saved (Settings saved) and the terminal keeps the saved theme",
   "G26-overlay-later.txt: cursor-style-blink = false and no theme = Chalkboard",
   "G26-07-save-failed-again.png: Apply with the folder read-only fails again with Retry",
-  "G26-08-saved-theme-selected.png: searching for the saved GX Mocha selects it with its check mark and reverts: the retry toast is gone, Revert and Apply are insensitive, the terminal shows GX Mocha",
+  "G26-08-saved-theme-selected.png: searching for the saved light theme GX Latte selects it with its check mark and reverts: the retry toast is gone, Revert and Apply are insensitive, the terminal shows GX Latte",
   "G26-09-closed.png: with the folder still read-only the close button closes the dialog without a failure toast",
   "G26-10-other-previewed.png: after a failed Apply of Chalkboard, the search Chalk lists Chalk and Chalkboard; Chalk is selected and previewed and the retry toast stays",
   "G26-11-retried.png: Retry with the folder writable saves Chalkboard: it gets the check mark, Chalk stays selected and previewed, Revert and Apply stay sensitive, the toast says the settings are saved",
-  "G26-overlay-retried.txt: theme = Chalkboard",
+  "G26-overlay-retried.txt: theme = light:Chalkboard,dark:GX Mocha",
   "G26-12-theme-row.png: going back ends the preview: the terminal and the theme row show Chalkboard",
 ]

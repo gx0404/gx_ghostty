@@ -1,5 +1,5 @@
 id = "G18"
-title = "Launch profile CRUD, ownership, defaults and existing shells"
+title = "Launch profile CRUD on the Shell page, ownership, defaults and existing shells"
 lang = "en"
 config = """
 command = direct:/bin/bash --noprofile --norc
@@ -8,9 +8,73 @@ confirm-close-surface = false
 env = HISTFILE=/dev/null
 gx-launch-profile = Lower=direct:/bin/bash --noprofile --norc
 keybind = ctrl+alt+n=gx:new_tab_menu
+keybind = ctrl+alt+p=gx:settings_page:shell
 """
+# Geometry: in a 1100x600 window the settings dialog is clamped to 530 px
+# (bottom edge y=565) whatever its own size, and its content column is
+# 576 px wide around x=550. After scrolling the Shell page to its end the
+# launch profile rows are counted from the bottom edge (English rows 55 px,
+# the "new" row 54 px). Subpages are driven by the keyboard: an opened
+# editable profile focuses its selected name, Tab moves to the command,
+# Tab again to the first sensitive row of the default group, and a third
+# Tab to Delete; Return in an entry saves. Only the read-only subpage of
+# a configuration-file profile is clicked (READONLY_*: banner, hint and a
+# one-line default hint above the rows).
 script = '''
-xdo("windowsize", window(), 1100, 740)
+BOTTOM = 565
+LIST_BOTTOM = BOTTOM - 24
+ROW = 55
+NEW_Y = LIST_BOTTOM - 27
+READONLY_USE_Y = 363
+READONLY_RESET_Y = 413
+overlay = config_home / "ghostty/gui-settings.ghostty"
+def row_y(k):
+    """The k-th launch profile from the end of the list."""
+    return LIST_BOTTOM - 54 - (k - 1) * ROW - ROW // 2
+def click(x, y):
+    xdo("mousemove", x, y, "click", 1)
+    sleep(0.3)
+def focus(target):
+    xdo("windowraise", target)
+    xdo("windowfocus", target)
+    xdo("mousemove", 400, 300, "click", 1)
+    sleep(0.5)
+def to_bottom():
+    xdo("mousemove", 550, 300)
+    xdo("click", "--repeat", 15, "--delay", 20, 5)
+    sleep(0.5)
+def open_shell(target):
+    focus(target)
+    xdo("key", "ctrl+alt+p")
+    sleep(1.0)
+    to_bottom()
+def close_dialog():
+    # Escape first dismisses a visible toast; let "Launch profiles saved."
+    # time out so it closes the dialog.
+    sleep(2.2)
+    xdo("key", "Escape")
+    sleep(0.7)
+def open_row(k):
+    click(550, row_y(k))
+    sleep(0.9)
+def keys(*names):
+    for name in names:
+        xdo("key", name)
+        sleep(0.25)
+def type_text(text):
+    """Replaces the text of the focused entry."""
+    xdo("key", "ctrl+a")
+    xdo("type", "--clearmodifiers", "--delay", 1, text)
+    sleep(0.2)
+def settled():
+    """After a commit: back on the list, scrolled to its end again."""
+    sleep(0.9)
+    to_bottom()
+def submit():
+    xdo("key", "Return")
+    settled()
+
+xdo("windowsize", window(), 1100, 600)
 sleep(1)
 xdo("mousemove", 400, 300, "click", 1)
 old_window = window()
@@ -19,12 +83,7 @@ sleep(1)
 windows = xdo("search", "--onlyvisible", "--pid", pid()).splitlines()
 assert len(windows) == 2, windows
 second = next(item for item in windows if item != old_window)
-xdo("windowsize", second, 1100, 740)
-def focus(target):
-    xdo("windowraise", target)
-    xdo("windowfocus", target)
-    xdo("mousemove", 400, 300, "click", 1)
-    sleep(0.5)
+xdo("windowsize", second, 1100, 600)
 focus(second)
 # Prime the second window's menu before any profile mutations.
 xdo("key", "ctrl+alt+n")
@@ -37,127 +96,140 @@ assert sum(row["exe"] == "/usr/bin/bash" for row in before) == 2, before
 xdo("key", "ctrl+alt+n")
 sleep(0.5)
 capture("menu")
-xdo("mousemove", 100, 495, "click", 1)
-sleep(1)
+# Edit Launch Profiles… below five profiles (GX Zsh, herdr, Login Shell,
+# Bash, Lower).
+click(100, 495)
+sleep(1.0)
 capture("manager")
-overlay = config_home / "ghostty/gui-settings.ghostty"
-def click(x, y):
-    xdo("mousemove", x, y, "click", 1)
-    sleep(0.3)
-def entry(y, text):
-    click(450, y)
-    xdo("key", "ctrl+a")
-    xdo("type", "--clearmodifiers", "--delay", 1, text)
-    sleep(0.2)
-click(265, 478)
-entry(308, "Owned")
-entry(380, "direct:/bin/bash --noprofile --norc")
+to_bottom()
+capture("manager-list")
+
+# Create Owned through the "new" row.
+click(550, NEW_Y)
+sleep(0.9)
+type_text("Owned")
+keys("Tab")
+type_text("direct:/bin/bash --noprofile --norc --noediting")
 capture("create-draft")
-click(372, 478)
-sleep(0.5)
-assert "Owned=direct:/bin/bash --noprofile --norc" in overlay.read_text()
+submit()
+assert "gx-launch-profile = Owned=direct:/bin/bash --noprofile --norc --noediting" in overlay.read_text()
 capture("created")
-click(280, 521)
-sleep(0.5)
-assert "command = direct:/bin/bash --noprofile --norc" in overlay.read_text()
+
+# Use it as the default: the first sensitive default row.
+open_row(1)
+keys("Tab", "Tab", "Return")
+settled()
+assert "command = direct:/bin/bash --noprofile --norc --noediting" in overlay.read_text()
 capture("default")
+
+# Rename it after another editor added lines to the overlay.
 with overlay.open("a") as out:
     out.write("\n# R6 external profile edit\nkeybind = ctrl+alt+7=gx:new_tab_profile:custom:Owned\n")
-entry(308, "Renamed")
-click(372, 478)
-sleep(0.5)
-assert "Renamed=direct:/bin/bash --noprofile --norc" in overlay.read_text()
-assert "gx:new_tab_profile:custom:Owned" in overlay.read_text()
-assert "# R6 external profile edit" in overlay.read_text()
+open_row(1)
+type_text("Renamed")
+capture("rename-draft")
+submit()
+text = overlay.read_text()
+assert "Renamed=direct:/bin/bash --noprofile --norc --noediting" in text
+assert "Owned=" not in text.replace("custom:Owned", "")
+assert "gx:new_tab_profile:custom:Owned" in text
+assert "# R6 external profile edit" in text
 capture("renamed-stale-reference")
+close_dialog()
+
 stale_before = processes("before-stale-reference")
-xdo("mousemove", 887, 180, "click", 1)
-sleep(0.5)
 xdo("mousemove", 400, 300, "click", 1)
 xdo("key", "ctrl+alt+7")
 sleep(0.5)
 assert processes("after-stale-reference") == stale_before
 assert (evidence / "G18.log").read_text().count("unknown launch profile custom:Owned") == 1
 capture("stale-reference-no-launch")
-xdo("key", "ctrl+alt+n")
-sleep(0.5)
-click(100, 527)
-sleep(0.5)
-click(500, 238)
-xdo("key", "--repeat", 5, "--delay", 150, "Down")
-xdo("key", "Return")
-sleep(0.5)
-click(457, 478)
-sleep(0.5)
+
+# Delete Renamed, the default: Use as Default is insensitive, so the third
+# Tab reaches Delete.
+open_shell(old_window)
+open_row(1)
+keys("Tab", "Tab", "Tab", "Return")
+settled()
 assert "gx-launch-profile = Renamed=" not in overlay.read_text()
-assert "command = direct:/bin/bash --noprofile --norc" in overlay.read_text()
+assert "command = direct:/bin/bash --noprofile --norc --noediting" in overlay.read_text()
 capture("deleted-keeps-default")
-click(447, 521)
-sleep(0.5)
-assert "\ncommand =" not in overlay.read_text()
+
+# Reset the default from the read-only Lower profile.
+open_row(1)
+capture("lower-readonly")
+click(550, READONLY_RESET_Y)
+settled()
+assert "\ncommand =" not in "\n" + overlay.read_text()
 after = processes("after")
 assert before == after, (before, after)
 capture("reset-default-old-shell-alive")
-click(265, 478)
-entry(308, "Sync")
-entry(380, "direct:/bin/bash --noprofile --norc -i")
-click(372, 478)
-sleep(0.5)
-click(887, 180)
-def open_manager(target, count):
-    focus(target)
-    xdo("key", "ctrl+alt+n")
-    sleep(0.5)
-    click(100, 495 + 32 * (count - 5))
-    sleep(0.5)
-    click(500, 238)
-    xdo("key", "--repeat", count - 1, "--delay", 150, "Down")
-    xdo("key", "Return")
-    sleep(0.5)
-def check_second(label, count, command):
+
+# Profiles edited in one window reach the settings of another one.
+click(550, NEW_Y)
+sleep(0.9)
+type_text("Sync")
+keys("Tab")
+type_text("direct:/bin/bash --noprofile --norc -i")
+submit()
+close_dialog()
+def check_second(label, readonly, command, commits=True):
     focus(second)
     xdo("key", "ctrl+alt+n")
     sleep(0.5)
     capture(label + "-menu")
     xdo("key", "Escape")
-    open_manager(second, count)
+    open_shell(second)
     capture(label)
-    # Prove the old window's manager selected the newly current entry, rather
-    # than accepting a screenshot or a no-new-process assertion on its own.
-    click(280, 521)
-    assert "command = " + command in overlay.read_text()
-    click(887, 180)
-check_second("cross-window-created", 6, "direct:/bin/bash --noprofile --norc -i")
-open_manager(old_window, 6)
-entry(308, "SyncRenamed")
-entry(380, "direct:/bin/bash --noprofile --norc --noediting")
-click(372, 478)
-sleep(0.5)
-click(887, 180)
-check_second("cross-window-renamed", 6, "direct:/bin/bash --noprofile --norc --noediting")
-open_manager(old_window, 6)
-click(457, 478)
-sleep(0.5)
-click(887, 180)
-check_second("cross-window-deleted", 5, "direct:/bin/bash --noprofile --norc")
-check_second("reopened-after-delete", 5, "direct:/bin/bash --noprofile --norc")
+    # Prove the second window's settings show the newly current entry by
+    # making it the default, rather than trusting a screenshot alone.
+    open_row(1)
+    if readonly:
+        click(550, READONLY_USE_Y)
+    else:
+        keys("Tab", "Tab", "Return")
+    sleep(0.9)
+    assert "command = " + command in overlay.read_text(), (label, overlay.read_text())
+    if not commits:
+        # The profile already is the default: its subpage stays open.
+        xdo("key", "Escape")
+        sleep(0.8)
+    close_dialog()
+check_second("cross-window-created", False, "direct:/bin/bash --noprofile --norc -i")
+open_shell(old_window)
+open_row(1)
+type_text("SyncRenamed")
+keys("Tab")
+type_text("direct:/bin/bash --noprofile --norc --noediting")
+submit()
+close_dialog()
+check_second("cross-window-renamed", False, "direct:/bin/bash --noprofile --norc --noediting")
+open_shell(old_window)
+open_row(1)
+keys("Tab", "Tab", "Tab", "Return")
+settled()
+assert "SyncRenamed=" not in overlay.read_text()
+close_dialog()
+check_second("cross-window-deleted", True, "direct:/bin/bash --noprofile --norc")
+check_second("reopened-after-delete", True, "direct:/bin/bash --noprofile --norc", commits=False)
 final = processes("cross-window")
 assert all(row in final for row in before), (before, final)
 save("-overlay.txt", overlay.read_text())
 '''
 expect = [
   "G18.png: an isolated English terminal",
-  "G18-menu.png: launch choices include the user Lower profile and profile manager entry",
-  "G18-manager.png: the native profile manager shows source and rename guidance",
-  "G18-create-draft.png and G18-created.png: Owned is created in the overlay",
-  "G18-default.png: the selected profile is used as the default",
-  "G18-renamed-stale-reference.png: Renamed is selected and rename guidance explains stable ID consequences",
+  "G18-menu.png: launch choices include the user Lower profile and Edit Launch Profiles…",
+  "G18-manager.png and G18-manager-list.png: the menu entry opened the settings on the Shell page; Launch Profiles lists the detected shells, Lower with From the configuration file and a lock, and New Launch Profile",
+  "G18-create-draft.png and G18-created.png: the New Launch Profile subpage with Owned typed; after saving the list shows Owned and the Launch profiles saved. toast; the overlay has it",
+  "G18-default.png: Owned carries the Default badge and the Default Shell row names it",
+  "G18-rename-draft.png and G18-renamed-stale-reference.png: the rename hint explains stable ID consequences; Renamed replaced Owned in the list",
   "G18-stale-reference-no-launch.png: the binding still naming custom:Owned does not launch a replacement shell; PID/birth/PTY set is unchanged",
-  "G18-deleted-keeps-default.png: deleting the profile does not rewrite the default command",
-  "G18-reset-default-old-shell-alive.png: resetting the default preserves the existing shell (PID/birth/PTY assertions)",
+  "G18-deleted-keeps-default.png: deleting the default profile does not rewrite the default command (the Default Shell row keeps it as a custom command)",
+  "G18-lower-readonly.png: the Lower subpage is read-only with the configuration-file banner, locks and Use as Default / Reset Default Shell rows",
+  "G18-reset-default-old-shell-alive.png: resetting the default preserves the existing shell (PID/birth/PTY assertions); Lower is the default again and the Default Shell row went back to System Default",
   "G18-second-before-mutations.png: the second window already exists and its menu is built before editing",
-  "G18-cross-window-created*.png: that pre-existing window sees Sync",
+  "G18-cross-window-created*.png: that pre-existing window sees Sync in its menu and settings",
   "G18-cross-window-renamed*.png: it sees SyncRenamed and the changed command",
-  "G18-cross-window-deleted*.png and G18-reopened-after-delete*.png: the deleted profile disappears; Lower is selected",
-  "G18-after.png: both ordinary windows survive; original shell PID/birth/PTY remain unchanged",
+  "G18-cross-window-deleted*.png and G18-reopened-after-delete*.png: the deleted profile disappears; Lower is the last profile, and after it became the default again the Default Shell row names Lower",
+  "G18-after.png: the settings are closed and both ordinary windows survive; original shell PID/birth/PTY remain unchanged",
 ]

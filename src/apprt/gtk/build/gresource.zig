@@ -174,6 +174,12 @@ fn genIcons(io: std.Io, writer: *std.Io.Writer) !void {
             ,
                 .{ alias, build_info.base_application_id, source },
             );
+            // fork(gx): GX-0058 begin: the same icon as ghostty-gx, a name no installed theme has
+            try writer.print(
+                \\    <file alias="{s}/apps/ghostty-gx.png">{s}</file>
+                \\
+            , .{ alias, source });
+            // fork(gx): GX-0058 end
         }
 
         // 2x
@@ -188,6 +194,12 @@ fn genIcons(io: std.Io, writer: *std.Io.Writer) !void {
             ,
                 .{ alias, build_info.base_application_id, source },
             );
+            // fork(gx): GX-0058 begin: the same icon as ghostty-gx, a name no installed theme has
+            try writer.print(
+                \\    <file alias="{s}/apps/ghostty-gx.png">{s}</file>
+                \\
+            , .{ alias, source });
+            // fork(gx): GX-0058 end
         }
     }
 

@@ -1,5 +1,5 @@
 id = "G24"
-title = "Deleting an overlay profile reveals the lower source; CLI sources remain readonly"
+title = "Overlay profiles shadow and reveal the lower source; duplicates, conflicts and failed saves keep the draft; CLI sources remain readonly"
 lang = "en"
 config = """
 command = direct:/bin/bash --noprofile --norc
@@ -7,55 +7,139 @@ language = en
 confirm-close-surface = false
 env = HISTFILE=/dev/null
 gx-launch-profile = Layer=direct:/bin/bash --noprofile --norc
-keybind = ctrl+alt+n=gx:new_tab_menu
+keybind = ctrl+alt+p=gx:settings_page:shell
 """
+# Geometry as in G18: a 1100x600 window clamps the settings dialog to 530 px
+# (bottom edge y=565); rows are counted from that edge after scrolling the
+# Shell page to its end; editable subpages are driven by the keyboard. The
+# CLI read-only subpage is clicked at every row position its rows could
+# take; all of them must be insensitive.
 script = '''
+import os
+BOTTOM = 565
+LIST_BOTTOM = BOTTOM - 24
+ROW = 55
+NEW_Y = LIST_BOTTOM - 27
 overlay = config_home / "ghostty/gui-settings.ghostty"
+folder = overlay.parent
 overlay.write_text("# R6 keep this line\ngx-launch-profile = Layer=direct:/bin/bash --noprofile --norc -i\n")
-def manager():
-    xdo("windowsize", window(), 1100, 740)
+def row_y(k):
+    return LIST_BOTTOM - 54 - (k - 1) * ROW - ROW // 2
+def to_bottom():
+    xdo("mousemove", 550, 300)
+    xdo("click", "--repeat", 15, "--delay", 20, 5)
+    sleep(0.5)
+def open_shell():
+    xdo("windowsize", window(), 1100, 600)
     sleep(1)
     xdo("mousemove", 400, 300, "click", 1)
-    xdo("key", "ctrl+alt+n")
+    xdo("key", "ctrl+alt+p")
+    sleep(1.0)
+    to_bottom()
+def click(x, y):
+    xdo("mousemove", x, y, "click", 1)
     sleep(0.3)
-    xdo("mousemove", 100, 495, "click", 1)
-    sleep(0.4)
-    xdo("mousemove", 500, 238, "click", 1)
-    sleep(0.3)
-    capture("combo-open-" + str(pid()))
-    xdo("key", "--repeat", 4, "--delay", 150, "Down")
-    xdo("key", "Return")
-    sleep(0.3)
+def keys(*names):
+    for name in names:
+        xdo("key", name)
+        sleep(0.25)
+def type_text(text):
+    """Replaces the text of the focused entry."""
+    xdo("key", "ctrl+a")
+    xdo("type", "--clearmodifiers", "--delay", 1, text)
+    sleep(0.2)
+def back():
+    xdo("key", "Escape")
+    sleep(0.8)
+    to_bottom()
+
 xdo("mousemove", 400, 300, "click", 1)
 restart()
-manager()
+open_shell()
+capture("owned-layer-list")
+click(550, row_y(1))
+sleep(0.9)
 capture("owned-layer")
-xdo("mousemove", 457, 478, "click", 1)
-sleep(0.5)
+back()
+
+# A new profile may not take the name of an existing one.
+before = overlay.read_text()
+click(550, NEW_Y)
+sleep(0.9)
+type_text("Layer")
+keys("Tab")
+type_text("direct:/bin/bash --noprofile --norc")
+keys("Return")
+sleep(0.8)
+capture("duplicate-draft-kept")
+assert overlay.read_text() == before
+back()
+
+# Another editor changes the profile while its subpage is open.
+click(550, row_y(1))
+sleep(0.9)
+external = "# R6 keep this line\ngx-launch-profile = Layer=direct:/bin/bash --noprofile --norc --login\n"
+overlay.write_text(external)
+type_text("LayerRenamed")
+keys("Return")
+sleep(0.8)
+capture("conflict-draft-kept")
+assert overlay.read_text() == external
+back()
+
+# A save that fails keeps the draft and says so; nothing is written.
+click(550, row_y(1))
+sleep(0.9)
+os.chmod(folder, 0o555)
+os.chmod(overlay, 0o444)
+try:
+    type_text("LayerFailed")
+    keys("Return")
+    sleep(0.8)
+    capture("save-failed-draft-kept")
+    assert overlay.read_text() == external
+finally:
+    os.chmod(folder, 0o755)
+    os.chmod(overlay, 0o644)
+back()
+
+# Deleting the overlay profile reveals the configuration file's Layer.
+click(550, row_y(1))
+sleep(0.9)
+keys("Tab", "Tab", "Tab", "Return")
+sleep(0.9)
 assert "gx-launch-profile" not in overlay.read_text()
 assert "# R6 keep this line" in overlay.read_text()
-xdo("mousemove", 500, 238, "click", 1)
-sleep(0.3)
-xdo("key", "--repeat", 4, "--delay", 150, "Down")
-xdo("key", "Return")
-sleep(0.3)
+to_bottom()
+capture("lower-reappears-list")
+click(550, row_y(1))
+sleep(0.9)
 capture("lower-reappears-readonly")
+back()
+sleep(2.2)
 xdo("key", "Escape")
-sleep(0.3)
+sleep(0.5)
+
 xdo("mousemove", 400, 300, "click", 1)
 restart(["--gx-launch-profile=Layer=direct:/bin/bash --noprofile --norc -i", "--command=direct:/bin/bash --noprofile --norc"])
-manager()
+open_shell()
+capture("cli-list")
+click(550, row_y(1))
+sleep(0.9)
 capture("cli-readonly")
 original = overlay.read_text()
-xdo("mousemove", 457, 478, "click", 1)
-xdo("mousemove", 280, 521, "click", 1)
-sleep(0.3)
+for y in (300, 330, 363, 380, 413, 440, 460, 488, 510):
+    click(550, y)
+sleep(0.5)
 assert overlay.read_text() == original
 save("-overlay.txt", overlay.read_text())
 '''
 expect = [
   "G24.png: isolated initial terminal",
-  "G24-owned-layer.png: overlay-owned Layer has editable fields and enabled Delete",
-  "G24-lower-reappears-readonly.png: deleting the override reveals the lower Layer with the readonly warning",
-  "G24-cli-readonly.png and G24-after.png: CLI profile and default-command controls cannot be changed",
+  "G24-owned-layer-list.png and G24-owned-layer.png: the overlay-owned Layer shadows the configuration one: no lock in the list; its subpage has editable entries, the rename hint and an enabled Delete Launch Profile",
+  "G24-duplicate-draft-kept.png: a new profile named Layer stays on the subpage with Layer typed and the A profile with this name already exists. toast",
+  "G24-conflict-draft-kept.png: after another editor changed Layer, the rename stays typed with the toast about the profile changing outside the settings",
+  "G24-save-failed-draft-kept.png: with the settings folder read-only, LayerFailed stays typed with the Unable to save launch profiles toast",
+  "G24-lower-reappears-list.png and G24-lower-reappears-readonly.png: deleting the override reveals the configuration Layer with From the configuration file, a lock, and the read-only banner",
+  "G24-cli-list.png, G24-cli-readonly.png and G24-after.png: the command-line Layer shows From the command line and a lock; its subpage has the command-line banner, every row insensitive, and the default hint says the default shell is set on the command line",
 ]

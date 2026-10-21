@@ -8,13 +8,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const adw = @import("adw");
-const gobject = @import("gobject");
 const gtk = @import("gtk");
 
 const configpkg = @import("../../../config.zig");
 const input = @import("../../../input.zig");
 const gx = @import("../../../gx/main.zig");
-const Common = @import("../class.zig").Common;
+const keycaps = @import("keycaps.zig");
 const shortcuts = @import("shortcuts.zig");
 
 const sheet = gx.shortcuts;
@@ -127,6 +126,7 @@ fn build(state: *State, config: *const configpkg.Config, parent: *gtk.Widget) Al
     dialog.setContentWidth(680);
     dialog.setContentHeight(560);
     dialog.setChild(toolbar.as(gtk.Widget));
+    dialog.as(gtk.Widget).addCssClass("gx-dialog");
     state.dialog = dialog;
 
     _ = gtk.SearchEntry.signals.search_changed.connect(
@@ -171,7 +171,7 @@ fn buildRow(arena: Allocator, row: sheet.Row, commands: []const input.Command) A
     } else {
         widget.as(adw.PreferencesRow).setTitle(text);
     }
-    widget.addSuffix(try keysWidget(arena, row.sequences));
+    widget.addSuffix(try keycaps.keys(arena, row.sequences));
     return .{ .widget = widget.as(gtk.Widget), .titles = titles };
 }
 
@@ -185,69 +185,11 @@ fn titleText(
     return try fillZ(arena, template, .{ .title = title, .argument = arg });
 }
 
-/// The first key sequences of a row side by side, then "+N" for the
-/// others, which its tooltip lists.
-fn keysWidget(arena: Allocator, sequences: []const []const Trigger) Allocator.Error!*gtk.Widget {
-    const box = gtk.Box.new(.horizontal, 12);
-    box.as(gtk.Widget).setValign(.center);
-    const shown = @min(sequences.len, shortcuts.shown_sequences);
-    for (sequences[0..shown], 0..) |sequence, i| {
-        if (i > 0) box.append(dimLabel("/"));
-        box.append(try sequenceWidget(arena, sequence));
-    }
-    if (sequences.len > shown) {
-        const more = dimLabel(try std.fmt.allocPrintSentinel(arena, "+{d}", .{sequences.len - shown}, 0));
-        more.setTooltipText(try sequencesText(arena, sequences[shown..]));
-        box.append(more);
-    }
-    return box.as(gtk.Widget);
-}
-
-/// A key sequence: the keycaps of each step, leader keys first.
-fn sequenceWidget(arena: Allocator, sequence: []const Trigger) Allocator.Error!*gtk.Widget {
-    if (sequence.len == 1) return try keycapsWidget(arena, sequence[0]);
-    const box = gtk.Box.new(.horizontal, 6);
-    for (sequence, 0..) |trigger, i| {
-        if (i > 0) box.append(dimLabel("›"));
-        box.append(try keycapsWidget(arena, trigger));
-    }
-    return box.as(gtk.Widget);
-}
-
-fn keycapsWidget(arena: Allocator, trigger: Trigger) Allocator.Error!*gtk.Widget {
-    const caps: sheet.Keycaps = .init(trigger, .gtk);
-    const keycaps = gobject.ext.newInstance(Keycaps, .{});
-    const box = keycaps.as(gtk.Box);
-    box.setSpacing(6);
-    for (0..caps.count()) |i| {
-        if (i > 0) box.append(dimLabel("+"));
-        const label = gtk.Label.new(try arena.dupeZ(u8, caps.get(i)));
-        label.as(gtk.Widget).addCssClass("keycap");
-        box.append(label.as(gtk.Widget));
-    }
-    return keycaps.as(gtk.Widget);
-}
-
-fn sequencesText(arena: Allocator, sequences: []const []const Trigger) Allocator.Error![:0]const u8 {
-    var out: std.Io.Writer.Allocating = .init(arena);
-    for (sequences, 0..) |sequence, i| {
-        if (i > 0) out.writer.writeByte('\n') catch return error.OutOfMemory;
-        sheet.writeSequence(&out.writer, sequence, .gtk, " › ") catch return error.OutOfMemory;
-    }
-    return try out.toOwnedSliceSentinel(0);
-}
-
 /// `gx.i18n.format` into a new string for GTK.
 fn fillZ(arena: Allocator, template: []const u8, args: anytype) Allocator.Error![:0]const u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     gx.i18n.format(&out.writer, template, args) catch return error.OutOfMemory;
     return try out.toOwnedSliceSentinel(0);
-}
-
-fn dimLabel(text: [:0]const u8) *gtk.Widget {
-    const label = gtk.Label.new(text);
-    label.as(gtk.Widget).addCssClass("dim-label");
-    return label.as(gtk.Widget);
 }
 
 fn searchChanged(entry: *gtk.SearchEntry, state: *State) callconv(.c) void {
@@ -277,32 +219,3 @@ fn stopSearch(entry: *gtk.SearchEntry, state: *State) callconv(.c) void {
     }
     _ = state.dialog.close();
 }
-
-/// The keycaps of one key combination. Its CSS name is `shortcut`, so
-/// libadwaita styles the `.keycap` labels as in a `Gtk.ShortcutLabel`,
-/// whose modifier order would differ from `gx.shortcuts`.
-const Keycaps = extern struct {
-    const Self = @This();
-    parent_instance: Parent,
-    pub const Parent = gtk.Box;
-    pub const getGObjectType = gobject.ext.defineClass(Self, .{
-        .name = "GhosttyGxKeycaps",
-        .classInit = &Class.init,
-        .parent_class = &Class.parent,
-    });
-
-    const C = Common(Self, null);
-    pub const as = C.as;
-
-    pub const Class = extern struct {
-        parent_class: Parent.Class,
-        var parent: *Parent.Class = undefined;
-        pub const Instance = Self;
-
-        fn init(class: *Class) callconv(.c) void {
-            gtk.Widget.Class.setCssName(class.as(gtk.Widget.Class), "shortcut");
-        }
-
-        pub const as = C.Class.as;
-    };
-};

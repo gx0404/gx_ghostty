@@ -960,6 +960,57 @@ pub const Search = struct {
     }
 };
 
+/// The place of the binding action named `name` (`new_tab`,
+/// `gx:settings`), as `place` puts that action.
+pub fn placeByName(name: []const u8) Place {
+    const tag = if (std.mem.startsWith(u8, name, "gx:")) "gx" else name;
+    return places.get(tag) orelse .{ .category = .other, .rank = table.len };
+}
+
+/// A title (msgid) for the binding action named `name` (`new_tab`,
+/// `copy_to_clipboard`, `gx:settings_page`), whatever its argument, for
+/// lists of actions to choose from: the only default command palette entry
+/// with that action, else the one for the action with its default
+/// argument, else a generic title (`title`); for `gx:` names the Ghostty
+/// GX title. Null when there is none.
+pub fn titleForName(name: []const u8) ?[:0]const u8 {
+    if (std.mem.startsWith(u8, name, "gx:")) {
+        const GxAction = @import("action.zig").Action;
+        const gx_name = name["gx:".len..];
+        inline for (@typeInfo(GxAction).@"union".fields) |field| {
+            if (std.mem.eql(u8, field.name, gx_name)) {
+                const value = @unionInit(GxAction, field.name, switch (@typeInfo(field.type)) {
+                    .void => {},
+                    .@"enum" => std.enums.values(field.type)[0],
+                    else => if (field.type == []const u8) "" else return null,
+                });
+                return value.title();
+            }
+        }
+        return null;
+    }
+    // As in `title`, text sequences have generic titles.
+    for ([_][]const u8{ "text", "csi", "esc" }) |generic| {
+        if (std.mem.eql(u8, name, generic)) return fallback_titles.get(name);
+    }
+    var found: ?[:0]const u8 = null;
+    var count: usize = 0;
+    for (input.command.defaults) |command| {
+        if (!std.mem.eql(u8, @tagName(std.meta.activeTag(command.action)), name)) continue;
+        found = command.title;
+        count += 1;
+    }
+    if (count == 1) return found.?;
+    if (count > 1) {
+        if (Action.parse(name)) |action| {
+            for (input.command.defaults) |command| {
+                if (command.action.equal(action)) return command.title;
+            }
+        } else |_| {}
+    }
+    return fallback_titles.get(name);
+}
+
 const testing = std.testing;
 
 fn testSet(alloc: Allocator, lines: []const []const u8) !Binding.Set {
@@ -1311,4 +1362,22 @@ test "Search matches titles, or only keys for a query written as keys" {
     // A chord does not match titles as letters.
     try testing.expect(Search.init("n+t").score(&titles, &new_tab) == null);
     try testing.expect(Search.init("close").score(&titles, &new_tab) == null);
+}
+
+test "titleForName names actions without their argument" {
+    try testing.expectEqualStrings("New Tab", titleForName("new_tab").?);
+    try testing.expectEqualStrings("Copy to Clipboard", titleForName("copy_to_clipboard").?);
+    try testing.expectEqualStrings("Go to Tab", titleForName("goto_tab").?);
+    try testing.expectEqualStrings("Send Text", titleForName("text").?);
+    try testing.expectEqualStrings("Settings…", titleForName("gx:settings").?);
+    try testing.expectEqualStrings("Settings Page", titleForName("gx:settings_page").?);
+    try testing.expectEqualStrings("New Tab with Profile", titleForName("gx:new_tab_profile").?);
+    try testing.expectEqual(@as(?[:0]const u8, null), titleForName("gx:no_such_action"));
+    try testing.expectEqual(@as(?[:0]const u8, null), titleForName("no_such_action"));
+}
+
+test "placeByName follows place" {
+    try testing.expectEqual(place(.new_tab), placeByName("new_tab"));
+    try testing.expectEqual(Category.application, placeByName("gx:settings").category);
+    try testing.expectEqual(Category.other, placeByName("no_such_action").category);
 }

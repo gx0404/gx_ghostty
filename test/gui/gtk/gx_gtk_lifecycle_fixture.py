@@ -4,8 +4,9 @@
 It drives the built GTK app with real X input (xdotool) and checks real
 processes, files and screenshots. Nothing is mocked:
 
-  session 1: save a launch profile in the profile manager and a binding in the
-  shortcut editor -> use the saved binding -> move a split into a new tab and
+  session 1: create a launch profile on the Shell page of the settings (menu
+  Edit Launch Profiles... -> New Launch Profile subpage) and a binding on the
+  New Advanced Shortcut page of the shortcut editor -> use the saved binding -> move a split into a new tab and
   into a new window -> close the old window -> keep typing into the original
   terminal (PID, starttime and PTY unchanged) -> resize -> quit.
   session 2 (gx-session-restore = true): the custom profile asks before it
@@ -17,8 +18,10 @@ Run on Windows through the heavy slot (WSL + Xvfb, never the host desktop):
   python scripts/gx_slots.py --kind heavy --timeout 1800 -- \
       python test/gui/gtk/gx_gtk_lifecycle_fixture.py --out <new evidence dir>
 
---explore only opens the new-tab menu, the profile manager and the shortcut
-editor and takes screenshots (to calibrate click positions). The exit code
+--explore only opens the new-tab menu, the Shell page with its launch profile
+list and New Launch Profile subpage, and the shortcut editor with its New
+Advanced Shortcut page, takes screenshots (to calibrate click positions) and
+saves nothing. The exit code
 covers the automated checks only: every screenshot listed in notes.txt must
 still be read before anything is recorded as PASS.
 """
@@ -49,20 +52,33 @@ BINDING = "ctrl+alt+j=gx:new_tab_profile:" + PROFILE_NAME
 RESIZE = (1000, 680)
 W2_POSITION = (440, 170)
 
-# Click positions on the 1280x800 screen with the first window at its default
-# 800x600 size at the origin. Calibrate with --explore screenshots.
+# Click positions on the 1280x800 screen, first window at the origin. The
+# window keeps its default 800x600 except while an editor is open: the
+# settings dialog (920x680) and the shortcut editor (720x560) are clamped by
+# the window, so the fixture sizes it like the GTK scenarios that pin these
+# positions (G16/G18: 1100x600, G17/G31: 1100x740) and restores 800x600
+# afterwards. Calibrate with --explore screenshots.
+#   pm_*: in the 1100x600 window the settings dialog is clamped to 530 px
+#         with its bottom edge at y=565 and the page switcher in its title
+#         bar; after scrolling the Shell page to its end the list ends 24 px
+#         above that edge and New Launch Profile is the last row, centred
+#         27 px above the list end (G16/G18: NEW_Y = 565 - 24 - 27 = 514).
+#         The subpage focuses the name entry, Tab moves to the command and
+#         Return saves (back to the list with the toast Launch profiles saved.).
+#   ed_*: the cheat sheet's Edit Keyboard Shortcuts button, the list scrolled
+#         to New Advanced Shortcut, and Save in the editor header bar.
+PM_WINDOW = (1100, 600)
+ED_WINDOW = (1100, 740)
+DEFAULT_WINDOW = (800, 600)
 LAYOUT = {
     "terminal": (400, 360),
     "menu_edit_profiles": (90, 495),
-    "pm_new_profile": (121, 407),
-    "pm_save": (225, 415),
-    "cheat_edit": (584, 57),
-    "ed_new_binding": (125, 443),
-    "ed_text": (400, 330),
-    "ed_save": (397, 443),
-    "pm_close": (734, 110),
-    "ed_close": (734, 47),
-    "cheat_close": (717, 57),
+    "pm_scroll": (550, 300),
+    "pm_new_profile": (550, 514),
+    "cheat_edit": (730, 110),
+    "ed_scroll": (550, 450),
+    "ed_new_advanced": (550, 598),
+    "ed_save": (828, 112),
 }
 
 CONFIG_TEMPLATE = """language = en
@@ -471,6 +487,20 @@ class Driver:
                                      "windows": windows, "sha256": sha256_file(path)})
         self.log(f"screenshot {path.name}")
 
+    def size_window(self, window_id: str, size: tuple[int, int]) -> None:
+        self.log(f"windowsize {window_id} {size[0]}x{size[1]}")
+        self.xdo("windowsize", window_id, str(size[0]), str(size[1]))
+        time.sleep(1.0)
+        current = next((w for w in self.windows() if w["id"] == window_id), None)
+        if current is None or abs(current["width"] - size[0]) > 2 or abs(current["height"] - size[1]) > 2:
+            raise Failure(f"window {window_id} did not take {size[0]}x{size[1]}: {current}")
+
+    def scroll_down(self, at: tuple[int, int], clicks: int) -> None:
+        self.log(f"scroll down x{clicks} at {at[0]},{at[1]}")
+        self.xdo("mousemove", str(at[0]), str(at[1]))
+        self.xdo("click", "--repeat", str(clicks), "--delay", "15", "5")
+        time.sleep(0.6)
+
     def type_marker(self, name: str, shell: dict, stage: str) -> None:
         target = self.marks / name
         self.type(f"printf '%s %s\\n' \"$$\" \"$(tty)\" >{target}")
@@ -735,52 +765,75 @@ class Driver:
         self.click(*LAYOUT["terminal"])
         self.shot("start", "one GX window, one tab, prompt TEMP$ from the temporary initial command")
 
-        # Launch profile manager: new-tab dropdown -> Edit Launch Profiles...
+        # Launch profiles: new-tab dropdown -> Edit Launch Profiles... opens the
+        # Shell page of the settings dialog; New Launch Profile opens a subpage.
+        first = self.terminal_windows()[0]["id"]
+        self.size_window(first, PM_WINDOW)
         self.key("ctrl+alt+n", 1.2)
         self.shot("new-tab-menu", "the new-tab dropdown lists the detected profiles and ends with Set Default Shell... and Edit Launch Profiles...")
         self.click(*LAYOUT["menu_edit_profiles"], 1.5)
-        self.shot("profile-manager", "the real Launch Profiles manager: selector, name and command fields, New Profile/Save/Delete/Reload")
+        self.shot("shell-page", "the settings dialog opened on the Shell page (Shell selected in the page switcher in the title bar) with Default Shell and the Launch Profiles group")
+        self.scroll_down(LAYOUT["pm_scroll"], 15)
+        self.shot("profile-list", "the Shell page scrolled to its end: launch profile rows and New Launch Profile as the last row")
+        self.click(*LAYOUT["pm_new_profile"], 1.0)
         if self.args.explore:
+            self.shot("profile-new", "the New Launch Profile subpage: empty focused name entry, command entry, insensitive Save in the header bar")
+            self.key("Escape", 0.8)
             self.key("Escape", 1.0)
         else:
-            self.click(*LAYOUT["pm_new_profile"], 0.8)
             self.type(PROFILE_NAME)
             self.key("Tab", 0.4)
             self.type(PROFILE_COMMAND)
-            self.click(*LAYOUT["pm_save"], 1.5)
-            self.shot("profile-saved", f"the manager selects {PROFILE_NAME}, shows its command and the status Launch profiles saved.")
-            self.check("session1: the profile manager saved the custom profile to gui-settings.ghostty",
+            self.shot("profile-draft", f"the New Launch Profile subpage holds the name {PROFILE_NAME} and its command; Save is sensitive")
+            self.key("Return", 1.0)
+            self.shot("profile-saved", f"back on the launch profile list with {PROFILE_NAME} as the new focused last profile row and the toast Launch profiles saved.")
+            self.check("session1: the Shell page saved the custom profile to gui-settings.ghostty",
                        f"{PROFILE_NAME}={PROFILE_COMMAND}" in self.overlay_text(), self.overlay_text())
-            self.click(*LAYOUT["pm_close"], 1.0)
-            self.click(*LAYOUT["terminal"], 0.6)
+            # Escape first dismisses a visible toast; let it time out so Escape closes the dialog.
+            # The toast pauses its timeout while hovered and sits right under New Launch Profile,
+            # so move the pointer off it first.
+            self.xdo("mousemove", str(LAYOUT["pm_scroll"][0]), str(LAYOUT["pm_scroll"][1]))
+            time.sleep(2.2)
+            self.key("Escape", 1.0)
+        self.size_window(first, DEFAULT_WINDOW)
+        self.click(*LAYOUT["terminal"], 0.6)
+        self.shot("settings-closed", "the settings dialog is closed; the TEMP$ terminal fills the 800x600 window again")
 
-        # Shortcut editor: Keyboard Shortcuts -> Edit Keyboard Shortcuts.
+        # Shortcut editor: Keyboard Shortcuts -> Edit Keyboard Shortcuts -> New Advanced Shortcut.
+        self.size_window(first, ED_WINDOW)
+        self.click(*LAYOUT["terminal"], 0.6)
         self.key("ctrl+alt+k", 1.5)
-        self.shot("shortcuts", "the Keyboard Shortcuts dialog with the Edit Keyboard Shortcuts header button")
+        self.shot("shortcuts", "the Keyboard Shortcuts reference with the Edit Keyboard Shortcuts header button")
         self.click(*LAYOUT["cheat_edit"], 1.5)
-        self.shot("shortcut-editor", "the real Edit Keyboard Shortcuts editor: selector, source, text editor, New Binding/Record/Save/Reset")
+        self.shot("shortcut-editor", "the shortcut editor list: search, category groups with keycaps and source badges, + in the header bar")
+        self.scroll_down(LAYOUT["ed_scroll"], 200)
+        self.shot("shortcut-list-end", "the editor list scrolled to its end with New Advanced Shortcut as the last row")
+        self.click(*LAYOUT["ed_new_advanced"], 1.0)
         if self.args.explore:
+            self.shot("advanced-new", "the New Advanced Shortcut page with an empty raw keybind text view and Save in the header bar")
             for _ in range(3):
                 self.key("Escape", 0.8)
+            self.size_window(first, DEFAULT_WINDOW)
+            self.click(*LAYOUT["terminal"], 0.6)
             self.shot("explore-closed", "dialogs closed, the TEMP$ terminal is visible")
             self.key("ctrl+alt+q", 0.5)
             self.log(f"explore: ghostty exited with {self.wait_exit()}")
             return
-        self.click(*LAYOUT["ed_new_binding"], 0.8)
-        self.click(*LAYOUT["ed_text"], 0.5)
         self.type(BINDING)
-        self.shot("binding-typed", f"New Binding: the text editor holds {BINDING} before Save")
+        self.shot("binding-typed", f"New Advanced Shortcut: the raw text view holds {BINDING} before Save")
         self.click(*LAYOUT["ed_save"], 1.5)
-        self.shot("binding-saved", "after Save the editor reloads (first row selected again) and shows the status Keyboard shortcuts saved.")
+        self.shot("binding-saved", "back on the editor list, scrolled to the top, with the banner Keyboard shortcuts saved.")
         self.check("session1: the shortcut editor saved the binding to gui-settings.ghostty",
                    BINDING in self.overlay_text(), self.overlay_text())
         self.check("session1: the editors changed nothing but the profile and the binding (default command untouched)",
                    not any(line.startswith("command") for line in self.overlay_text().splitlines()), self.overlay_text())
         self.copy_state("after-editors")
-        self.click(*LAYOUT["ed_close"], 1.0)
-        self.click(*LAYOUT["cheat_close"], 1.0)
+        # List -> Escape closes the editor, Escape again the shortcut reference.
+        self.key("Escape", 0.8)
+        self.key("Escape", 0.8)
+        self.size_window(first, DEFAULT_WINDOW)
         self.click(*LAYOUT["terminal"], 0.6)
-        self.shot("dialogs-closed", "both dialogs are closed; the TEMP$ terminal is visible again")
+        self.shot("dialogs-closed", "both dialogs are closed; the TEMP$ terminal fills the 800x600 window again")
 
         # The saved binding launches the saved profile right away.
         known = {s["pid"] for s in self.shells()}

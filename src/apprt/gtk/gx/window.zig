@@ -430,31 +430,96 @@ fn actionView(action: *gio.SimpleAction, _: ?*glib.Variant, window: *Window) cal
     _ = core.performBindingAction(binding) catch |err| log.warn("cannot perform view action err={}", .{err});
 }
 
+/// The custom item of the main menu: zoom out, the zoom of the active
+/// terminal as a percentage (which resets it), zoom in, then find and full
+/// screen. The percentage is refreshed whenever the item is shown and after
+/// each zoom button press.
 fn addViewControls(popover: *gtk.PopoverMenu) void {
     if (popover.as(gobject.Object).getData(controls_key) != null) return;
     const box = gtk.Box.new(.horizontal, 6);
     _ = box.as(gobject.Object).refSink();
     box.as(gtk.Widget).setMarginStart(6);
     box.as(gtk.Widget).setMarginEnd(6);
-    const controls = [_]struct { action: [:0]const u8, label: ?[:0]const u8 = null, icon: ?[:0]const u8 = null, title: [:0]const u8 }{
-        .{ .action = "win.gx-zoom-out", .label = "−", .title = tr("Zoom Out") },
-        .{ .action = "win.gx-zoom-reset", .label = tr("Reset Zoom"), .title = tr("Reset Zoom") },
-        .{ .action = "win.gx-zoom-in", .label = "+", .title = tr("Zoom In") },
+    const zoom = gtk.Box.new(.horizontal, 0);
+    zoom.as(gtk.Widget).setHexpand(1);
+    const percent = gtk.Label.new("100%");
+    percent.setWidthChars(5);
+    percent.as(gtk.Widget).addCssClass("numeric");
+    const controls = [_]struct { action: [:0]const u8, icon: [:0]const u8, title: [:0]const u8, zoom: bool = false }{
+        .{ .action = "win.gx-zoom-out", .icon = "zoom-out-symbolic", .title = tr("Zoom Out"), .zoom = true },
+        .{ .action = "win.gx-zoom-reset", .icon = "", .title = tr("Reset Zoom"), .zoom = true },
+        .{ .action = "win.gx-zoom-in", .icon = "zoom-in-symbolic", .title = tr("Zoom In"), .zoom = true },
         .{ .action = "win.gx-find", .icon = "edit-find-symbolic", .title = tr("Find…") },
         .{ .action = "win.gx-fullscreen", .icon = "view-fullscreen-symbolic", .title = tr("Full Screen") },
     };
     for (controls) |control| {
-        const button = if (control.label) |label| gtk.Button.newWithLabel(label) else gtk.Button.newFromIconName(control.icon.?);
-        button.as(gtk.Widget).setTooltipText(control.title);
-        button.as(gtk.Widget).setHexpand(1);
+        const button = if (control.icon.len == 0) reset: {
+            const reset = gtk.Button.new();
+            reset.setChild(percent.as(gtk.Widget));
+            break :reset reset;
+        } else gtk.Button.newFromIconName(control.icon);
+        const widget = button.as(gtk.Widget);
+        widget.setTooltipText(control.title);
+        button.as(gtk.Accessible).updateProperty(.label, control.title.ptr, @as(c_int, -1));
         button.as(gtk.Actionable).setActionName(control.action);
-        box.append(button.as(gtk.Widget));
+        if (control.zoom) {
+            widget.addCssClass("flat");
+            if (control.icon.len != 0) widget.addCssClass("circular") else widget.setHexpand(1);
+            _ = gtk.Button.signals.clicked.connect(button, *gtk.Label, zoomClicked, percent, .{ .after = true });
+            zoom.append(widget);
+        } else {
+            widget.setHexpand(1);
+            box.append(widget);
+        }
     }
+    box.prepend(zoom.as(gtk.Widget));
+    _ = gtk.Widget.signals.map.connect(percent.as(gtk.Widget), ?*anyopaque, zoomMapped, null, .{});
     if (popover.addChild(box.as(gtk.Widget), menus.view_controls) != 0) {
         popover.as(gobject.Object).setDataFull(controls_key, box, &unrefObject);
     } else {
         box.unref();
     }
+}
+
+fn zoomClicked(_: *gtk.Button, percent: *gtk.Label) callconv(.c) void {
+    showZoom(percent);
+}
+
+fn zoomMapped(widget: *gtk.Widget, _: ?*anyopaque) callconv(.c) void {
+    showZoom(gobject.ext.cast(gtk.Label, widget) orelse return);
+}
+
+/// Shows the zoom of the active terminal of the window `percent` is in.
+fn showZoom(percent: *gtk.Label) void {
+    var buf: [16]u8 = undefined;
+    const value = zoomPercent(percent.as(gtk.Widget)) orelse 100;
+    percent.setText(std.fmt.bufPrintZ(&buf, "{d}%", .{value}) catch "100%");
+}
+
+fn zoomPercent(widget: *gtk.Widget) ?u32 {
+    const root = widget.getRoot() orelse return null;
+    const window = gobject.ext.cast(Window, root) orelse return null;
+    const surface = window.getActiveSurface() orelse return null;
+    const core = surface.core() orelse return null;
+    return zoomOf(core.font_size.points, core.config.original_font_size);
+}
+
+/// The zoom of a terminal at `points` whose configured font size is
+/// `original`, as a rounded percentage, or null without a valid size.
+pub fn zoomOf(points: f32, original: f32) ?u32 {
+    if (!(original > 0) or !(points > 0) or !std.math.isFinite(points / original)) return null;
+    return @intFromFloat(@round(@min(points / original * 100, 100_000)));
+}
+
+test "zoomOf rounds the font size ratio" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?u32, 100), zoomOf(12, 12));
+    try testing.expectEqual(@as(?u32, 108), zoomOf(13, 12));
+    try testing.expectEqual(@as(?u32, 92), zoomOf(11, 12));
+    try testing.expectEqual(@as(?u32, 200), zoomOf(24, 12));
+    try testing.expectEqual(@as(?u32, null), zoomOf(12, 0));
+    try testing.expectEqual(@as(?u32, null), zoomOf(0, 12));
+    try testing.expectEqual(@as(?u32, null), zoomOf(std.math.nan(f32), 12));
 }
 
 fn removeViewControls(popover: *gtk.PopoverMenu) void {

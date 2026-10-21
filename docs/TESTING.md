@@ -107,7 +107,7 @@ W01–W15 逐条对应 R0 的验收点，W16 起采集界面现状截图。R0 �
 GTK 的 GUI 可见改动在本机 Windows 上没有 GTK 桌面，截图证据来自下面两处，都要实际读图：
 
 - 本机 WSL：`just wsl build --gtk` 后 `just wsl smoke --out <Windows 目录>`（Xvfb，参数与 `gtk-smoke` 相同；`--lang`、`--xdotool`、`--config`、`--env`、`--settle` 按需），截图与日志复制回 Windows，读图后才记 PASS。它是 Ubuntu 24.04 上的证据，不代证 `gtk-smoke`。
-- 场景：`just wsl scenario --out <Windows 目录> [G01 …]` 逐个跑 `test/gui/gtk/G*.toml`（格式见 `test/gui/README.md`），每个场景一份配置、一段 xdotool 脚本、一次 smoke，日志命中 `forbid`（默认 `Theme parser error`、`css parsing failed`）即失败；`<id>/notes.txt` 列出读图要点，`SUMMARY.txt` 每个场景一行。G01 英文启动、G02 中文主菜单、G03 设置对话框、G04 快捷键速查表的搜索、G05 双标签加分屏、G06 浅色主题加命令面板；G07–G13 是主菜单、启动配置菜单、标签右键菜单、快捷键速查表与设置分页，G14 Ctrl 滚轮缩放字号，G15 把现有分屏移到新标签，G16 从启动配置菜单打开启动配置管理器。Xvfb 里没有窗口管理器，脚本先在终端里单击一次取得键盘焦点；也没有合成器，弹出菜单周围透明的阴影区画成黑色，不是渲染错误。
+- 场景：`just wsl scenario --out <Windows 目录> [G01 …]` 逐个跑 `test/gui/gtk/G*.toml`（格式见 `test/gui/README.md`），每个场景一份配置、一段 xdotool 脚本、一次 smoke，日志命中 `forbid`（默认 `Theme parser error`、`css parsing failed`）即失败；`<id>/notes.txt` 列出读图要点，`SUMMARY.txt` 每个场景一行。G01 英文启动、G02 中文主菜单、G03 设置对话框、G04 快捷键速查表的搜索、G05 双标签加分屏、G06 浅色主题加命令面板；G07–G13 是主菜单、启动配置菜单、标签右键菜单、快捷键速查表与设置分页，G14 Ctrl 滚轮缩放字号，G15 把现有分屏移到新标签，G16 从启动配置菜单打开设置 Shell 页的启动配置列表与编辑子页；G17、G23、G31 是快捷键编辑器的高级页、只读与录键流程，G30 是系统明暗与强调色切换。Xvfb 里没有窗口管理器，脚本先在终端里单击一次取得键盘焦点；也没有合成器，弹出菜单周围透明的阴影区画成黑色，不是渲染错误。
 - CI：手动触发 `gx-ci` 并打开 `gtk_smoke`，下载 artifact `gx-gtk-smoke-evidence` 读图；`gx-release` 的 `linux-gtk-noble` 另有 Ubuntu 24.04 测试包的截图（`evidence-linux-gtk-noble`）。
 - 读图之前一律记 PENDING：提交没 push、CI 没跑、artifact 还没下载或下载了没读，都不能记 PASS。
 

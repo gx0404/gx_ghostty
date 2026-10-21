@@ -6,11 +6,19 @@
  * Ghostty's css/style.css, below Ghostty's runtime CSS (+3) and the
  * gtk-custom-css files (USER), which both still override it. When the
  * window follows the terminal colors (window-theme = auto or ghostty), the
- * colors derived from the terminal theme are appended (src/gx/gtk_css.zig).
+ * colors derived from the terminal theme are appended (src/gx/gtk_css.zig);
+ * in high contrast only these rules load.
+ *
+ * The px values come from src/gx/ui_metrics.zig (GTK 4.14 parses no CSS
+ * variables): tabs and the terminal overlays round with radius.overlay,
+ * the signature bar is signature.bar thick, and the tab transitions take
+ * the durations and the ease curve of src/gx/motion.zig. The style.zig
+ * tests keep these literals in step with the Zig values.
  *
  * The rules select below the main window's toolbar view, which has the
  * gx-chrome class (src/apprt/gtk/gx/window.zig), so dialogs shown inside
- * the window keep their own look. Scrollbars keep the libadwaita sizes.
+ * the window keep their own look; only the gx-* classes of the Ghostty GX
+ * dialogs (badges) apply everywhere. Scrollbars keep the libadwaita sizes.
  */
 
 /* Rounded tabs, with the keyboard focus ring following the corners. */
@@ -18,6 +26,51 @@ toolbarview.gx-chrome tabbar tab,
 toolbarview.gx-chrome tabbar tabbox > tabboxchild,
 dnd tab {
   border-radius: 8px;
+}
+
+/*
+ * Tabs fade into hover (motion.duration.faster) and into the pressed state
+ * (motion.duration.fast) with the ease curve. GTK runs no CSS transitions
+ * while gtk-enable-animations is off; GHOSTTY_GX_ANIMATIONS=0 also turns
+ * them off (style.zig appends transition: none).
+ */
+toolbarview.gx-chrome tabbar tab {
+  transition: background-color 83ms cubic-bezier(0.33, 0, 0.67, 1);
+}
+
+toolbarview.gx-chrome tabbar tab:active {
+  transition-duration: 167ms;
+}
+
+/*
+ * The brand signature: a bar in the accent along the top of the selected
+ * tab, inside its rounded corners, also with a single tab. An inset shadow
+ * leaves the tab size and the hover and pressed fills alone. This is the
+ * fallback in libadwaita's accent; the GX colors replace it with an accent
+ * that keeps 3:1 on the tab.
+ */
+toolbarview.gx-chrome tabbar tab:selected,
+dnd tab {
+  box-shadow: inset 0 2px 0 0 @accent_bg_color;
+}
+
+/*
+ * The terminal overlays (find, key tables, resize and link hover) round
+ * like popovers. The link overlay keeps upstream's shape: only the corner
+ * away from the window edge it sits on is round.
+ */
+toolbarview.gx-chrome .search-overlay,
+toolbarview.gx-chrome .key-state-overlay,
+toolbarview.gx-chrome label.resize-overlay {
+  border-radius: 8px;
+}
+
+toolbarview.gx-chrome label.url-overlay.left {
+  border-radius: 0 8px 0 0;
+}
+
+toolbarview.gx-chrome label.url-overlay.right {
+  border-radius: 8px 0 0 0;
 }
 
 /*
@@ -34,4 +87,80 @@ toolbarview.gx-chrome > .bottom-bar.raised:not(.border) {
 toolbarview.gx-chrome .split paned > separator {
   min-width: 1px;
   min-height: 1px;
+}
+
+/*
+ * Badges of the Ghostty GX dialogs: a small pill after a row title that
+ * names where a value comes from (the shortcut editor's sources) or marks a
+ * row (the default launch profile). Neutral colors only, derived from the
+ * text color so they read on every surface; the modifier classes tell the
+ * sources apart by fill and outline.
+ */
+.gx-badge {
+  min-height: 20px;
+  padding: 0 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.gx-badge.gx-source-defaults {
+  color: alpha(currentColor, 0.6);
+  box-shadow: inset 0 0 0 1px alpha(currentColor, 0.15);
+}
+
+.gx-badge.gx-source-settings,
+.gx-badge.gx-advanced {
+  color: alpha(currentColor, 0.75);
+  box-shadow: inset 0 0 0 1px alpha(currentColor, 0.25);
+}
+
+.gx-badge.gx-source-user {
+  background-color: alpha(currentColor, 0.1);
+}
+
+.gx-badge.gx-source-cli {
+  background-color: alpha(currentColor, 0.18);
+}
+
+.gx-badge.gx-mark {
+  color: alpha(currentColor, 0.75);
+  background-color: alpha(currentColor, 0.1);
+}
+
+/* With libadwaita's accent class: accent text on a faint accent fill. */
+.gx-badge.gx-accent {
+  background-color: alpha(currentColor, 0.12);
+}
+
+/*
+ * The shortcut editor (src/apprt/gtk/gx/shortcut_editor.zig): the card
+ * that records a key combination takes an accent outline while it
+ * records and shows its keycaps at body size; the inline conflict notice
+ * is tinted with the warning color; the flag rows name the configuration
+ * prefixes in monospace. libadwaita's named colors follow the GX colors
+ * when the window follows the terminal.
+ */
+.gx-dialog .gx-record {
+  transition: box-shadow 83ms cubic-bezier(0.33, 0, 0.67, 1);
+}
+
+.gx-dialog .gx-record.gx-recording {
+  box-shadow: inset 0 0 0 2px @accent_bg_color;
+}
+
+.gx-dialog .gx-record-keys .keycap {
+  min-height: 28px;
+  min-width: 20px;
+  padding: 0 8px;
+  font-size: 14px;
+}
+
+.gx-dialog .gx-conflict {
+  background-color: alpha(@warning_bg_color, 0.12);
+  box-shadow: inset 0 0 0 1px alpha(@warning_bg_color, 0.5);
+}
+
+.gx-dialog .gx-flag .title > .title {
+  font-family: monospace;
 }

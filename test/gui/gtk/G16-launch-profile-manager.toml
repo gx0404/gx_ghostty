@@ -1,22 +1,75 @@
 id = "G16"
-title = "The launch-profile menu opens the real profile manager"
+title = "The launch-profile menu opens the Shell page of the settings with the profile list and editor"
 lang = "zh_CN"
 config = """
 command = direct:/bin/bash --noprofile --norc
 language = zh-CN
 gx-launch-profile = Demo=direct:/bin/bash --noprofile --norc
 keybind = ctrl+alt+n=gx:new_tab_menu
+keybind = ctrl+alt+p=gx:settings_page:shell
+keybind = ctrl+alt+r=reload_config
 """
-xdotool = """
-mousemove 400 300
-click 1
-key ctrl+alt+n
-sleep 0.5
-mousemove 90 500
-click 1
-sleep 1.5
-"""
+# The settings dialog is clamped by the window: in a 1100x600 window it is
+# 530 px tall whatever its own height, with its bottom edge at y=565. After
+# scrolling the Shell page to its end, the launch profile rows are counted
+# from that edge (Chinese rows are 61 px, the "new" row 54 px).
+script = '''
+BOTTOM = 565
+LIST_BOTTOM = BOTTOM - 24
+ROW = 61
+NEW_Y = LIST_BOTTOM - 27
+def row_y(k):
+    return LIST_BOTTOM - 54 - (k - 1) * ROW - ROW // 2
+def to_bottom():
+    xdo("mousemove", 550, 300)
+    xdo("click", "--repeat", 15, "--delay", 20, 5)
+    sleep(0.5)
+xdo("windowsize", window(), 1100, 600)
+sleep(1)
+xdo("mousemove", 400, 300, "click", 1)
+xdo("key", "ctrl+alt+n")
+sleep(0.5)
+capture("menu")
+# 编辑启动配置… with five profiles (GX Zsh, herdr, 登录 Shell, Bash, Demo).
+xdo("mousemove", 90, 500, "click", 1)
+sleep(1.5)
+capture("shell-page")
+to_bottom()
+capture("list")
+xdo("mousemove", 550, row_y(1), "click", 1)
+sleep(0.8)
+capture("readonly")
+xdo("key", "Escape")
+sleep(0.8)
+xdo("mousemove", 550, NEW_Y, "click", 1)
+sleep(0.8)
+capture("new")
+xdo("key", "Escape")
+sleep(0.8)
+xdo("key", "Escape")
+sleep(0.8)
+# A profile of the settings overlay opens editable.
+overlay = config_home / "ghostty/gui-settings.ghostty"
+overlay.write_text("gx-launch-profile = Mine=direct:/bin/bash --noprofile --norc -i\n")
+xdo("mousemove", 400, 300, "click", 1)
+xdo("key", "ctrl+alt+r")
+sleep(1.0)
+xdo("key", "ctrl+alt+p")
+sleep(1.0)
+to_bottom()
+xdo("mousemove", 550, row_y(1), "click", 1)
+sleep(0.9)
+capture("editable")
+xdo("key", "Escape")
+sleep(0.8)
+'''
 expect = [
   "G16.png: the private Chinese test window starts normally",
-  "G16-after.png: the real launch-profile manager is open with a profile selector, name and command fields, editing controls, and source/rename guidance",
+  "G16-menu.png: the new tab menu ends with 编辑启动配置…",
+  "G16-shell-page.png: the menu entry opened the settings on the Shell page (Shell selected) with 默认 Shell and, below it, the 启动配置 group with its description",
+  "G16-list.png: rows with a terminal icon, name and monospace command; Demo shows 来自配置文件 and a lock, the default profile the 默认 badge, the other rows a chevron; the last row is 新建启动配置",
+  "G16-readonly.png: the Demo subpage: title Demo, the neutral read-only banner 此启动配置来自配置文件，只读。, the 要修改… hint, name and command with locks and no edit icons, 设为默认 / 恢复默认 Shell rows and a dimmed 删除启动配置; no 保存 button",
+  "G16-new.png: the 新建启动配置 subpage with empty, focused 启动配置名称 and 启动命令 entries and an insensitive 保存 button",
+  "G16-editable.png: the subpage of the overlay profile Mine: 保存 in the header bar (insensitive until a change), the rename hint, editable 启动配置名称 and 启动命令 entries with the name focused, 设为默认, an insensitive 恢复默认 Shell and a red 删除启动配置",
+  "G16-after.png: back on the profile list with Mine as the last profile and its row focused",
 ]

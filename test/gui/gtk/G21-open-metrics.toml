@@ -12,6 +12,9 @@ keybind = ctrl+alt+s=gx:settings
 keybind = ctrl+alt+t=gx:settings_page:appearance
 """
 env = { GHOSTTY_GX_PERF = "1" }
+# The 920 x 680 settings dialog sits at (90, 30) in the 1100 x 740 window:
+# page tabs and the close button at y 52, the Light Theme row at y 180, and
+# on the theme subpage search, Revert and Apply at y 89.
 script = '''
 xdo("windowsize", window(), 1100, 740)
 xdo("mousemove", 400, 300, "click", 1)
@@ -35,7 +38,7 @@ assert text.count("info(gx_perf): settings.open.total ") == 4
 xdo("key", "ctrl+alt+t")
 sleep(0.5)
 capture("appearance")
-xdo("mousemove", 550, 170, "click", 1)
+xdo("mousemove", 550, 180, "click", 1)
 sleep(0.5)
 capture("themes")
 xdo("key", "Tab")
@@ -46,7 +49,7 @@ after = (evidence / "G21.log").read_text().count("info(gx_perf): metric theme.re
 save("-theme-reloads.json", json.dumps({"before":before,"after":after,"delta":after-before}))
 capture("theme-preview")
 assert after - before == 1, (before, after)
-xdo("mousemove", 755, 96, "click", 1)
+xdo("mousemove", 757, 89, "click", 1)
 sleep(0.5)
 reverted = (evidence / "G21.log").read_text().count("info(gx_perf): metric theme.reload ")
 capture("theme-reverted")
@@ -54,30 +57,31 @@ assert reverted == after + 1, (after, reverted)
 def theme_count():
     return (evidence / "G21.log").read_text().count("info(gx_perf): metric theme.reload ")
 def search_theme(query):
-    xdo("mousemove", 400, 96, "click", 1)
+    xdo("mousemove", 400, 89, "click", 1)
     xdo("key", "ctrl+a")
     xdo("type", "--delay", 1, query)
     sleep(0.8)
 search_theme("Blue Dolphin")
 assert theme_count() == reverted + 1
 applied = theme_count()
-xdo("mousemove", 845, 96, "click", 1)
+xdo("mousemove", 843, 89, "click", 1)
 sleep(0.6)
 assert theme_count() == applied, "saving an already applied preview must not double count"
-assert "theme = Blue Dolphin" in (config_home / "ghostty/gui-settings.ghostty").read_text()
+saved = (config_home / "ghostty/gui-settings.ghostty").read_text()
+assert "theme = light:Blue Dolphin,dark:GX Mocha" in saved, saved
 capture("theme-saved")
-xdo("mousemove", 987, 59, "click", 1)
+xdo("mousemove", 986, 52, "click", 1)
 sleep(0.5)
 assert theme_count() == applied
 xdo("mousemove", 400, 300, "click", 1)
 xdo("key", "ctrl+alt+t")
 sleep(0.5)
-xdo("mousemove", 550, 170, "click", 1)
+xdo("mousemove", 550, 180, "click", 1)
 sleep(0.5)
 search_theme("Adventure")
 assert theme_count() == applied + 1
 capture("unsaved-theme-preview")
-xdo("mousemove", 987, 59, "click", 1)
+xdo("mousemove", 986, 52, "click", 1)
 sleep(0.6)
 assert theme_count() == applied + 2, "closing an unsaved preview must count restoring the saved theme"
 capture("close-restores-theme")
@@ -109,7 +113,7 @@ expect = [
   "G21-appearance.png and G21-themes.png: the appearance section and theme browser",
   "G21-theme-preview.png: one preview applies after repeated Down events; the counter delta is exactly one",
   "G21-theme-reverted.png: the saved theme returns after Revert; the count increases once",
-  "G21-theme-saved.png: saving an already visible preview adds no duplicate count",
+  "G21-theme-saved.png: saving an already visible preview adds no duplicate count; the overlay holds theme = light:Blue Dolphin,dark:GX Mocha",
   "G21-unsaved-theme-preview.png and G21-close-restores-theme.png: close restores the saved theme and counts once",
   "G21-fallback-menu.png and G21-context-after-fallback.png: the titlebar-hidden fallback has one sample per open; ordinary context menu adds none",
   "All timings are diagnostic Debug samples, not a P4 performance-gate result",

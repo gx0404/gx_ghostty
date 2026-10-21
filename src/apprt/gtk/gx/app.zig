@@ -230,9 +230,9 @@ fn actionSettingsPage(
     _ = openSettingsPage(app, std.mem.span(value.getString(null)));
 }
 
+/// The launch profiles are edited on the Shell page of the settings dialog.
 fn actionLaunchProfiles(_: *gio.SimpleAction, _: ?*glib.Variant, app: *Application) callconv(.c) void {
-    const window = activeWindow(app) orelse return;
-    @import("launch_profiles_dialog.zig").present(app, window.as(gtk.Widget));
+    GxSettingsDialog.showPage(app, .shell);
 }
 
 fn actionOpenConfigFile(

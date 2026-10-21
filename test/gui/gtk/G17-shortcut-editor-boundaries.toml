@@ -6,6 +6,7 @@ command = direct:/bin/bash --noprofile --norc
 language = en
 confirm-close-surface = false
 env = HISTFILE=/dev/null
+keybind = clear
 keybind = ctrl+alt+k=gx:keybinds
 keybind = ctrl+alt+0=activate_key_table_once:r6
 keybind = ctrl+alt+m=gx:main_menu
@@ -13,6 +14,10 @@ keybind = ctrl+alt+s=gx:settings
 keybind = ctrl+alt+u=text:LOWER-BINDING
 keybind = ctrl+alt+l>u=text:LOWER-LEADER
 """
+# Coordinates follow the 1100x740 window: the editor dialog is centered and
+# 720x560 with Save at 828,112; the cheat sheet's edit button sits at
+# 730,110. New Advanced Shortcut is the last row of the list, so the list is
+# scrolled to its end first.
 script = '''
 xdo("windowsize", window(), 1100, 740)
 xdo("mousemove", 400, 300, "click", 1)
@@ -23,26 +28,34 @@ xdo("mousemove", 730, 110, "click", 1)
 sleep(1)
 capture("editor")
 overlay = config_home / "ghostty/gui-settings.ghostty"
-def click(x, y):
+def click(x, y, wait=0.25):
     xdo("mousemove", x, y, "click", 1)
-    sleep(0.25)
+    sleep(wait)
+def open_advanced():
+    xdo("mousemove", 550, 450)
+    xdo("click", "--repeat", 20, 5)
+    sleep(0.5)
+    if first[0]:
+        capture("scrolled")
+        first[0] = False
+    click(550, 598, 0.8)
+first = [True]
 def draft(text):
-    click(220, 537)
-    click(270, 310)
     for index, line in enumerate(text.splitlines()):
         if index:
             xdo("key", "Return")
         xdo("type", "--clearmodifiers", "--delay", 1, line)
     sleep(0.5)
 def save_binding():
-    click(495, 537)
-    sleep(0.5)
+    click(828, 112, 0.8)
+open_advanced()
 draft("r6/unconsumed:performable:ctrl+alt+x>y=text:R6-A\nchain=text:R6-B")
 capture("table-chain-flags-draft")
 save_binding()
 assert "r6/unconsumed:performable:ctrl+alt+x>y=text:R6-A" in overlay.read_text()
 assert "keybind = chain=text:R6-B\n" in overlay.read_text()
 capture("table-chain-flags-saved")
+open_advanced()
 draft("ctrl+alt+8=text:R6-RETRY")
 directory = overlay.parent
 directory.chmod(0o500)
@@ -59,25 +72,24 @@ assert "R6-RETRY" in overlay.read_text()
 assert "# R6 external edit must survive" in overlay.read_text()
 assert "ctrl+alt+9=ignore" in overlay.read_text()
 capture("retry-preserves-external-edit")
+open_advanced()
 draft("ctrl+alt+u=text:R6-CONFLICT")
 save_binding()
 capture("ordinary-conflict")
-xdo("key", "Escape")
-sleep(0.5)
 assert "R6-CONFLICT" not in overlay.read_text()
 capture("cancel-retains-draft")
-save_binding()
-click(630, 428)
-sleep(0.5)
+click(749, 465, 0.8)
 assert "R6-CONFLICT" in overlay.read_text()
 capture("ordinary-conflict-confirmed")
+open_advanced()
 draft("ctrl+alt+l=text:R6-PREFIX")
 save_binding()
 capture("leader-prefix-conflict")
+# Escape leaves the page without saving the draft.
 xdo("key", "Escape")
-sleep(0.5)
+sleep(0.6)
 assert "R6-PREFIX" not in overlay.read_text()
-# Closing without saving must not write the cancelled draft.
+capture("prefix-cancelled")
 xdo("key", "Escape")
 sleep(0.5)
 xdo("key", "Escape")
@@ -98,15 +110,17 @@ save("-overlay.txt", overlay.read_text())
 expect = [
   "G17.png: an isolated English Bash terminal",
   "G17-shortcuts.png: the shortcut reference and Edit Keyboard Shortcuts entry",
-  "G17-editor.png: source and advanced syntax are shown in the real editor",
-  "G17-table-chain-flags-draft.png: a named table, trigger sequence, flags and adjacent chain are visible",
-  "G17-table-chain-flags-saved.png: the editor reports a successful save",
+  "G17-editor.png: the editor list with categories, keycaps, source badges and the Advanced badge on the leader sequence",
+  "G17-scrolled.png: the list scrolled to New Advanced Shortcut",
+  "G17-table-chain-flags-draft.png: the advanced page holds a named table, trigger sequence, flags and adjacent chain",
+  "G17-table-chain-flags-saved.png: the list is back with the saved banner and the r6 Key Table section",
   "G17-save-failure-retains-draft.png: a save error is visible and R6-RETRY remains in the draft",
   "G17-retry-preserves-external-edit.png: retry succeeds; the overlay assertion retains unrelated external lines",
-  "G17-ordinary-conflict.png: confirmation explains replacement or leader overlap",
-  "G17-cancel-retains-draft.png: cancellation retains the unsaved R6-CONFLICT draft",
-  "G17-ordinary-conflict-confirmed.png: Save Anyway commits the replacement",
+  "G17-ordinary-conflict.png: the inline prompt names Send Text: LOWER-BINDING from the user configuration and offers Save Anyway",
+  "G17-cancel-retains-draft.png: without confirming, R6-CONFLICT stays in the draft and is not written",
+  "G17-ordinary-conflict-confirmed.png: Save Anyway commits the replacement and returns to the list",
   "G17-leader-prefix-conflict.png: replacing a leader prefix requires confirmation",
+  "G17-prefix-cancelled.png: Escape returned to the list without saving R6-PREFIX",
   "G17-confirmed-key-runs.png: the real key writes R6-CONFLICT into the terminal",
   "G17-table-chain-runs.png and G17-after.png: entering table r6 and its sequence executes both R6-A and R6-B actions",
 ]

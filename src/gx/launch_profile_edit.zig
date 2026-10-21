@@ -130,6 +130,39 @@ pub fn commit(alloc: std.mem.Allocator, io: std.Io, path: []const u8, edit: Edit
     try latest.save(io, path);
 }
 
+/// Where a listed launch profile comes from, which decides whether the
+/// settings UI can edit it.
+pub const Source = enum {
+    /// A `gx-launch-profile` entry the settings overlay owns: editable.
+    overlay,
+    /// A shell detected on this system (not a `custom:` profile).
+    detected,
+    /// A `gx-launch-profile` entry of the user's configuration files.
+    config_file,
+    /// A `gx-launch-profile` entry of the command line, which wins.
+    command_line,
+    /// Editing is off (no Ghostty GX layers, or they cannot be read).
+    disabled,
+};
+
+/// The source of the listed profile `id` (`custom:<name>` for
+/// `gx-launch-profile` entries) for `policy` and the overlay's raw
+/// `gx-launch-profile` values.
+pub fn source(policy: Policy, values: []const []const u8, id: []const u8) Source {
+    if (!policy.enabled) return .disabled;
+    const name = std.mem.cutPrefix(u8, id, "custom:") orelse return .detected;
+    if (!policy.editable(name)) return .command_line;
+    return if (owned(values, name) != null) .overlay else .config_file;
+}
+
+/// Whether a draft differs from what it was opened with: a new profile
+/// (`old_name` null) once anything is typed, an existing one once its name
+/// or its overlay-owned command (`expected`) changed.
+pub fn draftChanged(old_name: ?[]const u8, expected: ?[]const u8, name: []const u8, command: []const u8) bool {
+    const old = old_name orelse return name.len > 0 or command.len > 0;
+    return !std.mem.eql(u8, old, name) or !equalOptional(expected, command);
+}
+
 test "profile edits preserve unrelated latest values reset markers and comments" {
     const testing = std.testing;
     var overlay = try Overlay.parse(testing.allocator, "# note\ngx-launch-profile = Old=old-command\ngx-launch-profile =\ngx-launch-profile = Old=current-command\ngx-launch-profile = External=external-command\nunknown = keep\n");
@@ -203,4 +236,30 @@ test "profile commit rereads externally added entries and preserves the file aft
     const after = try tmp.dir.readFileAlloc(io, "gui-settings.ghostty", testing.allocator, .limited(8192));
     defer testing.allocator.free(after);
     try testing.expectEqualStrings(before, after);
+}
+
+test "profile source tells overlay config command-line detected and disabled entries apart" {
+    const testing = std.testing;
+    const values: []const []const u8 = &.{ "Gone=sh", "", "Mine=sh", "Again=sh" };
+    try testing.expectEqual(Source.overlay, source(.{}, values, "custom:Mine"));
+    try testing.expectEqual(Source.overlay, source(.{}, values, "custom:Again"));
+    // A reset marker hides earlier overlay entries, so a lower source shows.
+    try testing.expectEqual(Source.config_file, source(.{}, values, "custom:Gone"));
+    try testing.expectEqual(Source.config_file, source(.{}, values, "custom:Lower"));
+    try testing.expectEqual(Source.detected, source(.{}, values, "gx-zsh"));
+    try testing.expectEqual(Source.command_line, source(.{ .cli_names = &.{"Mine"} }, values, "custom:Mine"));
+    try testing.expectEqual(Source.command_line, source(.{ .cli_all = true }, values, "custom:Lower"));
+    try testing.expectEqual(Source.disabled, source(.{ .enabled = false }, values, "custom:Mine"));
+    try testing.expectEqual(Source.disabled, source(.{ .enabled = false }, values, "bash"));
+}
+
+test "profile draft changes compare against the opened name and owned command" {
+    const testing = std.testing;
+    try testing.expect(!draftChanged(null, null, "", ""));
+    try testing.expect(draftChanged(null, null, "A", ""));
+    try testing.expect(draftChanged(null, null, "", "sh"));
+    try testing.expect(!draftChanged("A", "sh", "A", "sh"));
+    try testing.expect(draftChanged("A", "sh", "B", "sh"));
+    try testing.expect(draftChanged("A", "sh", "A", "bash"));
+    try testing.expect(draftChanged("A", null, "A", "sh"));
 }

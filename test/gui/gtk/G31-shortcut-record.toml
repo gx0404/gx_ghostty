@@ -1,0 +1,94 @@
+id = "G31"
+title = "Shortcut editor records a key combination, cancels with Escape, clears with Backspace and saves the override"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+env = HISTFILE=/dev/null
+keybind = ctrl+alt+k=gx:keybinds
+keybind = ctrl+alt+u=text:LOWER-BINDING
+"""
+# Coordinates follow the 1100x740 window: the editor dialog is centered and
+# 720x560; the cheat sheet's Edit Keyboard Shortcuts button sits at 730,110.
+script = '''
+overlay = config_home / "ghostty/gui-settings.ghostty"
+def click(x, y, wait=0.4):
+    xdo("mousemove", x, y, "click", 1)
+    sleep(wait)
+xdo("windowsize", window(), 1100, 740)
+sleep(1)
+click(400, 300)
+xdo("key", "ctrl+alt+k")
+sleep(1)
+click(730, 110, 1)
+capture("list")
+xdo("type", "--delay", 40, "LOWER")
+sleep(0.6)
+capture("filtered")
+click(400, 266, 1)
+capture("edit")
+# The action list searches by title; Escape closes it and keeps the page.
+click(550, 187, 0.6)
+xdo("type", "--delay", 40, "copy")
+sleep(0.6)
+capture("action-search")
+# libadwaita's list search takes one Escape for the query, one to close.
+xdo("key", "Escape")
+sleep(0.4)
+xdo("key", "Escape")
+sleep(0.4)
+capture("action-closed")
+# Recording: held modifiers show with a pending keycap, Escape keeps the
+# old combination.
+click(550, 392)
+xdo("keydown", "ctrl+alt")
+sleep(0.4)
+capture("recording-held")
+xdo("keyup", "ctrl+alt")
+xdo("key", "Escape")
+sleep(0.4)
+capture("escape-cancels")
+assert not overlay.exists() or "ctrl+alt+j" not in overlay.read_text()
+# Backspace clears the combination; saving then asks for one.
+click(550, 392)
+xdo("key", "BackSpace")
+sleep(0.4)
+click(828, 112)
+capture("backspace-cleared")
+assert not overlay.exists() or "LOWER-BINDING" not in overlay.read_text()
+click(550, 392)
+xdo("key", "ctrl+alt+j")
+sleep(0.4)
+capture("recorded")
+click(828, 112, 1)
+text = overlay.read_text()
+assert "keybind = ctrl+alt+u=unbind\n" in text, text
+assert "keybind = ctrl+alt+j=text:LOWER-BINDING\n" in text, text
+capture("saved")
+# Escape clears the search, closes the editor, then the cheat sheet.
+for _ in range(3):
+    xdo("key", "Escape")
+    sleep(0.5)
+click(400, 300)
+xdo("key", "ctrl+alt+j")
+sleep(0.3)
+xdo("key", "ctrl+alt+u")
+sleep(0.5)
+capture("recorded-key-runs")
+save("-overlay.txt", overlay.read_text())
+'''
+expect = [
+  "G31.png: an isolated English Bash terminal",
+  "G31-list.png: the Edit Keyboard Shortcuts list grouped by category, with keycaps and neutral source badges",
+  "G31-filtered.png: the query LOWER leaves the Send Text: LOWER-BINDING row from the user configuration",
+  "G31-edit.png: the structured page with action Send Text, parameter LOWER-BINDING, recorder showing Ctrl + Alt + U and the four flags",
+  "G31-action-search.png: the action list popover filters to the Copy actions while Send Text stays selected",
+  "G31-action-closed.png: Escape closed only the action list; the edit page with Send Text is still open",
+  "G31-recording-held.png: the recorder is in recording state (accent prompt) and shows Ctrl + Alt + … while the modifiers are held",
+  "G31-escape-cancels.png: Escape stopped recording and Ctrl + Alt + U is back",
+  "G31-backspace-cleared.png: Backspace cleared the combination (Not set) and saving asks to record one first",
+  "G31-recorded.png: Ctrl + Alt + J is recorded",
+  "G31-saved.png: the list is back with the Keyboard shortcuts saved banner; the filtered row now shows Ctrl + Alt + J with the Settings badge",
+  "G31-recorded-key-runs.png and G31-after.png: Ctrl+Alt+J types LOWER-BINDING and the unbound Ctrl+Alt+U types nothing",
+]

@@ -1580,9 +1580,9 @@ python -m unittest scripts.test_fork_patches -v
 
 ## GX-0058 GTK 内嵌图标改用 Ghostty GX 图标
 
-- 文件：`src/apprt/gtk/build/gresource.zig`；active，不回馈上游。`file_inputs` 的 1x/2x 两行用 begin/end 块包住，`genIcons` 的两处 `source` 各有一行单行标记；只换 PNG 来源目录，资源别名、图标名（`com.mitchellh.ghostty`）与 `icon_sizes` 不变。
+- 文件：`src/apprt/gtk/build/gresource.zig`；active，不回馈上游。`file_inputs` 的 1x/2x 两行用 begin/end 块包住，`genIcons` 的两处 `source` 各有一行单行标记，1x/2x 各追加一条 `ghostty-gx` 别名的 begin/end 块；换 PNG 来源目录，并把同一组 PNG 再登记为图标名 `ghostty-gx`，原资源别名、图标名（`com.mitchellh.ghostty`）与 `icon_sizes` 不变。
 - 原因：Ghostty 维护者要求非官方构建不用 Ghostty 品牌（同 GX-0026）。GTK 窗口按应用 ID `com.mitchellh.ghostty` 找图标，gresource 里内嵌的是 `images/gnome/` 的幽灵图标，Ubuntu 24.04 上 GX Shell 的 Ghostty GX 因此在窗口与切换器里显示上游图标；gresource 只能经这个构建期生成器选定来源，没有构建参数可替换。
-- 行为：gresource 改从 `dist/linux/gx/icons/<N>.png` 内嵌 16～1024 像素的 1x 与 2x 图标（2048 为 1024@2），这些 PNG 由 `scripts/gx_icon.py` 与 Windows 的 `ghostty-gx.ico` 同一图案生成；GX Shell 的 deb stage（`scripts/gx_package.py`）用同一组 PNG 作启动器图标 `com.gx0404.ghostty-gx`。上游的 `images/gnome/`、`zig build install` 安装的 hicolor 图标、Flatpak/Snap 与 Debian 13 tarball 都不变：装了上游 hicolor 图标的系统，图标主题查找仍可能先命中上游幽灵图标（共用应用 ID 的已知限制），所以 GX 的关于对话框继续不显示 logo。
-- 同步：上游改 `icon_sizes` 或图标来源时取上游版本，再把两处 `file_inputs` 与两处 `source` 指回 `dist/linux/gx/icons/` 并保留标记；新增尺寸要同步加进 `scripts/gx_icon.py::LINUX_SIZES`（含 2x）并重新生成。
+- 行为：gresource 改从 `dist/linux/gx/icons/<N>.png` 内嵌 16～1024 像素的 1x 与 2x 图标（2048 为 1024@2），这些 PNG 由 `scripts/gx_icon.py` 与 Windows 的 `ghostty-gx.ico` 同一图案生成；GX Shell 的 deb stage（`scripts/gx_package.py`）用同一组 PNG 作启动器图标 `com.gx0404.ghostty-gx`。上游的 `images/gnome/`、`zig build install` 安装的 hicolor 图标、Flatpak/Snap 与 Debian 13 tarball 都不变：装了上游 hicolor 图标的系统，图标主题查找仍可能先命中上游幽灵图标（共用应用 ID 的已知限制），所以 GX 的关于对话框与设置的关于页不用应用 ID，而用只在 gresource 里存在的图标名 `ghostty-gx` 显示 logo。
+- 同步：上游改 `icon_sizes` 或图标来源时取上游版本，再把两处 `file_inputs` 与两处 `source` 指回 `dist/linux/gx/icons/`、补回两条 `ghostty-gx` 别名并保留标记；新增尺寸要同步加进 `scripts/gx_icon.py::LINUX_SIZES`（含 2x）并重新生成。
 - 移除条件：Ghostty GX 不再发布 Linux GTK 程序，或改用独立应用 ID 与自有资源前缀后，删除改动与标记，登记改为 removed。
 - 验证：`python scripts/gx_icon.py --check`；`python scripts/run_unittests.py test_gx_icon test_gx_package test_fork_patches`（`test_gx_icon` 锁定四处来源路径、`icon_sizes` 与 2x 都在 `LINUX_SIZES` 里，`test_gx_package` 锁定 deb 图标与渲染一致）；GTK 构建 `just wsl build --gtk` 后在 Xvfb 场景或真实 Ubuntu 24.04 桌面截图确认窗口图标，Dock/Activities 的启动器图标须在装好 GX Shell deb 的 GNOME 上验收，Xvfb 截图不能代替。

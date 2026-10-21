@@ -1,0 +1,176 @@
+id = "G30"
+title = "The accent color choice follows into the GTK colors, in the light and the dark system mode"
+lang = "en"
+config = """
+command = direct:/bin/bash --noprofile --norc
+language = en
+confirm-close-surface = false
+env = HISTFILE=/dev/null
+keybind = ctrl+alt+t=gx:settings_page:appearance
+"""
+# Xvfb has no settings portal, so libadwaita sees no system preference and
+# the default theme pair (light:GX Latte,dark:GX Mocha) starts light. The dark
+# half restarts Ghostty with ADW_DEBUG_COLOR_SCHEME=prefer-dark, libadwaita's
+# debug override of the system color scheme (read at startup, so the mode is
+# not switched while running). The accent is read from the Blinking Cursor
+# switch, whose track is drawn in the accent color: Ghostty GX Purple has
+# more red than green, the themes' blue more green than red.
+script = '''
+import os
+import struct
+import zlib
+
+overlay = config_home / "ghostty" / "gui-settings.ghostty"
+
+def overlay_text():
+    return overlay.read_text() if overlay.exists() else ""
+
+def pixel(label, x, y):
+    data = (evidence / ("G30-" + label + ".png")).read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", label
+    pos, idat, width = 8, b"", 0
+    while pos < len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            width, _, depth, color, _, _, interlace = struct.unpack(">IIBBBBB", body)
+            assert depth == 8 and color in (2, 6) and interlace == 0, (depth, color, interlace)
+            bpp = 3 if color == 2 else 4
+        elif kind == b"IDAT":
+            idat += body
+        pos += 12 + length
+    raw = zlib.decompress(idat)
+    stride = width * bpp
+    previous = bytearray(stride)
+    for row in range(y + 1):
+        start = row * (stride + 1)
+        kind, line = raw[start], bytearray(raw[start + 1:start + 1 + stride])
+        for i in range(stride):
+            a = line[i - bpp] if i >= bpp else 0
+            b = previous[i]
+            c = previous[i - bpp] if i >= bpp else 0
+            if kind == 1:
+                line[i] = (line[i] + a) & 255
+            elif kind == 2:
+                line[i] = (line[i] + b) & 255
+            elif kind == 3:
+                line[i] = (line[i] + (a + b) // 2) & 255
+            elif kind == 4:
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        previous = line
+    return tuple(previous[x * bpp:x * bpp + 3])
+
+# The 920-wide dialog sits at (90, 36) in the 1100 x 740 window, its page
+# tabs in the header bar at y 58. Scrolled to the top, the accent combo row
+# is at y 371; scrolled to the bottom, the Blinking Cursor switch at y 575.
+def scroll(button):
+    xdo("mousemove", 550, 400)
+    xdo("click", "--repeat", 12, "--delay", 40, button)
+    sleep(0.5)
+
+def open_appearance():
+    xdo("windowsize", window(), 1100, 740)
+    sleep(0.5)
+    xdo("mousemove", 400, 300, "click", 1)
+    xdo("key", "ctrl+alt+t")
+    sleep(1.0)
+    scroll(4)
+
+def choose_accent(index, label):
+    scroll(4)
+    xdo("mousemove", 750, 371, "click", 1)
+    sleep(0.8)
+    capture(label + "-popover")
+    xdo("mousemove", 805, 416 + 35 * index, "click", 1)
+    sleep(1.5)
+
+def accent(label):
+    scroll(5)
+    capture(label)
+    color = pixel(label, 786, 575)
+    background = pixel(label, 210, 300)
+    save("-" + label + ".txt", "switch %02x%02x%02x dialog %02x%02x%02x\n" % (color + background))
+    scroll(4)
+    return color, background
+
+def purple(color):
+    return color[0] > color[1] + 20
+
+def blue(color):
+    return color[1] > color[0] + 20
+
+def run(mode):
+    open_appearance()
+    capture(mode + "-01-brand")
+    color, background = accent(mode + "-02-brand-switch")
+    assert purple(color), (mode, color)
+    assert (min(background) > 200) if mode == "light" else (max(background) < 90), (mode, background)
+    choose_accent(1, mode + "-03")
+    text = overlay_text()
+    save("-" + mode + "-overlay-theme.txt", text)
+    assert "gx-accent-color = theme" in text, text
+    capture(mode + "-04-theme")
+    color, _ = accent(mode + "-05-theme-switch")
+    assert blue(color), (mode, color)
+    choose_accent(0, mode + "-06")
+    text = overlay_text()
+    save("-" + mode + "-overlay-brand.txt", text)
+    assert "gx-accent-color = brand" in text, text
+    color, _ = accent(mode + "-07-brand-again")
+    assert purple(color), (mode, color)
+    xdo("mousemove", 897, 58, "click", 1)
+    sleep(0.8)
+    capture(mode + "-08-about")
+    xdo("key", "Escape")
+    sleep(0.8)
+
+run("light")
+os.environ["ADW_DEBUG_COLOR_SCHEME"] = "prefer-dark"
+restart()
+run("dark")
+
+# A color of its own in the configuration file is shown read-only.
+with (config_home / "ghostty" / "config.ghostty").open("a") as config:
+    config.write("gx-accent-color = #e5a50a\n")
+overlay.write_text(overlay_text().replace("gx-accent-color = brand\n", ""))
+restart()
+open_appearance()
+capture("dark-09-custom-read-only")
+
+# The same in Chinese.
+with (config_home / "ghostty" / "config.ghostty").open("a") as config:
+    config.write("language = zh-CN\n")
+xdo("key", "Escape")
+sleep(0.8)
+restart()
+open_appearance()
+capture("dark-10-zh-appearance")
+xdo("mousemove", 856, 58, "click", 1)
+sleep(0.8)
+capture("dark-11-zh-about")
+xdo("key", "Escape")
+sleep(0.8)
+log = (evidence / "G30.log").read_text()
+assert "CRITICAL" not in log and "Theme parser error" not in log and "css parsing failed" not in log
+'''
+expect = [
+  "G30.png: the isolated terminal in light mode before the settings open",
+  "G30-light-01-brand.png: the light (GX Latte) Appearance page; the Accent Color group shows Ghostty GX Purple with the line Stays Ghostty GX purple whatever the theme.",
+  "G30-light-02-brand-switch.png and G30-light-02-brand-switch.txt: scrolled to the bottom, the Blinking Cursor switch is purple",
+  "G30-light-03-popover.png: the accent popover lists Ghostty GX Purple (checked) and From the Theme",
+  "G30-light-overlay-theme.txt: gx-accent-color = theme",
+  "G30-light-04-theme.png: the row shows From the Theme with the line Takes the accent color of the current theme.; the Settings saved toast",
+  "G30-light-05-theme-switch.png and its .txt: the Blinking Cursor switch turned the theme's blue at once, without a reload toast",
+  "G30-light-06-popover.png and G30-light-overlay-brand.txt: choosing Ghostty GX Purple again writes gx-accent-color = brand",
+  "G30-light-07-brand-again.png and its .txt: the switch is purple again",
+  "G30-dark-01-brand.png: after the restart with ADW_DEBUG_COLOR_SCHEME=prefer-dark the dialog and terminal are dark (GX Mocha), the accent row shows Ghostty GX Purple",
+  "G30-dark-02-brand-switch.png and its .txt: the dark dialog background and a light purple switch",
+  "G30-dark-03-popover.png, G30-dark-overlay-theme.txt, G30-dark-04-theme.png and G30-dark-05-theme-switch.png: From the Theme is saved and the switch turns the Mocha blue",
+  "G30-dark-06-popover.png, G30-dark-overlay-brand.txt and G30-dark-07-brand-again.png: Ghostty GX Purple is saved and shown again",
+  "G30-light-08-about.png and G30-dark-08-about.png: the About page in light and dark: the GX logo, Ghostty GX, the version in a badge with accent text on a faint accent fill, the notice, the configuration and settings file rows",
+  "G30-dark-09-custom-read-only.png: with gx-accent-color = #e5a50a in the configuration file the combo row is gone; the read-only Accent Color row shows the lock, Custom Color and #e5a50a · From the configuration file, no reset button",
+  "G30-dark-10-zh-appearance.png: in Chinese the read-only row reads 强调色, #e5a50a · 来自配置文件 and 自定义颜色 with the lock",
+  "G30-dark-11-zh-about.png: the dark Chinese About page: logo, Ghostty GX, version badge, the Chinese notice and 配置文件 / 设置文件 rows",
+]

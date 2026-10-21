@@ -25,14 +25,18 @@
 - GX 模糊搜索增加全拼匹配（例如 `zhongwen` 找到「中文」，ü 用 v 输入，原文字母仍优先），数据来自钉版 pinyin-data 0.15.0 离线生成。
 - Windows 设置浮层选中分区的图标改用 Microsoft Fluent UI System Icons 的实心图形（钉版官方 SVG 离线生成，许可随包）；未选中的分区与图形不可用时仍用系统字形。
 - Windows 弹层可以试用 DirectComposition 呈现：设环境变量 `GHOSTTY_GX_POPUP_DCOMP=1`（只认这个值，默认关闭）；初始化或设备重置失败时退回原来的绘制方式，终端渲染不受影响。
-- GTK：快捷键编辑器（键表、按键序列、标志与动作链）与启动配置管理器（新建、编辑、改名、删除自定义启动配置并设默认），都只写 `gui-settings.ghostty`，命令行与其他配置文件提供的条目只读，保存失败保留草稿；`gx:move_split_to_tab`、`gx:move_split_to_window` 把现有分屏连同其终端移到新标签或新窗口，不重启 shell；第一个普通窗口按上次正常关闭时的大小打开，并恢复最大化（`window-save-state = never`、显式的 `window-width`/`window-height`、`maximize` 或 `fullscreen` 优先，不记屏幕位置）。
+- GTK：快捷键编辑器（按类别列出全部快捷键并标出来源；编辑页选动作、录键、开关标志、填参数并内联提示冲突；键表、按键序列与动作链在高级页用配置语法编辑）与设置 Shell 页里的启动配置列表（新建、编辑、改名、删除自定义启动配置并设默认，菜单「编辑启动配置…」直接打开该页），都只写 `gui-settings.ghostty`，命令行与其他配置文件提供的条目只读，保存失败保留草稿；`gx:move_split_to_tab`、`gx:move_split_to_window` 把现有分屏连同其终端移到新标签或新窗口，不重启 shell；第一个普通窗口按上次正常关闭时的大小打开，并恢复最大化（`window-save-state = never`、显式的 `window-width`/`window-height`、`maximize` 或 `fullscreen` 优先，不记屏幕位置）。
 - Windows 弹层输入框（查找栏、命令面板、快捷键速查表与设置浮层的搜索框）的编辑能力：撤销与重做（Ctrl+Z、Alt+Backspace 撤销，Ctrl+Y、Ctrl+Shift+Z 重做）、按词移动与删除（Ctrl+←/→、Ctrl+Backspace、Ctrl+Delete，连续的汉字算一个词）、Shift+Insert / Ctrl+Insert / Shift+Delete、双击选词与三击全选；插入符按系统频率闪烁，且只在输入框获得焦点时显示。
 - Windows 命令面板与设置浮层（主题、字体列表）的过滤支持拼音首字母（例如输入 `zt` 能找到「主题」），多个词按任意顺序匹配，全角字母数字按半角匹配；名称以输入开头或完全相同的条目排在前面。
 - 新配置键 `gx-prompt-cursor`（`config` 默认、`bar`）：选择 shell 集成在提示符处显示配置的光标样式，还是像上游一样显示竖线；只影响之后启动的 shell。
 - 开发框架：`just win-gui`（Windows GUI 场景回放与截图取证，场景在 `test/gui/win32/`）、`just wsl scenario`（GTK 场景，在 `test/gui/gtk/`）、`just perf`（新旧构建交替测启动、新建标签、分屏与缩放耗时，报中位数与 p90）、`just pinyin` / `just pinyin-check`（拼音首字母表的生成与校验，`pinyin-check` 并入 `framework-check` 与 `generated-check`）；设 `GHOSTTY_GX_PERF=1` 时日志输出 `info(gx_perf)` 耗时打点；`gx-ci` 的 `windows-app` 与 `gtk-smoke` 增跑 GX 层单测。
 
+- Ghostty GX 品牌外观：新配置键 `gx-accent-color`（默认 `brand` 为 GX 紫，`theme` 沿用主题的强调色，也可写具体颜色，均按背景保证对比度），链接用 GX 蓝；新增浅色内置主题 GX Latte，默认 `theme = light:GX Latte,dark:GX Mocha`，随系统明暗切换。GTK 活动标签顶部有 2 px 强调色签名条，设置外观页可选强调色，设置关于页与关于对话框显示 Ghostty GX 图标（独立图标名 `ghostty-gx`，不会被上游图标替换）。
+
 ### Changed
 
+- GX Mocha 前景改为 `#cdd6f4`，亮色 9–14 改用 Catppuccin 的新值，背景 `#1f1f28` 不变。
+- GTK 外观：查找、调整尺寸、链接与按键表浮层改用主题的表面、文字与边框颜色，响铃边框、子进程退出提示与错误进度条改用主题的警告、成功与危险色（高对比度下保持系统配色）；标签悬停与按下有短过渡（`GHOSTTY_GX_ANIMATIONS=0` 关闭）；主题明暗成对且 `window-theme = system` 时也套用 GX 配色。主菜单的缩放改为图标按钮，中间显示当前终端的缩放百分比，点击复位；关于对话框改用 MIT 许可条目，图形后端移到故障排查信息，链接不再重复。
 - Windows 主菜单与设置弹层按窗口隐藏复用；首帧、配置、语言、DPI 或启动配置变化后，在消息队列空闲时按界面单元逐个预排版，单元之间检查输入并让出，预排版不主动读文件。配置变化会重建隐藏宿主，启动配置探测结果变化只刷新数据；主题预览期间不逐步重建所有隐藏宿主。
 - Windows 窗口最小宽度为 510 DIP，进程提权且显示管理员标记时为 538 DIP，以容纳活动标签与溢出控件；较窄的已保存窗口和较小的 `window-width` 会被放宽，可能减少可用贴靠分栏组合。控件按 DPI 逐项取整，会话恢复先放宽尺寸再移入工作区。
 - GTK 设置对话框关闭后按窗口保留并在下次打开时复用；配置、语言或主题变化时重新构建，重开主题子页与 Shell 页会重新发现新增条目。

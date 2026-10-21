@@ -59,6 +59,7 @@ const Application = @import("../class/application.zig").Application;
 const open_perf = @import("open_perf.zig");
 const dialog_cache = @import("dialog_cache.zig");
 const gx_launch = @import("launch.zig");
+const launch_profiles_page = @import("launch_profiles_page.zig");
 
 const settings_map = gx.settings_map;
 const msg = settings_map.msg;
@@ -123,6 +124,9 @@ const page_rows = 10;
 
 /// The languages of the language row, in display order.
 const languages = std.enums.values(gx.i18n.Language);
+
+/// The accent color choices of the accent row, in display order.
+const accents = std.enums.values(settings_map.Accent);
 
 /// The material presets of the material row, in display order.
 const materials = std.enums.values(settings_map.Material);
@@ -287,6 +291,11 @@ pub const GxSettingsDialog = extern struct {
         theme_row: *adw.ActionRow,
         theme_light_row: *adw.ActionRow,
         theme_dark_row: *adw.ActionRow,
+        accent_group: *adw.PreferencesGroup,
+        accent_row: *adw.ComboRow,
+        accent_custom_row: *adw.ActionRow,
+        accent_custom_label: *gtk.Label,
+        accent_reset_button: *gtk.Button,
         material_group: *adw.PreferencesGroup,
         material_row: *adw.ComboRow,
         opacity_row: *adw.ComboRow,
@@ -322,8 +331,11 @@ pub const GxSettingsDialog = extern struct {
         shell_group: *adw.PreferencesGroup,
         shell_row: *adw.ComboRow,
         about_page: *adw.PreferencesPage,
+        about_header_group: *adw.PreferencesGroup,
+        about_name: *gtk.Label,
+        about_version: *gtk.Label,
+        about_notice: *gtk.Label,
         about_group: *adw.PreferencesGroup,
-        version_row: *adw.ActionRow,
         config_path_row: *adw.ActionRow,
         open_folder_button: *gtk.Button,
         open_config_button: *gtk.Button,
@@ -394,7 +406,10 @@ pub const GxSettingsDialog = extern struct {
         config_handler: c_ulong = 0,
 
         /// The values of the combo rows, kept across language changes,
-        /// which rebuild their models.
+        /// which rebuild their models. A null `accent` is a color of its
+        /// own, `accent_color`, which the read-only accent row shows.
+        accent: ?settings_map.Accent = .brand,
+        accent_color: CoreConfig.Color = .{ .r = 0, .g = 0, .b = 0 },
         material: settings_map.Material = .solid,
         opacity: OpacityValue = .{ .choice = .automatic },
         cursor_style: settings_map.CursorStyle = .block,
@@ -456,6 +471,9 @@ pub const GxSettingsDialog = extern struct {
 
         /// The herdr executable, if herdr was detected.
         herdr: ?[:0]const u8 = null,
+
+        /// The launch profile section of the Shell page.
+        launch_profiles: ?*launch_profiles_page.Section = null,
 
         /// The window that keeps the dialog (`kept_dialogs`); none for a
         /// dialog in a window of its own, which every opening builds anew.
@@ -648,6 +666,8 @@ pub const GxSettingsDialog = extern struct {
             priv.shell_page,
             priv.about_page,
         }) |preferences| preferences.scrollToTop();
+        // launch profile section
+        if (priv.state.launch_profiles) |section| section.refresh();
         self.as(adw.Dialog).setFocus(null);
     }
 
@@ -711,6 +731,8 @@ pub const GxSettingsDialog = extern struct {
         self.syncValues(config, .{ .font_family = true });
         steps.step("settings.load.values");
         self.loadAbout();
+        // launch profile section
+        st.launch_profiles = launch_profiles_page.Section.create(st.alloc, app, self.as(adw.PreferencesDialog), priv.shell_page) catch null;
         if (!st.layered) self.disableEditing();
         self.applyTexts();
         steps.step("settings.load.texts");
@@ -884,6 +906,12 @@ pub const GxSettingsDialog = extern struct {
 
         if (sync.theme) self.setSavedTheme(config.theme) else if (sync.saved_theme) self.refreshSavedTheme();
 
+        const accent_config = config.@"gx-accent-color";
+        const accent = settings_map.Accent.fromConfig(accent_config);
+        const accent_color: CoreConfig.Color = switch (accent_config) {
+            .color => |color| color,
+            .brand, .theme => .{ .r = 0, .g = 0, .b = 0 },
+        };
         const opacity = config.@"background-opacity";
         const material = settings_map.Material.fromConfig(opacity, config.@"background-blur".enabled());
         const opacity_value: OpacityValue = if (settings_map.Opacity.fromConfig(opacity, self.configured("background-opacity"))) |choice|
@@ -898,12 +926,16 @@ pub const GxSettingsDialog = extern struct {
             self.configured("window-padding-x") or self.configured("window-padding-y"),
         )) |preset| .{ .preset = preset } else .{ .custom = .{ .x = padding_x, .y = padding_y } };
 
-        const combos_changed = st.material != material or
+        const combos_changed = st.accent != accent or
+            !std.meta.eql(st.accent_color, accent_color) or
+            st.material != material or
             !st.opacity.eql(opacity_value) or
             st.cursor_style != config.@"cursor-style" or
             !st.padding.eql(padding_value) or
             st.right_click != config.@"right-click-action" or
             st.close_confirmation != config.@"confirm-close-surface";
+        st.accent = accent;
+        st.accent_color = accent_color;
         st.material = material;
         st.opacity = opacity_value;
         st.cursor_style = config.@"cursor-style";
@@ -912,6 +944,7 @@ pub const GxSettingsDialog = extern struct {
         st.close_confirmation = config.@"confirm-close-surface";
         if (combos_changed) self.fillCombos();
 
+        priv.accent_reset_button.as(gtk.Widget).setVisible(@intFromBool(self.overlaySets(settings_map.Accent.key)));
         setSwitch(priv.cursor_blink_row, config.@"cursor-style-blink" orelse true);
         setSwitch(priv.scrollbar_row, config.scrollbar == .system);
         setSwitch(priv.focus_follows_mouse_row, config.@"focus-follows-mouse");
@@ -1136,6 +1169,18 @@ pub const GxSettingsDialog = extern struct {
             for (languages) |lang| model.append(lang.nativeName());
             priv.language_row.setModel(model.as(gio.ListModel));
             priv.language_row.setSelected(@intCast(std.mem.indexOfScalar(gx.i18n.Language, languages, st.lang) orelse 0));
+        }
+
+        {
+            const model = gtk.StringList.new(null);
+            defer model.unref();
+            for (accents) |accent| model.append(self.tr(accent.label()));
+            priv.accent_row.setModel(model.as(gio.ListModel));
+            const accent = st.accent orelse .brand;
+            priv.accent_row.setSelected(@intCast(std.mem.indexOfScalar(settings_map.Accent, accents, accent) orelse 0));
+            // A color of its own is shown, not chosen (`settings_map.Accent`).
+            priv.accent_row.as(gtk.Widget).setVisible(@intFromBool(st.accent != null));
+            priv.accent_custom_row.as(gtk.Widget).setVisible(@intFromBool(st.accent == null));
         }
 
         {
@@ -1379,6 +1424,7 @@ pub const GxSettingsDialog = extern struct {
         for ([_]*adw.PreferencesGroup{
             priv.language_group,
             priv.theme_group,
+            priv.accent_group,
             priv.material_group,
             priv.cursor_group,
             priv.padding_group,
@@ -1391,12 +1437,14 @@ pub const GxSettingsDialog = extern struct {
 
         const pages = [_]struct { *adw.PreferencesPage, []const *adw.PreferencesGroup }{
             .{ priv.language_page, &.{priv.language_group} },
-            .{ priv.appearance_page, &.{ priv.theme_group, priv.material_group, priv.cursor_group, priv.padding_group } },
+            .{ priv.appearance_page, &.{ priv.theme_group, priv.accent_group, priv.material_group, priv.cursor_group, priv.padding_group } },
             .{ priv.font_page, &.{ priv.font_size_group, priv.font_family_group } },
             .{ priv.interaction_page, &.{ priv.interaction_group, priv.bell_group } },
             .{ priv.shell_page, &.{priv.shell_group} },
             .{ priv.about_page, &.{ priv.about_group, priv.settings_file_group } },
         };
+        // launch profile section: kept read-only and below the notice.
+        defer if (priv.state.launch_profiles) |section| section.setEditable(false);
         for (pages, &priv.state.layering_banners) |entry, *slot| {
             const page, const groups = entry;
             for (groups) |group| {
@@ -1503,6 +1551,13 @@ pub const GxSettingsDialog = extern struct {
         priv.theme_list.as(gtk.Accessible).updateProperty(.label, self.tr(msg.theme).ptr, @as(c_int, -1));
         priv.theme_subpage.setTitle(self.tr(themeTitle(st.target)));
 
+        priv.accent_group.setTitle(self.tr(msg.accent_color));
+        priv.accent_group.setDescription(self.tr(msg.accent_color_hint));
+        setTitle(priv.accent_row, self.tr(msg.accent_color));
+        setTitle(priv.accent_custom_row, self.tr(msg.accent_color));
+        priv.accent_custom_label.setText(self.tr(settings_map.Accent.custom_label));
+        setIconLabel(priv.accent_reset_button, self.tr(msg.reset_to_default));
+
         priv.material_group.setDescription(self.tr(msg.material_hint));
         setTitle(priv.material_row, self.tr(msg.window_material));
         setTitle(priv.opacity_row, self.tr(msg.opacity));
@@ -1537,12 +1592,13 @@ pub const GxSettingsDialog = extern struct {
         priv.shell_group.setDescription(self.tr(msg.default_shell_hint));
         setTitle(priv.shell_row, self.tr(msg.default_shell));
 
-        priv.about_group.setDescription(self.tr(msg.notice));
-        setTitle(priv.version_row, self.tr(msg.app_name));
+        priv.about_name.setText(self.tr(msg.app_name));
+        priv.about_version.setText(build_config.version_string);
         if (self.fill(st.alloc, msg.version, .{ .version = build_config.version_string })) |version| {
             defer st.alloc.free(version);
-            priv.version_row.setSubtitle(version);
+            priv.about_version.as(gtk.Accessible).updateProperty(.label, version.ptr, @as(c_int, -1));
         } else |_| {}
+        priv.about_notice.setText(self.tr(msg.notice));
         setTitle(priv.config_path_row, self.tr(msg.config_file));
         priv.open_config_button.setLabel(self.tr(msg.open_config_file));
         setIconLabel(priv.open_folder_button, self.tr(text.open_folder));
@@ -1556,6 +1612,8 @@ pub const GxSettingsDialog = extern struct {
         const config = app.getConfig();
         defer config.unref();
         self.updateNotes(config.get());
+        // launch profile section
+        if (st.launch_profiles) |section| section.applyTexts();
     }
 
     fn setTitle(row: anytype, title: [:0]const u8) void {
@@ -1588,6 +1646,12 @@ pub const GxSettingsDialog = extern struct {
             self.setNote(row, name, self.fromCli(&.{"theme"}));
         }
         setPlainNote(priv.language_row, if (self.fromCli(&.{"language"})) cli else "");
+        self.setNote(
+            priv.accent_row,
+            self.tr(settings_map.accentHint(st.accent orelse .brand)),
+            self.fromCli(&.{settings_map.Accent.key}),
+        );
+        self.updateAccentCustomNote();
         self.setNote(priv.material_row, "", self.fromCli(&.{ "background-opacity", "background-blur" }));
         self.setNote(priv.opacity_row, self.tr(msg.opacity_hint), self.fromCli(&.{"background-opacity"}));
         setPlainNote(priv.cursor_style_row, if (self.fromCli(&.{"cursor-style"})) cli else "");
@@ -1634,6 +1698,24 @@ pub const GxSettingsDialog = extern struct {
 
     fn setPlainNote(row: anytype, note: [:0]const u8) void {
         row.as(adw.ActionRow).setSubtitle(note);
+    }
+
+    /// The color of its own the read-only accent row shows, and the layer
+    /// that sets it.
+    fn updateAccentCustomNote(self: *Self) void {
+        const priv = self.private();
+        const st = &priv.state;
+        if (st.accent != null) return;
+        const color = st.accent_color;
+        var buf: [96]u8 = undefined;
+        const layer: ?gx.config_layers.Layer = if (st.layers) |*layers| layers.provenance(settings_map.Accent.key) else null;
+        const note = std.fmt.bufPrintZ(&buf, "#{x:0>2}{x:0>2}{x:0>2} · {s}", .{
+            color.r,
+            color.g,
+            color.b,
+            self.tr(settings_map.provenanceLabel(layer)),
+        }) catch return;
+        priv.accent_custom_row.setSubtitle(note);
     }
 
     fn updateShellSubtitle(self: *Self) void {
@@ -1927,6 +2009,13 @@ pub const GxSettingsDialog = extern struct {
         if (st.disposed) return;
         if (!st.applying) st.stale = true;
         if (!st.shown) return;
+        // launch profile section: the list, and the default shell row after
+        // a profile becomes the default, follow the configuration.
+        if (st.launch_profiles) |section| section.refresh();
+        if (!st.applying and st.changes.isEmpty() and !st.apply_pending) {
+            st.shells_loaded = false;
+            self.loadShells();
+        }
         const config = app.getConfig();
         defer config.unref();
         if (st.changes.isEmpty() and !st.apply_pending) {
@@ -2453,6 +2542,25 @@ pub const GxSettingsDialog = extern struct {
         self.queuePreview(preview_delay_ms);
     }
 
+    fn accentSelected(row: *adw.ComboRow, _: *gobject.ParamSpec, self: *Self) callconv(.c) void {
+        if (!self.recording()) return;
+        const st = &self.private().state;
+        // The read-only row shows a color of its own; the hidden choices
+        // do not replace it.
+        if (st.accent == null) return;
+        const index = row.getSelected();
+        if (index >= accents.len) return;
+        st.accent = accents[index];
+        self.queueSet(settings_map.Accent.key, accents[index].value());
+        self.setNote(row, self.tr(settings_map.accentHint(accents[index])), self.fromCli(&.{settings_map.Accent.key}));
+    }
+
+    fn accentResetClicked(button: *gtk.Button, self: *Self) callconv(.c) void {
+        if (!self.recording()) return;
+        button.as(gtk.Widget).setVisible(0);
+        self.queueReset(settings_map.Accent.key);
+    }
+
     fn materialSelected(row: *adw.ComboRow, _: *gobject.ParamSpec, self: *Self) callconv(.c) void {
         if (!self.recording()) return;
         const index = row.getSelected();
@@ -2734,6 +2842,9 @@ pub const GxSettingsDialog = extern struct {
             st.toast = null;
             item.unref();
         }
+        // launch profile section
+        if (st.launch_profiles) |section| section.destroy();
+        st.launch_profiles = null;
 
         gtk.Widget.disposeTemplate(
             self.as(gtk.Widget),
@@ -2800,6 +2911,11 @@ pub const GxSettingsDialog = extern struct {
             class.bindTemplateChildPrivate("theme_row", .{});
             class.bindTemplateChildPrivate("theme_light_row", .{});
             class.bindTemplateChildPrivate("theme_dark_row", .{});
+            class.bindTemplateChildPrivate("accent_group", .{});
+            class.bindTemplateChildPrivate("accent_row", .{});
+            class.bindTemplateChildPrivate("accent_custom_row", .{});
+            class.bindTemplateChildPrivate("accent_custom_label", .{});
+            class.bindTemplateChildPrivate("accent_reset_button", .{});
             class.bindTemplateChildPrivate("material_group", .{});
             class.bindTemplateChildPrivate("material_row", .{});
             class.bindTemplateChildPrivate("opacity_row", .{});
@@ -2835,8 +2951,11 @@ pub const GxSettingsDialog = extern struct {
             class.bindTemplateChildPrivate("shell_group", .{});
             class.bindTemplateChildPrivate("shell_row", .{});
             class.bindTemplateChildPrivate("about_page", .{});
+            class.bindTemplateChildPrivate("about_header_group", .{});
+            class.bindTemplateChildPrivate("about_name", .{});
+            class.bindTemplateChildPrivate("about_version", .{});
+            class.bindTemplateChildPrivate("about_notice", .{});
             class.bindTemplateChildPrivate("about_group", .{});
-            class.bindTemplateChildPrivate("version_row", .{});
             class.bindTemplateChildPrivate("config_path_row", .{});
             class.bindTemplateChildPrivate("open_folder_button", .{});
             class.bindTemplateChildPrivate("open_config_button", .{});
@@ -2857,6 +2976,8 @@ pub const GxSettingsDialog = extern struct {
             class.bindTemplateCallback("page_changed", &pageChanged);
             class.bindTemplateCallback("language_selected", &languageSelected);
             class.bindTemplateCallback("theme_row_activated", &themeRowActivated);
+            class.bindTemplateCallback("accent_selected", &accentSelected);
+            class.bindTemplateCallback("accent_reset_clicked", &accentResetClicked);
             class.bindTemplateCallback("material_selected", &materialSelected);
             class.bindTemplateCallback("opacity_selected", &opacitySelected);
             class.bindTemplateCallback("cursor_style_selected", &cursorStyleSelected);
@@ -3671,4 +3792,59 @@ test "System Default names GX Zsh unless command is configured" {
     try testing.expectEqualStrings("/bin/sh -l", st.default_command);
     _ = dialog.as(adw.Dialog).close();
     try testing.expect(testWaitDialog(dialog, false));
+}
+
+test "the accent row saves a choice and shows a color of its own read-only" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fs.path.join(alloc, &.{ root, gx.gui_settings.file_name });
+    defer alloc.free(path);
+    var config = try CoreConfig.default(alloc);
+    defer config.deinit();
+    var backend: TestBackend = .{ .path = path, .config = &config };
+    const dialog = try testDialog();
+    defer dialog.unref();
+    const priv = dialog.private();
+    priv.state.test_backend = &backend;
+    dialog.reopen(&config, .appearance);
+    priv.state.loading = false;
+
+    // The default is the brand purple, chosen on the visible combo row.
+    try testing.expect(priv.accent_row.as(gtk.Widget).getVisible() != 0);
+    try testing.expect(priv.accent_custom_row.as(gtk.Widget).getVisible() == 0);
+    try testing.expectEqual(@as(c_uint, 0), priv.accent_row.getSelected());
+
+    priv.accent_row.setSelected(1);
+    try testing.expectEqualStrings(
+        dialog.tr(settings_map.accentHint(.theme)),
+        std.mem.span(priv.accent_row.as(adw.ActionRow).getSubtitle().?),
+    );
+    try testing.expect(dialog.saveNow());
+    {
+        var overlay = try gx.gui_settings.Overlay.load(alloc, testing.io, path);
+        defer overlay.deinit();
+        try testing.expectEqualStrings("theme", overlay.get(settings_map.Accent.key).?);
+    }
+    try testing.expectEqual(@as(?settings_map.Accent, .theme), priv.state.accent);
+    try testing.expectEqual(@as(c_uint, 1), priv.accent_row.getSelected());
+
+    // A color of its own is shown read-only and no choice replaces it.
+    var custom = try config.clone(alloc);
+    defer custom.deinit();
+    custom.@"gx-accent-color" = .{ .color = .{ .r = 0xe5, .g = 0xa5, .b = 0x0a } };
+    dialog.syncValues(&custom, .{});
+    try testing.expect(priv.accent_row.as(gtk.Widget).getVisible() == 0);
+    try testing.expect(priv.accent_custom_row.as(gtk.Widget).getVisible() != 0);
+    const subtitle = std.mem.span(priv.accent_custom_row.as(adw.ActionRow).getSubtitle().?);
+    try testing.expect(std.mem.startsWith(u8, subtitle, "#e5a50a"));
+    priv.accent_row.setSelected(0);
+    try testing.expect(priv.state.changes.isEmpty());
+
+    // Back to a choice, the combo row returns.
+    dialog.syncValues(&config, .{});
+    try testing.expect(priv.accent_row.as(gtk.Widget).getVisible() != 0);
+    try testing.expect(priv.accent_custom_row.as(gtk.Widget).getVisible() == 0);
 }

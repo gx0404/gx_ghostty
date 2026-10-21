@@ -386,6 +386,46 @@ pub fn apply(alloc: std.mem.Allocator, overlay: *Overlay, current: []const Entry
     overlay.* = replacement;
 }
 
+/// Whether `entry` is one key combination with one action in the root
+/// table, which a structured editor can show and write back without loss.
+pub fn isSimple(entry: Entry) bool {
+    return entry.key.table.len == 0 and entry.key.triggers.len == 1 and
+        entry.key.triggers[0].key != .catch_all and entry.actions.len == 1;
+}
+
+/// The first entry of `current` that saving `draft` would replace or
+/// overlap, as `hasConflict` checks; null when there is none.
+pub fn firstConflict(draft: Draft, current: []const Entry, ignored: ?Key) ?usize {
+    for (draft.targets) |desired| for (current, 0..) |entry, index| {
+        if (ignored) |key| if (key.equal(entry.key)) continue;
+        if (overlaps(desired, .{ .key = entry.key })) return index;
+    };
+    return null;
+}
+
+/// `values` with the binding of `key` (its keybind value and the `chain=`
+/// values right after it) replaced by `replacement`, and later bindings of
+/// the same key dropped; `replacement` is appended when no value binds
+/// `key`. Other values keep their order.
+pub fn replaceBinding(alloc: std.mem.Allocator, values: []const []const u8, key: Key, replacement: []const []const u8) ![]const []const u8 {
+    var result: std.ArrayList([]const u8) = .empty;
+    var replaced = false;
+    var skipping = false;
+    for (values) |value| {
+        if (skipping and std.mem.startsWith(u8, value, "chain=")) continue;
+        skipping = false;
+        const affected = target(alloc, value) catch null;
+        if (affected) |found| if (found == .key and found.key.equal(key)) {
+            if (!replaced) try result.appendSlice(alloc, replacement);
+            replaced = true;
+            skipping = true;
+            continue;
+        };
+        try result.append(alloc, value);
+    }
+    if (!replaced) try result.appendSlice(alloc, replacement);
+    return result.toOwnedSlice(alloc);
+}
 test "native tables flags chains catch_all and ignore roundtrip without display loss" {
     const testing = std.testing;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -475,4 +515,53 @@ test "allocation failure leaves the original overlay intact" {
             };
         }
     }.check, .{});
+}
+
+test "isSimple accepts only one root key with one action" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var native: Config.Keybinds = .{};
+    for ([_][]const u8{ "ctrl+a=new_tab", "ctrl+b>c=new_tab", "copy/ctrl+d=new_tab", "ctrl+e=text:a", "chain=text:b", "catch_all=ignore" }) |value| try native.parseCLI(alloc, value);
+    var simple: usize = 0;
+    for (try enumerate(alloc, &native)) |entry| {
+        if (!isSimple(entry)) continue;
+        simple += 1;
+        try testing.expectEqualStrings("ctrl+a", try formatKey(alloc, entry.key));
+    }
+    try testing.expectEqual(@as(usize, 1), simple);
+}
+
+test "replaceBinding swaps one binding with its chain and keeps the rest" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const key = (try target(alloc, "ctrl+b=new_tab")).?.key;
+    const values: []const []const u8 = &.{ "ctrl+a=unbind", "ctrl+b=text:x", "chain=text:y", "ctrl+c=new_tab", "ctrl+b=new_window" };
+    const replaced = try replaceBinding(alloc, values, key, &.{"ctrl+alt+b=new_tab"});
+    try testing.expectEqual(@as(usize, 3), replaced.len);
+    try testing.expectEqualStrings("ctrl+a=unbind", replaced[0]);
+    try testing.expectEqualStrings("ctrl+alt+b=new_tab", replaced[1]);
+    try testing.expectEqualStrings("ctrl+c=new_tab", replaced[2]);
+    const appended = try replaceBinding(alloc, &.{"ctrl+a=unbind"}, key, &.{"ctrl+b=new_tab"});
+    try testing.expectEqual(@as(usize, 2), appended.len);
+    try testing.expectEqualStrings("ctrl+b=new_tab", appended[1]);
+}
+
+test "firstConflict names the overlapped entry and skips the edited one" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var native: Config.Keybinds = .{};
+    try native.parseCLI(alloc, "ctrl+a>ctrl+b=new_tab");
+    try native.parseCLI(alloc, "ctrl+x=new_window");
+    const entries = try enumerate(alloc, &native);
+    const draft = try parseValues(alloc, &.{"ctrl+x=close_surface"});
+    const index = firstConflict(draft, entries, null).?;
+    try testing.expectEqualStrings("ctrl+x", try formatKey(alloc, entries[index].key));
+    try testing.expectEqual(@as(?usize, null), firstConflict(draft, entries, entries[index].key));
+    try testing.expect(firstConflict(try parseValues(alloc, &.{"ctrl+a=ignore"}), entries, null) != null);
 }

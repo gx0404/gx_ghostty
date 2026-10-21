@@ -40,7 +40,9 @@ test {
     _ = @import("split_transfer.zig");
     _ = @import("window_state.zig");
     _ = @import("session.zig");
-    _ = @import("launch_profiles_dialog.zig");
+    _ = @import("launch_profiles_page.zig");
     _ = @import("shortcut_editor.zig");
+    _ = @import("keycaps.zig");
     _ = @import("tab_actions.zig");
+    _ = @import("about.zig");
 }

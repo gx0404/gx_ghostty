@@ -8,7 +8,11 @@
 //! callback), which upstream does only once in
 //! `Application.startupStyleManager`. While the system asks for high
 //! contrast, only the static rules load and libadwaita's high contrast
-//! style keeps its colors.
+//! style keeps its colors. `GHOSTTY_GX_ANIMATIONS=0` (`motion.env_override`)
+//! appends `no_motion_css` to the static rules; otherwise the tab
+//! transitions follow `gtk-enable-animations`, as all GTK CSS transitions
+//! do (turning them on against the system setting would need that setting
+//! changed for the whole app, which the override does not do).
 const std = @import("std");
 const adw = @import("adw");
 const gdk = @import("gdk");
@@ -18,6 +22,8 @@ const gtk = @import("gtk");
 
 const configpkg = @import("../../../config.zig");
 const gtk_css = @import("../../../gx/gtk_css.zig");
+const motion = @import("../../../gx/motion.zig");
+const ui_metrics = @import("../../../gx/ui_metrics.zig");
 const gtk_version = @import("../gtk_version.zig");
 const CoreConfig = configpkg.Config;
 
@@ -29,6 +35,31 @@ pub const priority = gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2;
 
 /// The static rules, independent of the configuration.
 pub const static_css = @embedFile("style.css");
+
+/// Appended to the static rules when `GHOSTTY_GX_ANIMATIONS` turns
+/// animations off.
+pub const no_motion_css =
+    \\/* GHOSTTY_GX_ANIMATIONS turns animations off. */
+    \\toolbarview.gx-chrome tabbar tab,
+    \\.gx-dialog .gx-record {
+    \\  transition: none;
+    \\}
+    \\
+;
+
+/// The static rules: `static_css`, with `no_motion_css` unless
+/// `animations`.
+pub fn staticRules(animations: bool) []const u8 {
+    return if (animations) static_css else static_css ++ no_motion_css;
+}
+
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// False when `GHOSTTY_GX_ANIMATIONS` turns animations off.
+fn animationsAllowed() bool {
+    const value = getenv(motion.env_override) orelse return true;
+    return motion.parseOverride(std.mem.span(value)) orelse true;
+}
 
 const alloc = std.heap.c_allocator;
 
@@ -59,6 +90,10 @@ pub const Style = struct {
 
     /// Whether `apply` ran before.
     applied: bool = false,
+
+    /// False when `GHOSTTY_GX_ANIMATIONS` turns animations off, read once
+    /// with the provider.
+    animations: bool = true,
 
     /// Loads the stylesheet for `config`, adding the provider to the
     /// default display the first time, and applies `window-theme`.
@@ -107,7 +142,10 @@ pub const Style = struct {
         if (!self.ensureProvider()) return;
         var out: std.Io.Writer.Allocating = .fromArrayList(alloc, &self.sheet);
         out.clearRetainingCapacity();
-        writeCss(&out.writer, config, gtk_version.runtimeAtLeast(4, 16, 0)) catch {
+        writeCss(&out.writer, config, .{
+            .variables = gtk_version.runtimeAtLeast(4, 16, 0),
+            .animations = self.animations,
+        }) catch {
             log.warn("out of memory writing the Ghostty GX stylesheet, using the static rules", .{});
             out.clearRetainingCapacity();
         };
@@ -121,7 +159,7 @@ pub const Style = struct {
     /// language) leave the stylesheet as it was.
     fn reload(self: *Style) void {
         const provider = self.provider orelse return;
-        const css = stylesheet(self.sheet.items, self.high_contrast);
+        const css = stylesheet(self.sheet.items, self.high_contrast, self.animations);
         const hash = stylesheetHash(css);
         if (self.loaded == hash) {
             log.debug("Ghostty GX stylesheet unchanged, not reloaded", .{});
@@ -153,6 +191,7 @@ pub const Style = struct {
         gtk.StyleContext.addProviderForDisplay(display, provider.as(gtk.StyleProvider), priority);
         self.provider = provider;
         self.loaded = null;
+        self.animations = animationsAllowed();
 
         const manager = adw.StyleManager.getDefault();
         self.high_contrast = manager.getHighContrast() != 0;
@@ -222,21 +261,29 @@ fn circularScheme(config: *const CoreConfig) bool {
     };
 }
 
-/// Writes the whole stylesheet for `config`: the static rules, then the
-/// colors when the window follows the terminal colors, as libadwaita named
-/// colors and, with `variables` (GTK 4.16 and newer), also as the CSS
-/// variables of libadwaita 1.6 and newer.
-pub fn writeCss(writer: *std.Io.Writer, config: *const CoreConfig, variables: bool) std.Io.Writer.Error!void {
-    try writer.writeAll(static_css);
+pub const Options = struct {
+    /// Also write the CSS variables of libadwaita 1.6 and newer (GTK 4.16
+    /// and newer).
+    variables: bool = false,
+    /// False to stop the tab transitions (`no_motion_css`).
+    animations: bool = true,
+};
+
+/// Writes the whole stylesheet for `config`: the static rules
+/// (`staticRules`), then the colors when the window follows the terminal
+/// colors, as libadwaita named colors and, with `variables`, also as the
+/// CSS variables of libadwaita 1.6 and newer.
+pub fn writeCss(writer: *std.Io.Writer, config: *const CoreConfig, options: Options) std.Io.Writer.Error!void {
+    try writer.writeAll(staticRules(options.animations));
     const colors = gtk_css.fromConfig(config) orelse return;
     try gtk_css.write(writer, colors);
-    if (variables) try gtk_css.writeVariables416(writer, colors);
+    if (options.variables) try gtk_css.writeVariables416(writer, colors);
 }
 
 /// The stylesheet to load: `sheet` (from `writeCss`), or only the static
 /// rules in high contrast or when `sheet` could not be written.
-pub fn stylesheet(sheet: []const u8, high_contrast: bool) []const u8 {
-    return if (high_contrast or sheet.len == 0) static_css else sheet;
+pub fn stylesheet(sheet: []const u8, high_contrast: bool, animations: bool) []const u8 {
+    return if (high_contrast or sheet.len == 0) staticRules(animations) else sheet;
 }
 
 /// The hash `Style` compares to skip loading the stylesheet it holds.
@@ -249,7 +296,7 @@ const testing = std.testing;
 fn generate(config: *const CoreConfig, variables: bool) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     errdefer out.deinit();
-    try writeCss(&out.writer, config, variables);
+    try writeCss(&out.writer, config, .{ .variables = variables });
     return out.toOwnedSlice();
 }
 
@@ -285,14 +332,94 @@ test "high contrast loads only the static rules" {
     defer config.deinit();
     const css = try generate(&config, false);
     defer testing.allocator.free(css);
-    try testing.expectEqualStrings(css, stylesheet(css, false));
-    try testing.expectEqualStrings(static_css, stylesheet(css, true));
+    try testing.expectEqualStrings(css, stylesheet(css, false, true));
+    try testing.expectEqualStrings(static_css, stylesheet(css, true, true));
     // A stylesheet that could not be written falls back to the static rules.
-    try testing.expectEqualStrings(static_css, stylesheet("", false));
+    try testing.expectEqualStrings(static_css, stylesheet("", false, true));
+    // Animations stay off in high contrast too.
+    try testing.expect(std.mem.endsWith(u8, stylesheet(css, true, false), no_motion_css));
 }
+
+test "GHOSTTY_GX_ANIMATIONS=0 stops the tab transitions" {
+    var config = try CoreConfig.default(testing.allocator);
+    defer config.deinit();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeCss(&out.writer, &config, .{ .animations = false });
+    const css = out.written();
+    try testing.expect(std.mem.startsWith(u8, css, static_css ++ no_motion_css));
+    // The GX colors follow and do not bring transitions back.
+    try testing.expect(std.mem.indexOf(u8, css[static_css.len + no_motion_css.len ..], "transition") == null);
+    try testing.expectEqualStrings(static_css, staticRules(true));
+}
+
+/// The px values of every `property: …;` declaration in `css`, in order,
+/// with each declaration's values ending in a null.
+fn pxValues(css: []const u8, property: []const u8, out: []?f32) ![]?f32 {
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, css, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " ");
+        if (!std.mem.startsWith(u8, trimmed, property)) continue;
+        const value = std.mem.trimEnd(u8, trimmed[property.len..], ";");
+        var parts = std.mem.tokenizeScalar(u8, value, ' ');
+        while (parts.next()) |part| {
+            const number = if (std.mem.endsWith(u8, part, "px")) part[0 .. part.len - 2] else part;
+            out[n] = try std.fmt.parseFloat(f32, number);
+            n += 1;
+        }
+        out[n] = null;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+fn hasText(comptime fmt: []const u8, args: anytype) !bool {
+    var buf: [256]u8 = undefined;
+    return std.mem.indexOf(u8, static_css, try std.fmt.bufPrint(&buf, fmt, args)) != null;
+}
+
+test "the static px values and transitions come from ui_metrics and motion" {
+    // Every corner radius is a ui_metrics radius, 0 (the link overlay's
+    // square corners) or the badge pill (half its height).
+    var buf: [64]?f32 = undefined;
+    const radii = try pxValues(static_css, "border-radius:", &buf);
+    try testing.expect(radii.len > 0);
+    var overlay_corners: usize = 0;
+    for (radii) |value| {
+        const v = value orelse continue;
+        if (v == ui_metrics.radius.overlay) overlay_corners += 1;
+        try testing.expect(v == 0 or v == ui_metrics.radius.control or v == ui_metrics.radius.overlay or
+            v == ui_metrics.radius.window or v == badge_height / 2);
+    }
+    // The tabs (with their focus ring and the dragged tab), the find, key
+    // table and resize overlays, and one corner of each link overlay.
+    try testing.expectEqual(@as(usize, 4), overlay_corners);
+    try testing.expect(try hasText("dnd tab {{\n  border-radius: {d}px;", .{ui_metrics.radius.overlay}));
+    try testing.expect(try hasText("toolbarview.gx-chrome label.resize-overlay {{\n  border-radius: {d}px;", .{ui_metrics.radius.overlay}));
+    try testing.expect(try hasText("url-overlay.left {{\n  border-radius: 0 {d}px 0 0;", .{ui_metrics.radius.overlay}));
+    try testing.expect(try hasText("url-overlay.right {{\n  border-radius: {d}px 0 0 0;", .{ui_metrics.radius.overlay}));
+
+    // The badge: caption type, a pill padded by the small spacing step.
+    try testing.expect(try hasText(".gx-badge {{\n  min-height: {d}px;\n  padding: 0 {d}px;\n  border-radius: {d}px;\n  font-size: {d}px;", .{
+        badge_height, ui_metrics.space.s, badge_height / 2, ui_metrics.type_ramp.caption.size,
+    }));
+
+    // The signature bar and the tab transitions.
+    try testing.expect(try hasText("tab:selected,\ndnd tab {{\n  box-shadow: inset 0 {d}px 0 0 @accent_bg_color;", .{ui_metrics.signature.bar}));
+    const ease = motion.ease;
+    try testing.expect(try hasText("toolbarview.gx-chrome tabbar tab {{\n  transition: background-color {d}ms cubic-bezier({d}, {d}, {d}, {d});", .{
+        motion.duration.faster, ease.x1, ease.y1, ease.x2, ease.y2,
+    }));
+    try testing.expect(try hasText("tab:active {{\n  transition-duration: {d}ms;", .{motion.duration.fast}));
+}
+
+/// The height of the dialog badges (`.gx-badge`), a pill.
+const badge_height: f32 = 20;
 
 test "the static rules only select the main window" {
     try testing.expect(std.mem.indexOf(u8, static_css, ".window ") == null);
+    try testing.expect(std.mem.indexOf(u8, static_css, "#555555") == null);
     try testing.expect(std.mem.indexOf(u8, static_css, "scrollbar") == null);
     try testing.expect(std.mem.indexOf(u8, static_css, "toolbarview.gx-chrome tabbar tabbox > tabboxchild") != null);
 }

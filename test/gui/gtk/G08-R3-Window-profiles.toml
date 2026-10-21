@@ -51,7 +51,7 @@ mousemove 573 487
 click 1
 sleep 1.5
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G08-s05-about.png"
-mousemove 400 348
+mousemove 400 383
 click 1
 sleep 1.0
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G08-s05b-about-details.png"
@@ -76,9 +76,9 @@ expect = [
   "G08-s01-profiles.png: the profile dropdown lists the detected profiles and Demo（默认） as the configured default, then 用启动配置新建窗口, the splits, 设置默认 Shell… and 编辑启动配置…",
   "G08-s02-demo-tab.png: choosing Demo opened a second tab running the Demo command",
   "G08-s03-settings-shell.png: 设置默认 Shell… opened the settings dialog directly on the Shell page (gx:settings_page:shell) showing the default shell",
-  "G08-s04-profile-manager.png: 编辑启动配置… opened the launch profile manager",
-  "G08-s05-about.png: 关于 Ghostty GX opens the GX About dialog: Ghostty GX, the unofficial-fork byline, the version, and the graphics backend and issue link in its details",
-  "G08-s05b-about-details.png: the Details page shows the GX notice, the licence, Graphics: OpenGL (EGL: …); GTK: <renderer> and the issue link; GTK and libadwaita built-in labels stay English because their zh_CN catalogs are not installed in this WSL",
+  "G08-s04-profile-manager.png: 编辑启动配置… opened the settings dialog on its Shell page with the launch profile list under the default shell",
+  "G08-s05-about.png: 关于 Ghostty GX opens the GX About dialog: the Ghostty GX logo (not the upstream ghost), Ghostty GX, the unofficial-fork byline, the version pill in the accent color, then Details, Report an Issue and Troubleshooting rows",
+  "G08-s05b-about-details.png: the Details page shows the GX notice and one website button, without license text, graphics backend or URLs in the comments (the license is the MIT entry of Legal, the graphics backend is the Troubleshooting debug info); GTK and libadwaita built-in labels stay English because their zh_CN catalogs are not installed in this WSL",
   "G08-s06-second-window-profiles.png: a second window offers the same profile list",
   "G08.log: with GHOSTTY_GX_PERF=1 the launch profile lines show detection reused (cached=true) for later menus and windows, and gtk_menu_builder_load appears once for the Chinese menus",
 ]

@@ -1,5 +1,5 @@
 id = "G03"
-title = "The Ghostty GX settings dialog: wide pages, live language, theme list, save failure, fonts and remembered page"
+title = "The Ghostty GX settings dialog: 920 x 680 pages, live language, theme list, save failure, fonts and remembered page"
 lang = "en"
 args = ["--right-click-action=paste"]
 env = { PATH = "/tmp/gx-o6-shim-G03:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" }
@@ -9,125 +9,124 @@ language = en
 window-width = 140
 window-height = 44
 """
-# Intermediate screenshots and file dumps use xdotool exec into the evidence
-# directory next to XDG_STATE_HOME, which the runner copies out with the rest;
-# the whole script must finish within the runner's 30 s xdotool timeout. The
-# xdg-open on PATH is a private shim written by the script that only records
-# its arguments, so opening the folder starts nothing.
-xdotool = '''
-mousemove 400 300
-click 1
-sleep 0.5
-key ctrl+comma
-sleep 2.0
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s01-wide-language.png"
-exec --sync sh -c "mkdir -p /tmp/gx-o6-shim-G03; echo '#!/bin/sh' > /tmp/gx-o6-shim-G03/xdg-open; echo 'echo xdg-open $* >> '$(dirname $XDG_STATE_HOME)/evidence/G03-xdg-open.txt >> /tmp/gx-o6-shim-G03/xdg-open; chmod +x /tmp/gx-o6-shim-G03/xdg-open"
-mousemove 876 185
-click 1
-sleep 0.7
-mousemove 877 231
-click 1
-sleep 1.1
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s02-language-hot-switch.png"
-exec --sync sh -c "cat $XDG_CONFIG_HOME/ghostty/gui-settings.ghostty > $(dirname $XDG_STATE_HOME)/evidence/G03-gui-settings-1-language.txt 2>&1"
-mousemove 455 83
-click 1
-sleep 0.7
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s03-appearance.png"
-mousemove 640 197
-click 1
-sleep 1.1
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s04-theme-subpage.png"
-type --delay 30 "latte"
-sleep 0.9
-key Return
-sleep 0.8
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s05-applied.png"
-exec --sync sh -c "chmod a-w $XDG_CONFIG_HOME/ghostty $XDG_CONFIG_HOME/ghostty/gui-settings.ghostty"
-key ctrl+a
-type --delay 30 "chalkboard"
-sleep 0.9
-key Return
-sleep 0.8
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s06-save-failed.png"
-exec --sync sh -c "cat $XDG_CONFIG_HOME/ghostty/gui-settings.ghostty > $(dirname $XDG_STATE_HOME)/evidence/G03-gui-settings-2-failed.txt 2>&1"
-exec --sync sh -c "chmod u+w $XDG_CONFIG_HOME/ghostty $XDG_CONFIG_HOME/ghostty/gui-settings.ghostty"
-mousemove 777 693
-click 1
-sleep 0.9
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s07-retry-saved.png"
-exec --sync sh -c "cat $XDG_CONFIG_HOME/ghostty/gui-settings.ghostty > $(dirname $XDG_STATE_HOME)/evidence/G03-gui-settings-3-retried.txt 2>&1"
-key Escape
-sleep 0.6
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s08-search-cleared.png"
-key Escape
-sleep 0.9
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s09-theme-row.png"
-mousemove 578 83
-click 1
-sleep 0.6
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s10-font.png"
-mousemove 822 263
-click 1
-sleep 1.6
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s11-font-dialog.png"
-mousemove 92 146
-click 1
-sleep 0.3
-mousemove 363 412
-click 1
-sleep 1.0
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s12-font-chosen.png"
-exec --sync sh -c "cat $XDG_CONFIG_HOME/ghostty/gui-settings.ghostty > $(dirname $XDG_STATE_HOME)/evidence/G03-gui-settings-4-font.txt 2>&1"
-mousemove 897 264
-click 1
-sleep 1.0
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s13-font-cleared.png"
-exec --sync sh -c "cat $XDG_CONFIG_HOME/ghostty/gui-settings.ghostty > $(dirname $XDG_STATE_HOME)/evidence/G03-gui-settings-5-cleared.txt 2>&1"
-mousemove 701 83
-click 1
-sleep 0.6
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s14-interaction.png"
-mousemove 824 83
-click 1
-sleep 0.8
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s15-shell.png"
-mousemove 946 83
-click 1
-sleep 0.6
-mousemove 778 260
-click 1
-sleep 0.6
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s16-about.png"
-key Escape
-sleep 0.8
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s16b-closed.png"
-key ctrl+comma
-sleep 1.5
-exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G03-s17-reopened.png"
-exec --sync rm -rf /tmp/gx-o6-shim-G03
+# The 1280 x 800 main window holds the 920 x 680 dialog at (180, 60); the
+# six page tabs sit in its header bar at y 82 (their x moves once the
+# dialog turns Chinese). The xdg-open on PATH is a
+# private shim written by the script that only records its arguments, so
+# opening the folder starts nothing.
+script = '''
+import os
+
+overlay = config_home / "ghostty" / "gui-settings.ghostty"
+
+def dump(suffix):
+    save(suffix, overlay.read_text() if overlay.exists() else "")
+
+def click(x, y, wait):
+    xdo("mousemove", x, y, "click", 1)
+    sleep(wait)
+
+def page(x):
+    click(x, 82, 1.0)
+
+shim = Path("/tmp/gx-o6-shim-G03")
+shim.mkdir(exist_ok=True)
+(shim / "xdg-open").write_text("#!/bin/sh\necho xdg-open \"$*\" >> " + str(evidence / "G03-xdg-open.txt") + "\n")
+os.chmod(shim / "xdg-open", 0o755)
+
+click(400, 300, 0.5)
+xdo("key", "ctrl+comma")
+sleep(2.0)
+capture("s01-language")
+click(878, 185, 1.0)
+click(877, 231, 1.5)
+capture("s02-language-hot-switch")
+dump("-gui-settings-1-language.txt")
+assert "language = zh-CN" in overlay.read_text()
+page(455)
+capture("s03-appearance")
+click(640, 210, 1.5)
+capture("s04-theme-subpage")
+xdo("type", "--delay", 30, "catppuccin latte")
+sleep(1.0)
+xdo("key", "Return")
+sleep(1.0)
+capture("s05-applied")
+assert "theme = light:Catppuccin Latte,dark:GX Mocha" in overlay.read_text()
+os.chmod(overlay, 0o444)
+os.chmod(overlay.parent, 0o555)
+xdo("key", "ctrl+a")
+xdo("type", "--delay", 30, "chalkboard")
+sleep(1.0)
+xdo("key", "Return")
+sleep(1.0)
+capture("s06-save-failed")
+dump("-gui-settings-2-failed.txt")
+assert "theme = light:Catppuccin Latte,dark:GX Mocha" in overlay.read_text()
+os.chmod(overlay.parent, 0o755)
+os.chmod(overlay, 0o644)
+click(777, 693, 1.2)
+capture("s07-retry-saved")
+dump("-gui-settings-3-retried.txt")
+assert "theme = light:Chalkboard,dark:GX Mocha" in overlay.read_text()
+xdo("key", "Escape")
+sleep(0.8)
+capture("s08-search-cleared")
+xdo("key", "Escape")
+sleep(1.0)
+capture("s09-theme-row")
+page(579)
+capture("s10-font")
+click(821, 263, 2.0)
+capture("s11-font-dialog")
+click(92, 146, 0.3)
+click(363, 412, 1.2)
+capture("s12-font-chosen")
+dump("-gui-settings-4-font.txt")
+assert "font-family = DejaVu Sans Mono" in overlay.read_text()
+click(897, 263, 1.2)
+capture("s13-font-cleared")
+dump("-gui-settings-5-cleared.txt")
+assert "DejaVu Sans Mono" not in overlay.read_text()
+page(702)
+capture("s14-interaction")
+page(823)
+capture("s15-shell")
+page(946)
+click(779, 416, 1.0)
+capture("s16-about")
+assert "xdg-open" in (evidence / "G03-xdg-open.txt").read_text()
+xdo("key", "Escape")
+sleep(1.0)
+capture("s16b-closed")
+xdo("key", "ctrl+comma")
+sleep(1.8)
+capture("s17-reopened")
+for item in shim.iterdir():
+    item.unlink()
+shim.rmdir()
 '''
 expect = [
   "G03.png: the wide English main window before the dialog opens",
-  "G03-s01-wide-language.png: the 920 px settings dialog keeps its six pages (Language, Appearance, Font, Interaction, Shell, About) in the header bar and starts on Language",
+  "G03-s01-language.png: the 920 x 680 settings dialog starts on Language; its six pages (Language, Appearance, Font, Interaction, Shell, About) are in the view switcher at the top of its header bar, next to the close button",
   "G03-s02-language-hot-switch.png: picking 中文 retranslates the open dialog at once (语言 外观 字体 交互 Shell 关于), shows the 设置已保存。 toast and one window toast about the language, no configuration reload toast",
   "G03-gui-settings-1-language.txt: the overlay holds language = zh-CN",
-  "G03-s03-appearance.png: theme row with swatch and current theme, material, opacity, cursor and padding rows",
-  "G03-s04-theme-subpage.png: the full-height theme subpage with search, Revert/Apply and the virtual list with swatches, the saved theme checked and scrolled into view",
-  "G03-s05-applied.png: query latte, Enter applies Catppuccin Latte: the check moves to it and Apply/Revert turn insensitive",
+  "G03-s03-appearance.png: the light and dark theme rows with swatches (GX Latte, GX Mocha), the Accent Color group (Ghostty GX 紫 with its line), then material and opacity rows",
+  "G03-s04-theme-subpage.png: the full-height Light Theme subpage with search, Revert/Apply and the virtual list with swatches, the saved GX Latte checked and scrolled into view",
+  "G03-s05-applied.png: query catppuccin latte, Enter applies Catppuccin Latte as the light theme: the check moves to it and Apply/Revert turn insensitive",
   "G03-s06-save-failed.png: with the settings directory read-only, Enter on Chalkboard keeps the preview and shows the translated failure toast with 重试",
-  "G03-gui-settings-2-failed.txt: still theme = Catppuccin Latte",
+  "G03-gui-settings-2-failed.txt: still theme = light:Catppuccin Latte,dark:GX Mocha",
   "G03-s07-retry-saved.png: after the directory is writable again, 重试 saves; the check mark must move to Chalkboard and Apply must turn insensitive",
-  "G03-gui-settings-3-retried.txt: theme = Chalkboard",
+  "G03-gui-settings-3-retried.txt: theme = light:Chalkboard,dark:GX Mocha",
   "G03-s08-search-cleared.png: the first Escape clears the search and keeps the selected theme selected in the full list",
-  "G03-s09-theme-row.png: the second Escape goes back to the appearance page; the theme row must name the saved theme Chalkboard",
+  "G03-s09-theme-row.png: the second Escape goes back to the appearance page; the light theme row must name the saved theme Chalkboard",
   "G03-s10-font.png: font size shown as the integer 12 with the reset icon, the monospace font button and its clear button, the font family entry",
   "G03-s11-font-dialog.png: the GTK font dialog lists monospace families only",
-  "G03-s12-font-chosen.png and G03-gui-settings-4-font.txt: DejaVu Sans Mono is chosen and saved as font-family with the fallback families kept",
+  "G03-s12-font-chosen.png and G03-gui-settings-4-font.txt: DejaVu Sans Mono is chosen, shown on the button and in the font family row, and saved as font-family = DejaVu Sans Mono",
   "G03-s13-font-cleared.png and G03-gui-settings-5-cleared.txt: the clear button removes the chosen family",
   "G03-s14-interaction.png: right-click action with the command-line note, scrollbar, close confirmation, focus follows mouse, Ctrl+wheel zoom with its reset icon, bell rows with the bell-audio-path hint",
   "G03-s15-shell.png: the default shell row shows /bin/bash --noprofile --norc without the direct: prefix",
-  "G03-s16-about.png and G03-xdg-open.txt: version, configuration and settings file paths; the folder button opened the configuration folder through xdg-open",
+  "G03-s16-about.png and G03-xdg-open.txt: the GX logo, Ghostty GX, the version in an accent badge and the notice, then the configuration and settings file paths; the folder button opened the configuration folder through xdg-open",
   "G03-s16b-closed.png: Escape closed the dialog",
   "G03-s17-reopened.png: closing and reopening the dialog starts on the page it was closed on (关于)",
 ]

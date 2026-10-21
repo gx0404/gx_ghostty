@@ -42,11 +42,17 @@ keyup alt ctrl
 keydown ctrl super
 click 4
 keyup super ctrl
+key ctrl+shift+m
+sleep 1
+exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G14-s01-menu-zoom.png"
+key Escape
+sleep 0.5
 key F6
 sleep 1.5
 """
 expect = [
   "G14.png: Chinese GTK main window with one terminal at configured 12 pt",
+  "G14-s01-menu-zoom.png: the main menu's zoom row shows the focused right split's zoom, 92% (11 pt of the configured 12 pt), between the zoom-out and zoom-in buttons",
   "G14-after.png: left and right terminal splits at different font sizes (left 15 pt, right 11 pt), preserved after reload; Ctrl+Shift/Alt/Super did not zoom",
   "Native pinch and physical smooth-device sensitivity require real hardware; this discrete-wheel scenario does not prove them",
 ]

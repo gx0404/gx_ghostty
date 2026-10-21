@@ -13,4 +13,4 @@ sleep 0.3
 key ctrl+alt+s
 sleep 1.5
 """
-expect = ["G13-after.png: the settings dialog opens on the Shell page with its default Shell control"]
+expect = ["G13-after.png: the 920 x 680 settings dialog opens on the Shell page with its default Shell control; Shell is selected in the view switcher of the header bar"]

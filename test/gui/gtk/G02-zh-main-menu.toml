@@ -26,7 +26,7 @@ sleep 0.3
 key ctrl+shift+m
 sleep 1
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G02-s01-two-windows-menu.png"
-mousemove 380 318
+mousemove 430 318
 click 1
 sleep 0.8
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G02-s02-language-submenu.png"
@@ -37,7 +37,7 @@ exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G02-s03-same-langua
 exec --sync sh -c "cat $XDG_CONFIG_HOME/ghostty/gui-settings.ghostty > $(dirname $XDG_STATE_HOME)/evidence/G02-gui-settings-1-after-same.txt 2>&1"
 key ctrl+shift+m
 sleep 1
-mousemove 380 318
+mousemove 430 318
 click 1
 sleep 0.8
 mousemove 400 144
@@ -51,7 +51,7 @@ sleep 0.6
 key ctrl+shift+m
 sleep 1
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G02-s05-english-menu.png"
-mousemove 380 316
+mousemove 430 316
 click 1
 sleep 0.8
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G02-s06-english-language-submenu.png"

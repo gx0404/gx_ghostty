@@ -5,13 +5,19 @@ template $GhosttyGxSettingsDialog: Adw.PreferencesDialog {
   // The Ghostty GX settings dialog (src/apprt/gtk/gx/settings_dialog.zig).
   // Its text comes from the Ghostty GX translation tables at runtime, so
   // nothing here is marked for gettext. Wide enough that the page switcher
-  // of six pages stays in the header bar.
+  // of six pages stays in the header bar: libadwaita 1.5 moves it to the
+  // bottom below 110 pt per page (about 880 px). The root carries
+  // gx-dialog for the GX dialog styles (src/apprt/gtk/gx/style.css).
   content-width: 920;
   content-height: 680;
   search-enabled: false;
   close-attempt => $close_attempted();
   closed => $closed();
   notify::visible-page => $page_changed();
+
+  styles [
+    "gx-dialog",
+  ]
 
   Adw.PreferencesPage language_page {
     name: "language";
@@ -61,6 +67,48 @@ template $GhosttyGxSettingsDialog: Adw.PreferencesDialog {
         [suffix]
         Gtk.Image {
           icon-name: "go-next-symbolic";
+        }
+      }
+    }
+
+    Adw.PreferencesGroup accent_group {
+      Adw.ComboRow accent_row {
+        notify::selected => $accent_selected();
+      }
+
+      // A color of its own (`gx-accent-color = #rrggbb`) is not a choice:
+      // the row shows it read-only, until "Reset to Default" when the
+      // settings file has it.
+      Adw.ActionRow accent_custom_row {
+        visible: false;
+        use-markup: false;
+
+        [suffix]
+        Gtk.Image {
+          icon-name: "changes-prevent-symbolic";
+
+          styles [
+            "dim-label",
+          ]
+        }
+
+        [suffix]
+        Gtk.Label accent_custom_label {
+          styles [
+            "dim-label",
+          ]
+        }
+
+        [suffix]
+        Gtk.Button accent_reset_button {
+          visible: false;
+          icon-name: "edit-undo-symbolic";
+          valign: center;
+          clicked => $accent_reset_clicked();
+
+          styles [
+            "flat",
+          ]
         }
       }
     }
@@ -230,12 +278,54 @@ template $GhosttyGxSettingsDialog: Adw.PreferencesDialog {
     name: "about";
     icon-name: "help-about-symbolic";
 
-    Adw.PreferencesGroup about_group {
-      Adw.ActionRow version_row {
-        use-markup: false;
-        subtitle-selectable: true;
-      }
+    Adw.PreferencesGroup about_header_group {
+      Gtk.Box {
+        orientation: vertical;
+        spacing: 6;
+        halign: center;
+        margin-bottom: 6;
 
+        Gtk.Image about_logo {
+          icon-name: "ghostty-gx";
+          pixel-size: 112;
+          margin-bottom: 6;
+        }
+
+        Gtk.Label about_name {
+          use-markup: false;
+
+          styles [
+            "title-1",
+          ]
+        }
+
+        Gtk.Label about_version {
+          halign: center;
+          use-markup: false;
+
+          styles [
+            "gx-badge",
+            "gx-accent",
+            "accent",
+            "numeric",
+          ]
+        }
+
+        Gtk.Label about_notice {
+          justify: center;
+          wrap: true;
+          max-width-chars: 48;
+          margin-top: 6;
+          use-markup: false;
+
+          styles [
+            "dim-label",
+          ]
+        }
+      }
+    }
+
+    Adw.PreferencesGroup about_group {
       Adw.ActionRow config_path_row {
         use-markup: false;
         subtitle-selectable: true;

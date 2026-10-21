@@ -421,7 +421,14 @@ class SettingsDialogTests(unittest.TestCase):
         self.assertEqual("family", chooser.props["level"])
         self.assertEqual("Adw.ActionRow", declared["font_choice_row"].kind)
         self.assertEqual("Adw.EntryRow", declared["font_family_row"].kind)
+        # libadwaita 1.5 keeps the switcher of six pages in the header bar
+        # from 110 pt per page (about 880 px) up; G03 and G30 show it there.
         self.assertGreaterEqual(int(template(root).props["content-width"]), 900)
+        self.assertEqual(int(template(root).props["content-height"]), 680)
+        self.assertEqual("Adw.ComboRow", declared["accent_row"].kind)
+        self.assertEqual("Adw.ActionRow", declared["accent_custom_row"].kind)
+        self.assertEqual("Gtk.Image", declared["about_logo"].kind)
+        self.assertEqual("ghostty-gx", declared["about_logo"].props["icon-name"])
         pages = [node.props["name"] for node in root.walk() if node.kind == "Adw.PreferencesPage"]
         self.assertEqual(pages, ["language", "appearance", "font", "interaction", "shell", "about"])
 

@@ -1490,3 +1490,18 @@ test "settings strings are translated" {
     }) |err| check(errorReason(err), &missing);
     try testing.expectEqual(@as(usize, 0), missing);
 }
+
+/// The msgid of the line under the accent color row, which says what
+/// `accent` does.
+pub fn accentHint(accent: Accent) [:0]const u8 {
+    return switch (accent) {
+        .brand => "Stays Ghostty GX purple whatever the theme.",
+        .theme => "Takes the accent color of the current theme.",
+    };
+}
+
+test "accent hints are translated" {
+    for (std.enums.values(Accent)) |accent| {
+        try testing.expect(i18n.lookup(.zh_CN, accentHint(accent)) != null);
+    }
+}

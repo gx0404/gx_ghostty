@@ -18,15 +18,15 @@ sleep 0.3
 key ctrl+shift+m
 sleep 1
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G07-s01-menu.png"
-mousemove 710 439
+mousemove 665 440
 click 1
 sleep 0.8
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G07-s02-zoom-in.png"
-mousemove 617 439
+mousemove 617 440
 click 1
 sleep 0.8
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G07-s03-zoom-reset.png"
-mousemove 758 439
+mousemove 704 440
 click 1
 sleep 0.8
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G07-s04-find.png"
@@ -48,7 +48,7 @@ mousemove 658 28
 click 1
 sleep 1
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G07-s06-menu-from-button.png"
-mousemove 798 439
+mousemove 745 440
 click 1
 sleep 1.2
 exec --sync sh -c "scrot $(dirname $XDG_STATE_HOME)/evidence/G07-s07-fullscreen.png"
@@ -56,9 +56,9 @@ exec --sync rm -rf /tmp/gx-o6-shim-G07
 '''
 expect = [
   "G07.png: the English main window shows no missing glyphs",
-  "G07-s01-menu.png: twelve main entries follow the Windows order (New Tab, New Window, New Tab with Profile, Split, Command Palette, Settings…, Keyboard Shortcuts, Language, Reload Configuration, Open Configuration File, About Ghostty GX, Quit); zoom out, Reset Zoom, zoom in, find and fullscreen form one control row; the entries with bindings show their accelerators",
-  "G07-s02-zoom-in.png: the + button enlarged the terminal font behind the menu, which stays open for the control row",
-  "G07-s03-zoom-reset.png: Reset Zoom restored the configured font size",
+  "G07-s01-menu.png: twelve main entries follow the Windows order (New Tab, New Window, New Tab with Profile, Split, Command Palette, Settings…, Keyboard Shortcuts, Language, Reload Configuration, Open Configuration File, About Ghostty GX, Quit); one control row holds flat zoom-out and zoom-in icon buttons around the zoom percentage (100%), then the find and fullscreen buttons; the entries with bindings show their accelerators",
+  "G07-s02-zoom-in.png: the zoom-in button enlarged the terminal font behind the menu, which stays open for the control row, and the percentage between the zoom buttons rose above 100%",
+  "G07-s03-zoom-reset.png: clicking the percentage restored the configured font size and shows 100% again",
   "G07-s04-find.png: the find button opened the terminal search bar behind the open menu",
   "G07-s05-open-config.png and G07-xdg-open.txt: Open Configuration File handed the private configuration file to xdg-open",
   "G07-s06-menu-from-button.png: clicking the header bar menu button opens the same menu",
