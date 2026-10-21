@@ -279,16 +279,10 @@ pub const StreamHandler = struct {
                 @branchHint(.likely);
                 self.terminal.setCursorPos(value.row, value.col);
             },
-            .cursor_col => self.terminal.setCursorPos(self.terminal.screens.active.cursor.y + 1, value.value),
-            .cursor_row => self.terminal.setCursorPos(value.value, self.terminal.screens.active.cursor.x + 1),
-            .cursor_col_relative => self.terminal.setCursorPos(
-                self.terminal.screens.active.cursor.y + 1,
-                self.terminal.screens.active.cursor.x + 1 +| value.value,
-            ),
-            .cursor_row_relative => self.terminal.setCursorPos(
-                self.terminal.screens.active.cursor.y + 1 +| value.value,
-                self.terminal.screens.active.cursor.x + 1,
-            ),
+            .cursor_col => self.terminal.setCursorCol(value.value),
+            .cursor_row => self.terminal.setCursorRow(value.value),
+            .cursor_col_relative => self.terminal.cursorColRelative(value.value),
+            .cursor_row_relative => self.terminal.cursorRowRelative(value.value),
             // fork(gx): GX-0057 publish effective state before the next VT action/query.
             .cursor_style => self.gx_cursor_policy.request(self.terminal, value),
             .erase_display_below => self.terminal.eraseDisplay(.below, value),
@@ -894,6 +888,18 @@ pub const StreamHandler = struct {
         }
     }
 
+    /// The cursor position for a CPR/DECXCPR report, honoring origin mode
+    /// (relative to the scrolling region when DECOM is set).
+    fn cursorReportPos(self: *StreamHandler) struct { x: usize, y: usize } {
+        return if (self.terminal.modes.get(.origin)) .{
+            .x = self.terminal.screens.active.cursor.x -| self.terminal.scrolling_region.left,
+            .y = self.terminal.screens.active.cursor.y -| self.terminal.scrolling_region.top,
+        } else .{
+            .x = self.terminal.screens.active.cursor.x,
+            .y = self.terminal.screens.active.cursor.y,
+        };
+    }
+
     pub fn deviceStatusReport(
         self: *StreamHandler,
         req: terminal.device_status.Request,
@@ -902,22 +908,28 @@ pub const StreamHandler = struct {
             .operating_status => self.messageWriter(.{ .write_stable = "\x1B[0n" }),
 
             .cursor_position => {
-                const pos: struct {
-                    x: usize,
-                    y: usize,
-                } = if (self.terminal.modes.get(.origin)) .{
-                    .x = self.terminal.screens.active.cursor.x -| self.terminal.scrolling_region.left,
-                    .y = self.terminal.screens.active.cursor.y -| self.terminal.scrolling_region.top,
-                } else .{
-                    .x = self.terminal.screens.active.cursor.x,
-                    .y = self.terminal.screens.active.cursor.y,
-                };
+                const pos = self.cursorReportPos();
 
                 // Response always is at least 4 chars, so this leaves the
                 // remainder for the row/column as base-10 numbers. This
                 // will support a very large terminal.
                 var msg: termio.Message = .{ .write_small = .{} };
-                const resp = try std.fmt.bufPrint(&msg.write_small.data, "\x1B[{};{}R", .{
+                const resp = try std.mem.print(&msg.write_small.data, "\x1B[{};{}R", .{
+                    pos.y + 1,
+                    pos.x + 1,
+                });
+                msg.write_small.len = @intCast(resp.len);
+
+                self.messageWriter(msg);
+            },
+
+            // DECXCPR: extended cursor position adds a page number. Ghostty has
+            // no page memory, so the page is always 1.
+            .cursor_position_extended => {
+                const pos = self.cursorReportPos();
+
+                var msg: termio.Message = .{ .write_small = .{} };
+                const resp = try std.mem.print(&msg.write_small.data, "\x1B[?{};{};1R", .{
                     pos.y + 1,
                     pos.x + 1,
                 });
@@ -991,7 +1003,7 @@ pub const StreamHandler = struct {
     pub fn queryKittyKeyboard(self: *StreamHandler) !void {
         log.debug("querying kitty keyboard mode", .{});
         var data: termio.Message.WriteReq.Small.Array = undefined;
-        const resp = try std.fmt.bufPrint(&data, "\x1b[?{}u", .{
+        const resp = try std.mem.print(&data, "\x1b[?{}u", .{
             self.terminal.screens.active.kitty_keyboard.current().int(),
         });
 
@@ -1008,7 +1020,7 @@ pub const StreamHandler = struct {
     ) !void {
         log.debug("reporting XTVERSION: ghostty {s}", .{build_config.version_string});
         var buf: [288]u8 = undefined;
-        const resp = try std.fmt.bufPrint(
+        const resp = try std.mem.print(
             &buf,
             "\x1BP>|{s} {s}\x1B\\",
             .{
@@ -1219,11 +1231,11 @@ pub const StreamHandler = struct {
         const req = try alloc.create(apprt.ClipboardRequest.KittyRead);
         const mimes = try alloc.alloc([:0]const u8, mimes_len);
         for (mimes_buf[0..mimes_len], mimes) |src, *dst| {
-            dst.* = try alloc.dupeZ(u8, src);
+            dst.* = try alloc.dupeSentinel(u8, src, 0);
         }
         const id = try alloc.dupe(u8, meta.id);
         const pw_owned = try alloc.dupe(u8, pw);
-        const name_owned = try alloc.dupeZ(u8, meta.name);
+        const name_owned = try alloc.dupeSentinel(u8, meta.name, 0);
         req.* = .{
             // The arena must be copied in last so it tracks every
             // allocation above.
@@ -1438,12 +1450,12 @@ pub const StreamHandler = struct {
             committed.contents.len,
         );
         for (committed.contents, contents) |src, *dst| dst.* = .{
-            .mime = try alloc.dupeZ(u8, src.mime),
-            .data = try alloc.dupeZ(u8, src.data),
+            .mime = try alloc.dupeSentinel(u8, src.mime, 0),
+            .data = try alloc.dupeSentinel(u8, src.data, 0),
         };
         const id = try alloc.dupe(u8, committed.id);
         const pw_owned = try alloc.dupe(u8, pw);
-        const name_owned = try alloc.dupeZ(u8, committed.name);
+        const name_owned = try alloc.dupeSentinel(u8, committed.name, 0);
         req.* = .{
             // The arena must be copied in last so it tracks every
             // allocation above.
@@ -1581,7 +1593,7 @@ pub const StreamHandler = struct {
         // for this OSC 7 context (e.g. kitty-shell-cwd expects the full,
         // unencoded path).
         const uri: std.Uri = internal_os.uri.parse(url, .{
-            .mac_address = comptime builtin.os.tag != .macos,
+            .mac_address = comptime builtin.target.os.tag != .macos,
             .raw_path = std.mem.startsWith(u8, url, "kitty-shell-cwd://"),
         }) catch |e| {
             log.warn("invalid url in OSC 7: {}", .{e});
@@ -1596,9 +1608,13 @@ pub const StreamHandler = struct {
         }
 
         var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-        const host = uri.getHost(&host_buffer) catch |err| switch (err) {
+        const host = std.Io.net.HostName.fromUri(uri, &host_buffer) catch |err| switch (err) {
             // fork(gx): GX-0008 file:///path has an empty host, which isLocal accepts
             error.UriMissingHost => std.Io.net.HostName{ .bytes = "" },
+            error.NameTooLong, error.InvalidHostName => {
+                log.warn("OSC 7 uri contains an invalid hostname: {}", .{err});
+                return;
+            },
         };
 
         // OSC 7 is a little sketchy because anyone can send any value from
@@ -1622,10 +1638,11 @@ pub const StreamHandler = struct {
         // We need the raw path, which might require unescaping. We try to
         // avoid making any heap allocations by using the stack first.
         var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
-        var stack_alloc = std.heap.stackFallback(1024, arena_alloc.allocator());
+        var stack_alloc_buf: [1024]u8 = undefined;
+        var stack_alloc: std.heap.BufferFirstAllocator = .init(&stack_alloc_buf, arena_alloc.allocator());
         defer arena_alloc.deinit();
         // fork(gx): GX-0008 Windows stores a native path (C:\...), see src/gx/osc7.zig
-        const raw_path = try uri.path.toRawMaybeAlloc(stack_alloc.get());
+        const raw_path = try uri.path.toRawMaybeAlloc(stack_alloc.allocator());
         const path = try gx_osc7.nativePath(arena_alloc.allocator(), raw_path) orelse return;
 
         log.debug("terminal pwd: {s}", .{path});
@@ -1768,7 +1785,7 @@ pub const StreamHandler = struct {
                             },
                         });
                     }
-                    mask.* = .initEmpty();
+                    mask.* = .empty;
                 },
 
                 .reset_special => log.warn(
@@ -1821,7 +1838,7 @@ pub const StreamHandler = struct {
                             .dynamic => |dynamic| try response.writer.print(
                                 "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}",
                                 .{
-                                    @intFromEnum(dynamic),
+                                    @backingInt(dynamic),
                                     @as(u16, color.r) * 257,
                                     @as(u16, color.g) * 257,
                                     @as(u16, color.b) * 257,
@@ -1843,7 +1860,7 @@ pub const StreamHandler = struct {
                             .dynamic => |dynamic| try response.writer.print(
                                 "\x1b]{d};rgb:{x:0>2}/{x:0>2}/{x:0>2}",
                                 .{
-                                    @intFromEnum(dynamic),
+                                    @backingInt(dynamic),
                                     @as(u16, color.r),
                                     @as(u16, color.g),
                                     @as(u16, color.b),
@@ -1884,6 +1901,7 @@ pub const StreamHandler = struct {
             .csi_14_t => self.messageWriter(.{ .size_report = .csi_14_t }),
             .csi_16_t => self.messageWriter(.{ .size_report = .csi_16_t }),
             .csi_18_t => self.messageWriter(.{ .size_report = .csi_18_t }),
+            .csi_19_t => self.messageWriter(.{ .size_report = .csi_19_t }),
             .csi_21_t => self.surfaceMessageWriter(.{ .report_title = .csi_21_t }),
         }
     }

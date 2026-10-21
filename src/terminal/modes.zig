@@ -81,7 +81,8 @@ pub const ModeState = struct {
     }
 
     /// Return a DECRPM report for the given mode tag. If the tag does
-    /// not correspond to a known mode, the report state is .not_recognized.
+    /// not correspond to a known mode, the report state is .not_recognized,
+    /// except for the permanently-reset modes below.
     pub fn getReport(self: *const ModeState, tag: Report.Tag) Report {
         // DECECM (Erase Color Mode, DEC private mode 117) controls whether erasing
         // and scrolling use the default background or the active background color.
@@ -95,6 +96,28 @@ pub const ModeState = struct {
 
         if (!tag.ansi and tag.value == 117) {
             return .{ .tag = tag, .state = .permanently_reset };
+        }
+
+        // These unimplemented ANSI modes report fixed reset, matching
+        // xterm: GATM, SRTM, VEM, HEM, PUM, FEAM, FETM, MATM, TTM, SATM,
+        // TSM, EBM. Report permanently_reset instead of not_recognized so
+        // DECRQM callers hear "unsupported" rather than "unknown".
+        if (tag.ansi) {
+            switch (tag.value) {
+                inline 1, 5, 7, 10, 11, 13, 14, 15, 16, 17, 18, 19 => |v| {
+                    comptime for (entries) |entry| {
+                        if (entry.ansi and entry.value == v) @compileError(
+                            std.fmt.comptimePrint(
+                                "ANSI mode {} is in the mode table and " ++
+                                    "must not be reported as permanently reset",
+                                .{v},
+                            ),
+                        );
+                    };
+                    return .{ .tag = tag, .state = .permanently_reset };
+                },
+                else => {},
+            }
         }
         const mode = modeFromInt(tag.value, tag.ansi) orelse return .{
             .tag = tag,
@@ -135,10 +158,9 @@ fn getPacked(values: *const ModePacked, mode: Mode) bool {
 /// A packed struct of all the settable modes. This shouldn't
 /// be used directly but rather through the ModeState struct.
 pub const ModePacked = packed_struct: {
-    const StructField = std.builtin.Type.StructField;
     var names: [entries.len][]const u8 = undefined;
-    var types = [_]type{bool} ** entries.len;
-    var attrs: [entries.len]StructField.Attributes = undefined;
+    var types: [entries.len]type = @splat(bool);
+    var attrs: [entries.len]std.lang.Type.Struct.FieldAttributes = undefined;
 
     for (entries, &names, &attrs) |entry, *name, *attr| {
         name.* = entry.name;
@@ -171,7 +193,7 @@ pub const ModeTag = packed struct(u16) {
     ansi: bool = false,
 
     pub fn fromMode(mode: Mode) ModeTag {
-        return @bitCast(@intFromEnum(mode));
+        return @bitCast(@backingInt(mode));
     }
 
     test "order" {
@@ -202,7 +224,7 @@ pub fn modeFromInt(v: u16, ansi: bool) ?Mode {
         if (entries_disabled[idx]) return null;
     }
 
-    return @enumFromInt(int);
+    return @fromBackingInt(int);
 }
 
 /// The tag of every entry, in the same order as `entries`. Looking up
@@ -281,7 +303,7 @@ pub const Report = struct {
         try writer.print("\x1B[{s}{};{}$y", .{
             if (self.tag.ansi) "" else "?",
             self.tag.value,
-            @intFromEnum(self.state),
+            @backingInt(self.state),
         });
     }
 };
@@ -393,7 +415,7 @@ const entries: []const ModeEntry = &.{
         .value = 5522,
         // The macOS app and libghostty-vt can both serve the follow-up
         // Kitty clipboard read that a paste event grants.
-        .disabled = build_options.artifact != .lib and builtin.os.tag != .macos,
+        .disabled = build_options.artifact != .lib and builtin.target.os.tag != .macos,
     },
     // fork(gx): GX-0006 begin: win32-input-mode, keys as Win32 KEY_EVENT_RECORDs
     // ConPTY requests it; see src/gx/win32_input.zig.
@@ -503,6 +525,24 @@ test "getReport DECECM permanently reset" {
     const report = state.getReport(.{ .value = 117, .ansi = false });
     try testing.expectEqual(Report.State.permanently_reset, report.state);
     try testing.expectEqual(false, report.tag.ansi);
+}
+
+test "getReport unsupported ANSI modes permanently reset" {
+    const state: ModeState = .{};
+    // GATM, SRTM, VEM, HEM, PUM, FEAM, FETM, MATM, TTM, SATM, TSM, EBM.
+    for ([_]u16{ 1, 5, 7, 10, 11, 13, 14, 15, 16, 17, 18, 19 }) |value| {
+        // None of these may gain a settable mode table entry without
+        // leaving this list first.
+        try testing.expect(modeFromInt(value, true) == null);
+        const report = state.getReport(.{ .value = value, .ansi = true });
+        try testing.expectEqual(Report.State.permanently_reset, report.state);
+        try testing.expectEqual(true, report.tag.ansi);
+        try testing.expectEqual(value, report.tag.value);
+    }
+
+    // An unlisted ANSI mode is still unknown, not permanently reset.
+    const unknown = state.getReport(.{ .value = 9, .ansi = true });
+    try testing.expectEqual(Report.State.not_recognized, unknown.state);
 }
 
 test "getReport unknown mode" {

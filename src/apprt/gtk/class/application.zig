@@ -284,7 +284,7 @@ pub const Application = extern struct {
     pub fn new(
         rt_app: *ApprtApp,
         core_app: *CoreApp,
-    ) Allocator.Error!*Self {
+    ) (error{ GtkMinimumVersion, AdwaitaMinimumVersion } || Allocator.Error)!*Self {
         const alloc = core_app.alloc;
 
         // Capture GLib/GObject/GTK log messages and funnel them through Zig's
@@ -292,8 +292,8 @@ pub const Application = extern struct {
         _ = glib.logSetWriterFunc(glibLogWriterFunction, null, null);
 
         // Log our GTK versions
-        gtk_version.logVersion();
-        adw_version.logVersion();
+        try gtk_version.logVersion();
+        try adw_version.logVersion();
 
         // fork(gx): GX-0034 begin: retain the startup configuration layers until GTK initializes
         var gx_defaults: gx_gtk.defaults.Startup = .{};
@@ -1153,6 +1153,10 @@ pub const Application = extern struct {
                 \\  --window-fg-color: var(--ghostty-fg);
                 \\  --window-bg-color: var(--ghostty-bg);
                 \\}}
+                \\listview.command-palette-view {{
+                \\  --view-fg-color: var(--ghostty-fg);
+                \\  --view-bg-color: var(--ghostty-bg);
+                \\}}
                 \\windowhandle {{
                 \\  background-color: var(--headerbar-bg-color);
                 \\  color: var(--headerbar-fg-color);
@@ -1385,7 +1389,7 @@ pub const Application = extern struct {
     ) callconv(.c) void {
         const location = css_section.toString();
         defer glib.free(location);
-        if (comptime gtk_version.atLeast(4, 16, 0)) bytes: {
+        bytes: {
             const bytes = css_section.getBytes() orelse break :bytes;
             var len: usize = undefined;
             const ptr = bytes.getData(&len) orelse break :bytes;
@@ -1533,7 +1537,7 @@ pub const Application = extern struct {
         const priv = self.private();
         assert(priv.signal_source == null);
         priv.signal_source = glibunix.signalAdd(
-            @intFromEnum(std.posix.SIG.USR2),
+            @backingInt(std.posix.SIG.USR2),
             handleSigusr2,
             self,
         );
@@ -1879,10 +1883,11 @@ pub const Application = extern struct {
         };
 
         var body_buf: [512]u8 = undefined;
-        const body = std.fmt.bufPrintZ(
+        const body = std.mem.printSentinel(
             &body_buf,
             "{s}: {s}",
             .{ label, detail },
+            0,
         ) catch return;
 
         Action.desktopNotification(self, .app, .{
@@ -2348,7 +2353,7 @@ const Action = struct {
         ) callconv(.c) void {
             defer dialog.unref();
 
-            if (response_id != @intFromEnum(gtk.ResponseType.accept)) return;
+            if (response_id != @backingInt(gtk.ResponseType.accept)) return;
 
             const file = dialog.as(gtk.FileChooser).getFile() orelse {
                 log.warn("inspector export dialog returned no file", .{});
@@ -2500,7 +2505,7 @@ const Action = struct {
                     .previous => .previous,
                     .next => .next,
                     .last => .last,
-                    else => .{ .n = @intCast(@intFromEnum(tab)) },
+                    else => .{ .n = @intCast(@backingInt(tab)) },
                 });
             },
         }
@@ -2825,8 +2830,7 @@ const Action = struct {
                     .direct = &.{ "/bin/sh", "-c", cmd },
                 };
 
-                const title = std.fmt.allocPrintSentinel(
-                    alloc,
+                const title = alloc.printSentinel(
                     "{s} {s}",
                     .{ i18n._("Editing configuration file"), path },
                     0,

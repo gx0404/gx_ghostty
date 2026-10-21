@@ -458,7 +458,10 @@ const Preview = struct {
                             self.mode = .help;
                         if (key.matches('/', .{}))
                             self.mode = .search;
-                        if (key.matchesAny(&.{ vaxis.Key.enter, vaxis.Key.kp_enter }, .{}))
+                        // The save screen shows the selected theme, so there
+                        // must be one to select.
+                        if (key.matchesAny(&.{ vaxis.Key.enter, vaxis.Key.kp_enter }, .{}) and
+                            self.filtered.items.len > 0)
                             self.mode = .save;
                         if (key.matchesAny(&.{ 'x', '/' }, .{ .ctrl = true })) {
                             self.text_input.buf.clearRetainingCapacity();
@@ -467,7 +470,7 @@ const Preview = struct {
                         if (key.matchesAny(&.{ vaxis.Key.home, vaxis.Key.kp_home, 'g' }, .{}))
                             self.current = 0;
                         if (key.matchesAny(&.{ vaxis.Key.end, vaxis.Key.kp_end, 'G' }, .{}))
-                            self.current = self.filtered.items.len - 1;
+                            self.current = self.filtered.items.len -| 1;
                         if (key.matchesAny(&.{ 'j', '+', vaxis.Key.down, vaxis.Key.kp_down, vaxis.Key.kp_add }, .{}))
                             self.down(1);
                         if (key.matchesAny(&.{ vaxis.Key.page_down, vaxis.Key.kp_page_down }, .{}))
@@ -484,18 +487,20 @@ const Preview = struct {
                             self.hex = true;
                         if (key.matches('d', .{}))
                             self.hex = false;
-                        if (key.matches('c', .{}))
-                            try self.vx.copyToSystemClipboard(
-                                self.tty.writer(),
-                                self.themes[self.filtered.items[self.current]].theme,
-                                alloc,
-                            )
-                        else if (key.matches('c', .{ .shift = true }))
-                            try self.vx.copyToSystemClipboard(
-                                self.tty.writer(),
-                                self.themes[self.filtered.items[self.current]].path,
-                                alloc,
-                            );
+                        if (self.filtered.items.len > 0) {
+                            if (key.matches('c', .{}))
+                                try self.vx.copyToSystemClipboard(
+                                    self.tty.writer(),
+                                    self.themes[self.filtered.items[self.current]].theme,
+                                    alloc,
+                                )
+                            else if (key.matches('c', .{ .shift = true }))
+                                try self.vx.copyToSystemClipboard(
+                                    self.tty.writer(),
+                                    self.themes[self.filtered.items[self.current]].path,
+                                    alloc,
+                                );
+                        }
                         if (key.matches('f', .{})) {
                             switch (self.theme_filter) {
                                 .all => self.theme_filter = .dark,
@@ -862,7 +867,7 @@ const Preview = struct {
                 const save_instructions = [_][]const u8{
                     "To apply this theme, add the following line to your Ghostty configuration:",
                     "",
-                    try std.fmt.allocPrint(alloc, "theme = {s}", .{theme.theme}),
+                    try alloc.print("theme = {s}", .{theme.theme}),
                     "",
                     "Save the configuration file and then reload it to apply the new theme.",
                     "",
@@ -917,7 +922,7 @@ const Preview = struct {
                 child.fill(.{ .style = self.ui_standard() });
                 const middle = child.height / 2;
                 {
-                    const text = try std.fmt.allocPrint(alloc, "Unable to open {s} from:", .{theme.theme});
+                    const text = try alloc.print("Unable to open {s} from:", .{theme.theme});
                     const text_len: u16 = @intCast(text.len);
                     _ = child.printSegment(
                         .{
@@ -946,7 +951,7 @@ const Preview = struct {
                     );
                 }
                 {
-                    const text = try std.fmt.allocPrint(alloc, "{}", .{err});
+                    const text = try alloc.print("{}", .{err});
                     const text_len: u16 = @intCast(text.len);
                     _ = child.printSegment(
                         .{
@@ -1161,9 +1166,9 @@ const Preview = struct {
                     const r = i / 8;
                     const c = i % 8;
                     const text = if (self.hex)
-                        try std.fmt.allocPrint(alloc, " {x:0>2}", .{i})
+                        try alloc.print(" {x:0>2}", .{i})
                     else
-                        try std.fmt.allocPrint(alloc, "{d:3}", .{i});
+                        try alloc.print("{d:3}", .{i});
                     _ = child.printSegment(
                         .{
                             .text = text,
