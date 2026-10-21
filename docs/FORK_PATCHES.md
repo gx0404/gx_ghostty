@@ -669,10 +669,10 @@ Windows 本机的第一条用 `just test --filter gx. --filter config --filter c
 
 ## GX-0011 GTK 界面语言运行时切换、GX 菜单、启动配置与快捷键速查
 
-- 文件：`src/apprt/gtk/class/application.zig`（导入 GX GTK 层并引入其单测的纯新增块；`Application.new` 中按 `language` 改写 `LANG` 的 5 行换成一行 `gx_gtk.language.startup`；`startup` 在 `startupActionMap` 之后注册 GX app action；`propConfig` 开头跟随 `language` 变化）、`src/apprt/gtk/class/window.zig`（导入；`init` 与 `propConfig` 末尾重建菜单与提示；`surfaceMenu` 的参数改为具名，在右键菜单弹出前重建它；`closureTitle` 的兜底标题）、`src/apprt/gtk/class/tab.zig`（标签页兜底标题）、`src/apprt/gtk/class/surface.zig`（`defaultTermioEnv` 给子进程还原 `LANGUAGE`）、`src/apprt/gtk/App.zig`（纯新增 `gxAction`）、`src/apprt/gtk/build/gresource.zig`（登记 `gx/menus` Blueprint）。逻辑都在新路径 `src/apprt/gtk/gx/*.zig` 与 `src/apprt/gtk/ui/1.5/gx/menus.blp`。
+- 文件：`src/apprt/gtk/class/application.zig`（导入 GX GTK 层并引入其单测的纯新增块；`Application.new` 中按 `language` 改写 `LANG` 的 5 行换成一行 `gx_gtk.language.startup`；`startup` 在 `startupActionMap` 之后注册 GX app action；`propConfig` 开头跟随 `language` 变化；`deinit` 释放应用缓存的启动配置探测结果）、`src/apprt/gtk/class/window.zig`（导入；`init` 与 `propConfig` 末尾重建菜单与提示；`surfaceMenu` 的参数改为具名，在右键菜单弹出前重建它；`closureTitle` 的兜底标题）、`src/apprt/gtk/class/tab.zig`（标签页兜底标题）、`src/apprt/gtk/class/surface.zig`（`defaultTermioEnv` 给子进程还原 `LANGUAGE`）、`src/apprt/gtk/App.zig`（纯新增 `gxAction`）、`src/apprt/gtk/build/gresource.zig`（登记 `gx/menus` Blueprint）。逻辑都在新路径 `src/apprt/gtk/gx/*.zig` 与 `src/apprt/gtk/ui/1.5/gx/menus.blp`。
 - 标记：`fork(gx): GX-0011`；纯新增（导入、各钩子调用、`gxAction`、Blueprint 登记）都用 begin/end 包住，删掉这些块即得上游原文；改动的上游行（`Application.new` 的 `LANG` 改写、`surfaceMenu` 的参数名、两处兜底标题）上一行写单行标记。
 - 状态：active，未回馈上游。
-- 改动量：6 个文件，`git diff --numstat` 合计 +46/−8（含注释）。
+- 改动量：6 个文件，`git diff --numstat` 合计 +49/−8（含注释）。
 
 ### 原因
 
@@ -689,6 +689,7 @@ Windows 本机的第一条用 `just test --filter gx. --filter config --filter c
 - 新建标签页下拉：`gx.profiles.detectSystem` 探测到的启动配置加上 `gx-launch-profile`，名称随界面语言；条目激活 `app.new-tab`，参数为 `(0, ["-e", argv…])`（自定义命令行为 `--command=<值>`，均为 `class/Overrides.zig::parse` 的语法），新标签页照常继承工作目录；另有「用启动配置新建窗口」子菜单（`app.new-window-command`）。下拉按钮提示改为「启动配置与分屏」。
 - 快捷键速查：`Adw.Dialog`，按类别列出 `keybind` 根集合的绑定（含前导键序列与链式动作，跳过 `ignore` 与 catch-all），同一动作的多个按键并成一行；标题取命令面板默认条目或 GX 补充标题并经 `gx.i18n` 翻译，副标题是配置语法的动作，按键用 `GtkShortcutLabel`；顶部搜索框按标题、动作、类别与按键过滤。
 - `gx:` 绑定动作：`App.gxAction(target, action)` 按标签名分派 `settings`、`main_menu`、`keybinds`、`new_tab_profile`、`new_window_profile`；`action` 是 `anytype`，`src/apprt/gtk/gx/app.zig::request` 只按标签名映射，不依赖 `src/gx/action.zig::Action` 的具体定义，未知标签返回 false。`main_menu` 优先从可见的 ☰ 按钮弹出，否则借用活动终端的右键弹出菜单在其右上角显示，关闭后恢复原菜单。
+- 退出：`Application.deinit` 调 `gx/launch.zig::shutdown` 释放应用对象上缓存的 shell 探测结果，此后不再建缓存。应用对象不会被 finalize，挂在它上面的对象数据不会自动释放，不显式释放时调试构建在进程退出时报内存泄漏。
 - 子进程：`Surface.defaultTermioEnv` 在上游恢复 `LANG` 之后把 `LANGUAGE` 恢复为启动时的值（原来没有就删除），终端里的 shell 保持系统语言。
 
 ### 上游状态

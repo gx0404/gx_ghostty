@@ -456,6 +456,16 @@ class SettingsDialogTests(unittest.TestCase):
         self.assertLess(source.index('if (gx_font_zoom.scroll(self, ec, y))'),
                         source.index('const multiplier: f64 = if (priv.precision_scroll)'))
 
+    def test_application_deinit_releases_the_launch_profile_cache(self):
+        # The application is never finalized, so object data it owns must
+        # be released in deinit or the debug allocator reports it leaked.
+        source = strip_comments((GTK / "class/application.zig").read_text(encoding="utf-8"))
+        body = source.split("pub fn deinit(self: *Self) void {", 1)[1].split("\n    }\n", 1)[0]
+        self.assertIn("gx_gtk.launch.shutdown(self);", body)
+        launch = strip_comments((GX / "launch.zig").read_text(encoding="utf-8"))
+        cache = launch.split("fn appCache(", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("getData(stopped_key) != null) return null;", cache)
+
     def test_environment_flags_are_appended_before_gtk_init(self):
         source = (GTK / "class/application.zig").read_text(encoding="utf-8")
         self.assertIn('try @import("../gx/environment.zig").append("GDK_DEBUG", gdk_debug);', source)

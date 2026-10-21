@@ -485,6 +485,9 @@ pub const Application = extern struct {
         @import("../gx/session.zig").shutdown(self);
         // fork(gx): GX-0039 stale callbacks cannot resolve across application shutdown.
         @import("../gx/runtime.zig").shutdown(self);
+        // fork(gx): GX-0011 begin: release the launch profiles the application cached
+        gx_gtk.launch.shutdown(self);
+        // fork(gx): GX-0011 end
         const alloc = self.allocator();
         const priv: *Private = self.private();
         priv.config.unref();

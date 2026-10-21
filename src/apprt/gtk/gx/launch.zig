@@ -11,6 +11,7 @@
 //! every window, which follow each configuration change, do not probe the
 //! file system each time; detection runs again when `PATH` or `SHELL`
 //! change, or when the shells are older than `cache_lifetime_us`.
+//! `Application.deinit` releases them (`shutdown`).
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -76,6 +77,9 @@ pub const cache_lifetime_us: i64 = 10 * std.time.us_per_s;
 /// The object data key on the application holding its `Cache`.
 const cache_key = "gx-launch-profiles";
 
+/// Set on the application by `shutdown`: no cache is created afterwards.
+const stopped_key = "gx-launch-profiles-stopped";
+
 const Cache = struct {
     alloc: Allocator,
     shells: gx.profiles.Cache = .{},
@@ -93,11 +97,23 @@ const Cache = struct {
 fn appCache(app: *Application) ?*Cache {
     const object = app.as(gobject.Object);
     if (object.getData(cache_key)) |data| return @ptrCast(@alignCast(data));
+    if (object.getData(stopped_key) != null) return null;
     const alloc = app.allocator();
     const cache = alloc.create(Cache) catch return null;
     cache.* = .{ .alloc = alloc };
     object.setDataFull(cache_key, cache, &Cache.destroy);
     return cache;
+}
+
+/// Releases the shells the application detected. Called from
+/// `Application.deinit`: the application is never finalized, so its
+/// object data would otherwise outlive the allocator's leak check. Later
+/// lookups detect again without a cache.
+pub fn shutdown(app: *Application) void {
+    const object = app.as(gobject.Object);
+    object.setData(stopped_key, @ptrFromInt(1));
+    // Replacing the data runs `Cache.destroy` on the old value.
+    object.setDataFull(cache_key, null, null);
 }
 
 /// The profiles of the running system for `config`, with the shells the
