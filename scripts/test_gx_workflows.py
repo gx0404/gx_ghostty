@@ -514,7 +514,7 @@ class CiWorkflowTests(unittest.TestCase):
                 report = next(index for index in uploads if index > position)
                 self.assertEqual(field(job_steps[report], "if", 8), "always()")
         text = CI.job_text("windows-app")
-        order = [text.index(needle) for needle in (WIN32_BUILD + "\n", FILTERED_TEST_COMMANDS["windows-app"],
+        order = [text.index(needle) for needle in (WIN32_BUILD + " -Doptimize=fast -Dstrip=true\n", FILTERED_TEST_COMMANDS["windows-app"],
                                                    "name: gx-zig-test-windows-app", "CopyFromScreen")]
         self.assertEqual(order, sorted(order))
         report = next(step for step in steps(CI.job("windows-app"))
@@ -596,7 +596,7 @@ class CiWorkflowTests(unittest.TestCase):
         text = CI.job_text("windows-app")
         order = [text.index(needle) for needle in (
             "git config --global core.autocrlf false", "uses: actions/checkout@", "uses: mlugg/setup-zig@",
-            WIN32_BUILD + "\n", "Invoke-WebRequest", "-RedirectStandardError", "CopyFromScreen",
+            WIN32_BUILD + " -Doptimize=fast -Dstrip=true\n", "Invoke-WebRequest", "-RedirectStandardError", "CopyFromScreen",
             "'loaded OpenGL 4.'", "name: evidence-windows-smoke")]
         self.assertEqual(order, sorted(order))
         job_steps = steps(job)
@@ -610,6 +610,10 @@ class CiWorkflowTests(unittest.TestCase):
         self.assertEqual(mapping(upload, "with", 8)["path"], "${{ runner.temp }}/gx-windows-smoke/")
         build = next(step for step in job_steps if WIN32_BUILD in "\n".join(step))
         self.assertIsNone(field(build, "if", 8))
+        self.assertEqual([line.strip() for line in run_scripts(build)[0].splitlines()], [
+            WIN32_BUILD + " -Doptimize=fast -Dstrip=true",
+            "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+        ])
         script = run_scripts(smoke)[0]
         mesa = next(item for item in gx_windows_package.DOWNLOADS if item.name == gx_windows_package.MESA)
         self.assertIn(f"Invoke-WebRequest '{mesa.url}' -OutFile $archive", script)

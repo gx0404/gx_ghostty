@@ -302,9 +302,9 @@ jobs:
           cache-size-limit: 4096
           use-tool-cache: true
           cache-key: stable-toolchain-v1
-      - name: Build the win32 app
+      - name: Build the stripped fast win32 app
         run: |
-          zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu
+          zig build -Dapp-runtime=win32 -Dtarget=x86_64-windows-gnu -Doptimize=fast -Dstrip=true
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       # +validate-config must keep its exit code whatever stdout is: a pipe, a file or NUL (GX-0049).
       - name: validate-config exit codes with stdout on a pipe, a file and NUL
