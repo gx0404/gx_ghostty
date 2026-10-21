@@ -2,8 +2,8 @@
 
 ## 范围
 
-- fork 新路径 `src/gx/**`：win32 与 GTK 两个 apprt 共用的 GX 核心，以及它的数据文件 `defaults.ghostty`、`defaults-windows.ghostty`、`themes/GX Mocha`、`i18n/gx.zh_CN.po`，生成物 `i18n/zh_CN.zig`、`pinyin/initials.zig`、`pinyin/syllables.zig`（旁附上游许可原文）与 `fluent/paths.zig`。
-- 生成器：翻译表 `scripts/gx_i18n.py`（测试 `scripts/test_gx_i18n.py`，上游输入 `po/zh_CN.po` 同属 `apprt-gtk`）；拼音表 `scripts/gx_pinyin.py`（测试 `scripts/test_gx_pinyin.py`）；Fluent 图标 `scripts/gx_fluent_icons.py`（测试 `scripts/test_gx_fluent_icons.py`）。
+- fork 新路径 `src/gx/**`：win32 与 GTK 两个 apprt 共用的 GX 核心，以及它的数据文件 `defaults.ghostty`、`defaults-windows.ghostty`、`themes/GX {Mocha,Latte}`、`i18n/gx.zh_CN.po`，生成物 `i18n/zh_CN.zig`、`pinyin/initials.zig`、`pinyin/syllables.zig`（旁附上游许可原文）与 `fluent/paths.zig`。
+- 生成器（测试为同名 `scripts/test_*.py`）：翻译表 `scripts/gx_i18n.py`（上游输入 `po/zh_CN.po` 同属 `apprt-gtk`）、拼音表 `scripts/gx_pinyin.py`、Fluent 图标 `scripts/gx_fluent_icons.py`。
 - 分界：消费方是 win32 apprt（`apprt-win32.md`）与 GTK 的 GX 层 `src/apprt/gtk/gx/**`（`apprt-gtk.md`）；接入上游的钩子是 fork 补丁 GX-0006、GX-0007、GX-0008、GX-0010、GX-0012、GX-0014（见 `docs/FORK_PATCHES.md`），对应的上游规则分别在 `input.md`、`termio-pty-os.md`、`config.md`、`app-core.md`。
 
 ## 符号真源
@@ -23,8 +23,8 @@
 | `leader.zig`、`unread.zig` | 前台程序归类（远程、超级用户、容器）；后台标签的新输出 |
 | `url_policy.zig` | OSC 8 链接放行、先确认或拒绝，只看文本 |
 | `perf.zig` | `GHOSTTY_GX_PERF=1` 时每个样本记一行 `info(gx_perf): <指标> <微秒>us`，`scripts/gx_perf.py` 汇总 |
-| `ui_color.zig`、`ui_tokens.zig`、`chrome.zig`、`motion.zig` | 界面库，见下文「界面库」 |
-| `fuzzy.zig`、`pinyin.zig` | 模糊匹配：空格切词、各词都须命中，全角折叠，前缀与完全匹配加分，至少两个 ASCII 字母的词可按拼音首字母或全拼（ü 写作 v，原文字母优先）匹配汉字；`Frecency` |
+| `ui_color.zig`、`ui_tokens.zig`、`ui_metrics.zig`、`chrome.zig`、`motion.zig` | 界面库，见下文「界面库」 |
+| `fuzzy.zig`、`pinyin.zig` | 模糊匹配：空格切词、各词都须命中，全角折叠，前缀与完全匹配加分，至少两个 ASCII 字母的词可按拼音首字母或全拼（ü 写 v，原文字母优先）匹配汉字；`Frecency` |
 | `theme_swatch.zig`、`shortcuts.zig` | 主题文件的颜色与列表色块 `Cache`；快捷键速查的模型、键名与搜索（按标题或按键） |
 | `win32_input.zig`、`conpty.zig`、`osc7.zig`、`path_quote.zig` | Windows 终端支持：KEY_EVENT_RECORD 编码（GX-0006）、随包 ConPTY（GX-0007）、OSC 7 的盘符路径（GX-0008）、拖放与粘贴路径按 shell 引用 |
 | `gtk_css.zig` | GTK 外观的配色 CSS，纯文本生成，表面、文字、强调色与状态色取 `ui_tokens` |
@@ -44,8 +44,8 @@
 - `loadWithOverrides`（设置预览的内存覆盖，在命令行之上、`-e` 之下）、`defaultConfig`（只含 GX 默认值）、`overlayPath`（覆盖文件在首选用户配置文件旁）。
 - 默认值见 `defaults.ghostty`；Windows 另设 `quit-after-last-window-closed = true` 与 `shift+insert=paste_from_clipboard`（单测锁定）。win32 用 `setMaterialOpacity` 说明材质能否透到终端；能且各层都没设 `background-opacity` 时，默认值层末尾补 `materialOpacity`（mica、tabbed 0.3，acrylic 0.75）。
 - 默认值的三条命令面板条目是英文 msgid（须有译文，单测锁定）：GTK 构建在 `load` 时按最终 `language` 改写默认值层的这些重放步骤（`translatePalette`），win32 显示时才翻译，用户写的条目不改。
-- `gui_settings.zig::Overlay` 逐行编辑，保留注释、空行、未知键与顺序，`save` 原子替换。内置主题由 `theme.zig::install` 在加载前写进 `<配置目录>/ghostty/themes`（首行 `theme.marker`，内容变化才替换，无标记的同名用户文件不动）。
-- fork 配置键是 `src/config/Config.zig` 中 GX-0010 块的字段：`gx-launch-profile`（`名称=命令`，可重复）、`gx-herdr-app-mode`、`gx-window-material`（只在 Windows）、`gx-idle-processes`（空时用 `policy.builtin_idle_processes`）、`gx-open-config-ui`、`gx-ctrl-scroll-zoom`（默认 true，Windows 与 GTK）、`gx-single-instance`（默认 true，只在 Windows）、`gx-session-restore`（默认 false，Windows 与 GTK；后两者改动需完全重启）；`language` 只认 `zh-CN` 与 `en`。字段的 doc comment 就是用户文档，写法见 `config.md`。
+- `gui_settings.zig::Overlay` 逐行编辑，保留注释、空行、未知键与顺序，原子 `save`。内置主题由 `theme.zig::install` 在加载前写进 `<配置目录>/ghostty/themes`（首行 `theme.marker`，内容变化才替换，无标记的同名用户文件不动）。
+- fork 配置键是 `src/config/Config.zig` 中 GX-0010 块的字段：`gx-launch-profile`（`名称=命令`，可重复）、`gx-herdr-app-mode`、`gx-window-material`（只在 Windows）、`gx-idle-processes`（空时用 `policy.builtin_idle_processes`）、`gx-open-config-ui`、`gx-ctrl-scroll-zoom`（默认 true，Windows 与 GTK）、`gx-single-instance`（默认 true，只在 Windows）、`gx-session-restore`（默认 false，Windows 与 GTK；后两者改动需完全重启）、`gx-accent-color`；`language` 只认 `zh-CN` 与 `en`。字段的 doc comment 就是用户文档，写法见 `config.md`。
 
 ### i18n
 
@@ -63,14 +63,15 @@
 ### 界面库
 
 - `ui_color`：WCAG 对比度；`ensureContrast` 只移动 OKLab 明度，8 位量化后再校验；`pickAccent` 依次试光标色、palette 4、palette 12，取第一个彩度 ≥0.05 且达 3:1 的，否则夹紧明度，最后退回 #0067c0；`Color` 是 D2D1_COLOR_F 布局（win32 的 `d2d.Color` 即它）。
-- `ui_tokens`：两级表面由背景向限彩度的前景步进，按下比悬停淡；次要文字与占位符 4.5:1、三级文字 3:1、边框 1.4:1 在背景与两级表面上保底，强调色、焦点环与状态色对 `surface_raised` 3:1；win32 焦点环用 `focus_stroke` 加 `focus_stroke_inner`；高对比度用 `Tokens.fromSystem`。
+- `ui_tokens`：两级表面由背景向限彩度的前景步进，按下比悬停淡；次要文字与占位符 4.5:1、三级文字 3:1、边框 1.4:1 在背景与两级表面上保底，强调色、焦点环与状态色对 `surface_raised` 3:1；强调色见 `gx-accent-color`，`link` 是 GX 蓝；win32 焦点环用 `focus_stroke` 加 `focus_stroke_inner`；高对比度用 `Tokens.fromSystem`。
+- `ui_metrics`：圆角、间距、控件与行高、字号与签名条粗细（4 的倍数）。
 - `chrome`：标签条 `titleBar` 比背景深 32%（浅色 8%）且至少 1.12:1，另有分隔线、覆盖层、窗口边框与关闭钮色；`Chrome.fromSystem`；`Options.fromConfig` 读 `split-divider-color` 与 GTK 的 `window-titlebar-*`。
 - `motion`：83/167/250 ms，`enter`、`exit`、`ease`（移动）与 `linear` 曲线，`enabled` 综合系统动画设置、远程会话与 `GHOSTTY_GX_ANIMATIONS`。
-- 消费方：win32 的 `ui/style.zig` 逐字段镜像 `ui_tokens` 与 `chrome`，`ui/anim.zig` 取 `motion`（`apprt-win32.md`）；GTK 经 `gtk_css` 与 `src/apprt/gtk/gx/` 使用。
+- 消费方：win32 的 `ui/style.zig` 逐字段镜像 `ui_tokens`、`chrome` 与 `ui_metrics`，`ui/anim.zig` 取 `motion`（`apprt-win32.md`）；GTK 经 `gtk_css` 与 `src/apprt/gtk/gx/` 使用。
 
 ## 不变量
 
-- 可在任何主机上测：探测与判断写成注入 `Environment`、`io` 或 `/proc` 目录的纯函数（`profiles.detect`、`proc.Table.readProc`、`app_mode.procRunsHerdr`、`leader.procKind`），两个平台的规则都能单测；Windows 专属代码按 `builtin.os.tag` 编译期门控（`conpty`、`confirm.windows`、`profiles.wslDistros`）。
+- 可在任何主机上测：探测与判断是注入 `Environment`、`io` 或 `/proc` 目录的纯函数（`profiles.detect`、`proc.Table.readProc`、`app_mode.procRunsHerdr`、`leader.procKind`），两个平台的规则都能单测；Windows 专属代码按 `builtin.os.tag` 编译期门控（`conpty`、`confirm.windows`、`profiles.wslDistros`）。
 - 与 UI 工具包无关：`src/gx` 不导入 GTK、Win32 UI 模块或 apprt；`settings_map`、`gtk_css` 与界面库只产出数据与文本，界面在各 apprt 里。`src/gx` 只属于 app 产物（`config_layers` 读 `src/global.zig`），libghostty-vt 可达的代码不得导入它。
 - 层序是用户契约：改层或排序要同时更新 `config_layers.zig` 文件头、`defaults.ghostty` 注释与单测；默认值文件不写颜色。`gui-settings.ghostty` 只经 `Overlay` 或 `settings_map.Changes` 写入，「恢复默认」是删键（`Changes.reset`），值回落到下层；任何代码都不写用户的 `config.ghostty`。
 - 状态文件不是配置：窗口位置、会话与面板记录只写状态目录（`state_file` 原子替换），不进任何配置文件；面板记录不存明文。
@@ -91,6 +92,6 @@
 ## 验证
 
 - 单测：`just test --filter gx.`。Windows 本机跑 win32 构建的 `ghostty-test`，覆盖 Windows 分支；Linux 分支用 `just wsl test --filter gx.`（`-Dapp-runtime=none`，与 gx-ci 的 `linux-main` 相同）。改平台专属代码时两边都跑。
-- 翻译：`just i18n` 后 `just i18n-check`；改生成器跑 `python scripts/run_unittests.py test_gx_i18n`。拼音：`just pinyin-check`；改生成器或升级钉版跑 `python scripts/run_unittests.py test_gx_pinyin`，再 `just pinyin` 并审 diff；Fluent 同理用 `test_gx_fluent_icons` 与 `just fluent`。
+- 生成物：`just i18n` 后 `just i18n-check`，拼音 `just pinyin-check`，Fluent `just fluent-check`；改生成器或钉版输入跑 `python scripts/run_unittests.py` 的对应 `test_gx_*`，再重建并审 diff。
 - 改配置键、默认值或分层：`just test --filter gx.config_layers --filter gx.settings_map`，再按 `config.md` 的验证生成文档（`just build -Demit-webdata`），并用隔离配置启动 app 核对效果（GUI 证据见 `apprt-win32.md`、`apprt-gtk.md`）。
 - 改 Zig 跑 `just fmt-check`；改了 `pub` 签名或 `//!` 文档跑 `just kb`。

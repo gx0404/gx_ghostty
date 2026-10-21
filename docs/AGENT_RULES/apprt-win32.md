@@ -16,8 +16,8 @@
 | `App.zig`、`shortcut_conflicts.zig` | 窗口类 `GhosttyWindow`、`GhosttyTerminal`（`CS_OWNDC`）与消息窗口 `GhosttyMsg`；消息循环 `run`、`wakeup`、`performAction`、`gxAction`；默认 shell、全局热键、托盘通知；快捷键冲突检测（`RegisterHotKey` 试注册与 TSF 保留键查询） |
 | `Window.zig` | 顶层窗口：标签模型（每个标签一棵 split tree）、分屏布局、DPI、窗口位置、首帧前 cloak、herdr 应用模式、关闭标签与窗口；纯函数在 `tabs.zig`、`splits.zig` |
 | `Surface.zig` | 每个终端一个子 HWND：按键、IME、鼠标、拖放、剪贴板、标题与光标；持有查找栏、链接预览、滚动条与 `frame_event`；命令面板由 Window 持有 |
-| `chrome/TitleBar.zig`、`chrome/TabBar.zig`、`chrome/Backdrop.zig` | 集成标题栏（`WM_NCCALCSIZE`、`WM_NCHITTEST`、Snap Layouts）；Direct2D 标签栏；DWM 主题、窗口材质与按像素透明 |
-| `ui/d2d.zig`、`ui/style.zig`、`ui/anim.zig` | D2D/DirectWrite 绑定与 `Canvas`（DIP、像素对齐、文字缓存；`Color` 即 `gx.ui_color.Color`，`colorRef` 转 GDI 色）；设计 token（尺寸为 4 DIP 的倍数，编译期校验）；帧时钟与 `Tween` |
+| `chrome/TitleBar.zig`、`chrome/TabBar.zig`、`chrome/Backdrop.zig` | 集成标题栏（`WM_NCCALCSIZE`、`WM_NCHITTEST`、Snap Layouts）；Direct2D 标签栏与签名条；DWM 主题、窗口材质与按像素透明 |
+| `ui/d2d.zig`、`ui/style.zig`、`ui/anim.zig` | D2D/DirectWrite 绑定与 `Canvas`（DIP、像素对齐、文字缓存；`Color` 即 `gx.ui_color.Color`，`colorRef` 转 GDI 色）；设计 token（尺寸取 `gx.ui_metrics`）；帧时钟与 `Tween` |
 | `ui/Popup.zig`、`ui/controls.zig`、`ui/text_edit.zig`、`ui/Notice.zig`、`ui/Toast.zig` | 弹层（首帧揭幕、输入法 `TextInput`）；共用控件；编辑模型；提示条与 Toast |
 | `ui/Palette.zig`、`ui/Keybinds.zig`、`ui/trigger.zig` | 命令面板、快捷键速查表、绑定键帽与菜单提示（`Hints` 跳过冲突按键） |
 | `ui/Menu.zig`、`ui/MenuPopup.zig` | 主菜单、启动配置菜单、右键菜单；自绘模态菜单 |

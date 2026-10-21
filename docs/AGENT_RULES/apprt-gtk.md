@@ -9,7 +9,7 @@
 
 ## 符号真源
 
-本文中没写全的 `.zig` 路径（如 `class/…`、`build/…`、`winproto.zig`）都相对 `src/apprt/gtk/`；其它目录一律写全路径。
+没写全的 `.zig` 路径（如 `class/…`、`winproto.zig`）相对 `src/apprt/gtk/`，其它写全路径。
 
 ### 入口与主循环
 
@@ -37,7 +37,7 @@
 
 ### GX 层
 
-- `src/apprt/gtk/gx/**`（`main.zig` 汇总）承载 GTK 上的全部 GX 功能，上游类里只留登记过的钩子：`language.zig`（界面语言，GX-0011）、`app.zig`（`app.gx-*` action 与 `App.gxAction` 的处理）、`about.zig`（`app.gx-about`，写明非官方分支，代替上游 `win.about`）、`window.zig` 与 `menus.zig`（菜单与启动配置下拉随语言重建）、`launch.zig`（未设 `command` 时新终端默认 GX Zsh，经 `origin.zig` 接入，GX-0039）、`shortcuts.zig` 与 `shortcuts_dialog.zig`（快捷键速查）、`settings_dialog.zig` 与 `ui/1.5/gx-settings-dialog.blp`（设置对话框，GX-0015，libadwaita 低于 1.5 时退回编辑器）、`style.zig`、`style.css` 与 `app_mode.zig`（GX 外观与 herdr 应用模式，GX-0016）。与工具包无关的部分在 `src/gx/`（`gx-core.md`）。
+- `src/apprt/gtk/gx/**`（`main.zig` 汇总）承载 GTK 上的全部 GX 功能，上游类里只留登记过的钩子：`language.zig`（界面语言，GX-0011）、`app.zig`（`app.gx-*` action 与 `App.gxAction` 的处理）、`about.zig`（`app.gx-about`，写明非官方分支，代替上游 `win.about`）、`window.zig` 与 `menus.zig`（菜单与启动配置下拉随语言重建）、`launch.zig`（未设 `command` 时新终端默认 GX Zsh，经 `origin.zig` 接入，GX-0039）、`shortcuts.zig`、`shortcuts_dialog.zig`、`keycaps.zig` 与 `shortcut_editor.zig`（速查与编辑器）、`settings_dialog.zig` 与 `ui/1.5/gx-settings-dialog.blp`与 `launch_profiles_page.zig`（设置对话框与启动配置，GX-0015，libadwaita 低于 1.5 时退回编辑器）、`style.zig`、`style.css` 与 `app_mode.zig`（GX 外观与 herdr 应用模式，GX-0016）。与工具包无关的部分在 `src/gx/`（`gx-core.md`）。
 
 ### i18n
 

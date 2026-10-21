@@ -4233,8 +4233,9 @@ term: []const u8 = "xterm-ghostty",
 /// from the interface surfaces. Links keep the Ghostty GX blue unless
 /// this is `theme`, which takes palette 4 for them as well.
 ///
-/// On GTK this applies while `window-theme` is `auto` or `ghostty`, where
-/// the interface follows the terminal colors.
+/// On GTK this applies where the interface follows the terminal colors:
+/// while `window-theme` is `auto` or `ghostty`, or `system` with a light
+/// and a dark `theme` (as with the Ghostty GX default themes).
 ///
 /// The default is `brand`.
 ///
