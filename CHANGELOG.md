@@ -64,6 +64,7 @@
 
 ### Fixed
 
+- Windows 发布构建在 Zig 0.17.0 下保留同步异常展开表，修复 `fast` 优化并启用 `strip` 时的 SEH 编译失败；CI 增加这个发布组合的真实应用构建，保留 Debug 单测。
 - GTK/Windows 光标优先级：成功解析的显式 `cursor-style` 和 `cursor-style-blink=true/false` 分别高于 Vim/fzf、shell vi 模式及 `gx-prompt-cursor=bar` 的请求；等于默认值也优先。GX、系统与主题默认不锁光标，未显式用户保留程序控制。空 style 显式选择 block，空 blink 释放闪烁覆盖；重载删去最后一项显式来源后恢复程序状态。实际终端状态、渲染与 DECRQSS 一致，集成关闭时同样生效；macOS embedded 与 lib-vt 维持原行为。历史 C2-G 报告保留，新行为需重新验收。
 - Windows 尺寸提示在传统绘制路径中优先复用软件 DC/DIB，避免首次显示时创建独立的 HWND 渲染目标；提示的出现时机、窗格位置和首帧失败处理不变，DComp 仍是默认关闭的可选实验路径。本轮候选未再观察到原先的固定慢点，但 P7 的“超时次数严格少于旧版”仍未满足，不宣称该性能门通过。
 - Windows C7 采样明确记录 CPU、PDH 与呈现计数的实际起止范围；准备工作移到窗口外，缺少计划周期点或超出事前确定的计时精度时不再产出正式性能指标，失败原始数据仍保留。
