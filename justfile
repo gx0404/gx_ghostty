@@ -52,7 +52,7 @@ framework-test:
 # 框架门：rules-check、version-check、framework-test、kb-check、i18n-check、pinyin-check（改公开签名或文档后先 just kb）
 framework-check: rules-check version-check framework-test kb-check i18n-check pinyin-check
 
-# 生成物新鲜度门：kb-check、i18n-check、pinyin-check、graph-check（上游同步后与发版前）
+# 生成物新鲜度门：kb-check、i18n-check、pinyin-check、fluent-check、graph-check（含已构建的离线视图）
 generated-check: kb-check i18n-check pinyin-check fluent-check graph-check
 
 # 本地 CI 门：framework-check、fmt-check、test-vt
@@ -66,13 +66,21 @@ quick-prepare:
 quick-check:
     {{python}} scripts/quick_check.py check
 
-# 重建代码图谱（钉版 graphifyy，需先 just setup）
+# 重建代码图谱及离线三维视图（钉版 graphifyy，需先 just setup）
 graph:
     {{python}} scripts/graphify.py rebuild
 
-# 校验图谱源码指纹与报告是否新鲜
+# 校验图谱源码指纹、报告及本机已构建的离线视图是否新鲜
 graph-check:
     {{python}} scripts/graphify.py check
+
+# 从现有新鲜图谱重建离线视图，样式迭代无需重新提取 AST
+graph-view:
+    {{python}} scripts/graphify_viewer.py build
+
+# 只读校验离线视图输入、资源、输出闭集与内容摘要
+graph-view-check:
+    {{python}} scripts/graphify_viewer.py check
 
 # 查询代码图谱
 graph-query *a:
@@ -102,7 +110,7 @@ i18n-check:
 pinyin:
     {{python}} scripts/gx_pinyin.py
 
-# 离线只读校验拼音首字母表 src/gx/pinyin/initials.zig
+# 离线只读校验拼音首字母与全拼表
 pinyin-check:
     {{python}} scripts/gx_pinyin.py --check
 
@@ -158,13 +166,13 @@ package-windows *a:
 stage platform dir *a:
     {{python}} scripts/gx_package.py {{platform}} --stage-dir {{dir}} {{a}}
 
-# zig fmt 格式化全仓（排除 .local/ 与构建产生的 zig-pkg/、zig-out/、.zig-cache/）
+# 格式化 Git 可见的 Zig/ZON 源码，排除任意层级构建缓存
 fmt:
-    {{python}} scripts/zigw.py fmt --exclude .local --exclude zig-pkg --exclude zig-out --exclude .zig-cache .
+    {{python}} scripts/zig_fmt.py
 
-# 只检查 zig 格式（排除同上；zig-pkg/ 是 Zig 0.16 拉取的第三方依赖包，不归本仓格式化）
+# 只检查 Git 可见 Zig/ZON 源码格式（与 fmt 使用相同范围）
 fmt-check:
-    {{python}} scripts/zigw.py fmt --check --exclude .local --exclude zig-pkg --exclude zig-out --exclude .zig-cache .
+    {{python}} scripts/zig_fmt.py --check
 
 # 直通钉版 zig（例：just zig version）
 zig *a:

@@ -9,7 +9,7 @@ stdin:  the client's hook payload, e.g. {"tool_name": "Bash", "tool_input": {...
 stdout: nothing when the call is allowed, otherwise one PreToolUse decision JSON.
 exit:   0 once a decision is made; 2 (reason on stderr) when the payload is not a
         JSON object, or when the policy cannot be loaded or evaluated for a guarded
-        tool (shell, file writes, apply_patch). The hooks are registered for guarded
+        tool (shell, file reads/writes, apply_patch). The hooks are registered for guarded
         tools only, so an unreadable payload fails closed instead of silently allowing.
         1 (traceback on stderr) when evaluation outlives the watchdog deadline
         (EVALUATION_DEADLINE_SECONDS; tests may shorten it via GX_GATE_WATCHDOG_SECONDS);
@@ -38,6 +38,7 @@ REPO_ROOT = HOOK_DIR.parents[1]
 SECTIONS = ("SHELL", "FILE")
 LEVELS = ("deny", "ask")
 SHELL_TOOLS = frozenset({"bash"})
+READ_TOOLS = frozenset({"read"})
 WRITE_TOOLS = frozenset({"edit", "write", "multiedit", "notebookedit"})
 # Codex edits files through apply_patch, whose patch text names the target files.
 PATCH_TOOLS = frozenset({"apply_patch"})
@@ -219,7 +220,7 @@ def evaluate(
         # Codex can also run apply_patch through the shell; its patch headers name the files.
         if _APPLY_PATCH_CALL.search(command):
             paths = patch_targets(tool_input.get("command"))
-    elif name in WRITE_TOOLS:
+    elif name in READ_TOOLS or name in WRITE_TOOLS:
         paths = [value for key in FILE_KEYS if isinstance(value := tool_input.get(key), str)]
     elif name in PATCH_TOOLS:
         paths = patch_targets(tool_input)
@@ -286,7 +287,7 @@ def _read_payload() -> dict | None:
 
 def _is_guarded(tool_name: object) -> bool:
     name = str(tool_name or "").lower()
-    return name in SHELL_TOOLS or name in WRITE_TOOLS or name in PATCH_TOOLS
+    return name in SHELL_TOOLS or name in READ_TOOLS or name in WRITE_TOOLS or name in PATCH_TOOLS
 
 
 def _fail_closed(message: str) -> int:

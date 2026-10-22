@@ -1,12 +1,30 @@
 # .zcode（团队共享，fork 维护）
 
-ZCode 的项目配置面，只挂 PreToolUse 安全门。规则入口是根 `AGENTS.md`（ZCode 不经 `CLAUDE.md` 间接读取，根文件必须自足），领域规则由 `just rules <paths...>` 解析。
+ZCode 的规则入口是根 `AGENTS.md`，领域规则由 `just rules <paths...>` 解析，不经 `CLAUDE.md` 间接加载。
 
-- `config.json`：`hooks.enabled: true` 与毫秒单位的 `timeoutMs` 缺一不可（缺失或误用秒单位的 `timeout` 时 hook 静默不执行）。
-- 安全门复用 `.claude/hooks/block_dangerous.sh`（Claude 协议），策略真源 `.claude/hooks/dangerous_patterns.conf`；协议分叉时只加适配器，不复制策略。
-- hook 命令是 `bash "$(git rev-parse --show-toplevel)/.claude/hooks/block_dangerous.sh" || exit 2`：会话 cwd 在仓库外时找不到脚本，`|| exit 2` 让受控调用一律被拦，而不是以 127 放行。ZCode 没有文档化的项目目录变量，所以不像 Claude Code 那样读环境变量。
-- 这条命令是 POSIX 写法。如果 ZCode 在 Windows 上经 PowerShell 执行 hook，Windows PowerShell 5.1 会拒绝 `||`，PowerShell 7 里失败只剩 exit 1，都等于放行（Codex 因此另配了 `command_windows`）。ZCode 有没有对应字段未知，这里不臆造，记 PENDING。
-- `config.json` 自 2026-10 最小核心防线起不再受安全门额外确认，按正常流程修改。
-- 本机未安装 ZCode：协议兼容只由 `scripts/test_ai_tool_hooks.py` 的离线探针证明，真实会话中的加载与拦截记 PENDING（见 `docs/AI_TOOLS.md`）。
+当前 [ZCode 官方 hooks 文档](https://zcode.z.ai/en/docs/hooks) 明确：项目 `.zcode/config.json` 或 `zcode.json` 中的 hooks 会被整体忽略。仓内 `config.json` 因此保留为空对象，不声称提供已生效的项目安全门。
 
-plans、tmp、认证与 provider 等个人状态不入库（根 `.gitignore` 只放行 `config.json` 与本文件）。
+需要启用安全门时，由用户选择在 `~/.zcode/cli/config.json` 配置，或安装受信任的 hook 插件；本仓更新不写用户配置、权限、provider 或认证。用户级配置可以引用共享脚本，不复制模式：
+
+```json
+{
+  "hooks": {
+    "enabled": true,
+    "events": {
+      "PreToolUse": [{
+        "matcher": "Bash|Read|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [{
+          "type": "process",
+          "command": "<verified-python>",
+          "args": ["-B", "<checkout>/.claude/hooks/pre_tool_use_gate.py", "--protocol", "claude"],
+          "timeoutMs": 30000
+        }]
+      }]
+    }
+  }
+}
+```
+
+示例中的解释器与 checkout 须替换为本机已验证的绝对路径，并按字段合并到原配置。`process` 直接按 argv 执行，避免 Windows shell 的引号差异；共享门依赖仓库中的 `dangerous_patterns.conf`。此示例不是已安装配置，也不证明 ZCode 已加载或拦截。
+
+hook 配置在新会话开始时取快照。启用后分别验证普通调用、核心防线、模板例外与 Plan 边界；客户端、插件及用户级接入状态见 [AI 工具接入与验证账本](../docs/AI_TOOLS.md)。plans、tmp、认证、provider 与日志均不入库。

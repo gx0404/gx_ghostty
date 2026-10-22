@@ -1,185 +1,104 @@
 # AI 工具接入与验证账本
 
-本仓的 AI 协作面是「两份真源 + 各客户端薄适配」：
+项目有两份真源：根 `AGENTS.md` 与 `docs/AGENT_RULES/` 定义开发规则，`scripts/resolve_agent_rules.py` 按路径加载；`.claude/hooks/dangerous_patterns.conf` 定义危险模式，`.claude/hooks/pre_tool_use_gate.py` 统一求值。客户端目录只做薄适配，不复制领域正文。
 
-- 规则真源：根 `AGENTS.md` 加 `docs/AGENT_RULES/`，由 `scripts/resolve_agent_rules.py`（`just rules <paths...>`）按路径解析。
-- 危险操作真源：`.claude/hooks/dangerous_patterns.conf`，判定逻辑 `.claude/hooks/pre_tool_use_gate.py`。
+认证、会话与本机覆盖不入库；白名单见根 `.gitignore`，`.kimi-code/` 整目录忽略。以下契约与本机检查更新至 2026-10-22。配置文件存在或离线探针通过，都不证明真实会话已经加载、信任并调用 hook。
 
-各客户端目录只做协议适配，不复制规则或模式。入库范围由根 `.gitignore` fork 段的白名单决定；认证、会话、`settings.local.json` 等个人状态留在本机，`.kimi-code/` 整目录忽略。
+## 客户端入口
 
-## 各客户端如何加载
+| 客户端 | 规则与配置 | 项目 hook | 角色与限制 |
+|---|---|---|---|
+| Claude Code | `CLAUDE.md` 导入根规则；`.claude/rules/` 按路径提醒 resolver；`.claude/settings.json` | `Bash|Read|Edit|Write|MultiEdit|NotebookEdit` → `block_dangerous.sh` | `.claude/agents/code-reviewer.md`；只读职责靠工具集合与指令，不把角色当独立权限沙箱 |
+| Codex | 原生根 `AGENTS.md`；受信任后加载 `.codex/config.toml` | `^(Bash|apply_patch)$` → `pre_tool_use_policy.py` | 定义四个角色，按 `.codex/agents/*.toml` 的 `name` 协议发现；实际项目发现见账本，不再用旧 `config_file` 注册 |
+| Kimi Code | 会话注入根规则；项目 skills 扫描 `.agents/skills/` | 无项目级 hook | 用户级 hook 可选；出错或超时按放行处理 |
+| ZCode | 根 `AGENTS.md`；`.zcode/config.json` 保留空对象 | 官方明确忽略项目级 hooks | 需要时由人类配置用户级或插件 hook，本仓不自动安装 |
 
-| 客户端 | 规则入口 | 领域规则 | 项目配置 | 安全门 | 只读复审 |
-|---|---|---|---|---|---|
-| Claude Code | `CLAUDE.md` 首行 `@AGENTS.md` 导入根规则 | resolver；`.claude/rules/*.md` 按 `paths` 触发「先跑 resolver」提醒 | `.claude/settings.json` | PreToolUse（Bash 与写文件工具）→ `.claude/hooks/block_dangerous.sh`，Claude 协议，支持 ask | `.claude/agents/code-reviewer.md` |
-| Codex | 根 `AGENTS.md`（原生读取） | resolver | `.codex/config.toml`（项目受信任后才加载） | PreToolUse（匹配 Bash 与 `apply_patch`）→ `.codex/hooks/pre_tool_use_policy.py`，Codex 协议，ask 按 deny 返回 | `.codex/agents/gx-ghostty-reviewer.toml` |
-| Kimi Code | 根 `AGENTS.md`（会话启动时注入） | resolver；项目 skill 目录 `.agents/skills/` | 无（`.kimi-code/` 不入库） | 无项目级 hooks，见下文 | 无专属定义；按 `docs/AGENT_RULES/code-review.md` 自审 |
-| ZCode | 根 `AGENTS.md`（不经 `CLAUDE.md`，根文件必须自足） | resolver | `.zcode/config.json`（只有 hooks） | PreToolUse → 同一个 `block_dangerous.sh`，Claude 协议 | 无 |
+Codex 角色只声明职责。模型与推理档由父会话依用户级路由显式选择，provider、认证和权限继承宿主；角色里的文字不建立独立沙箱。已移除角色中的固定模型、推理档以及 reviewer 的 `sandbox_mode` / `approval_policy` 覆盖，项目不保存个人模型策略。
 
-各工具的规则文件、reviewer 与 `CLAUDE.md` 都只提醒运行 resolver，规则正文只在 `docs/AGENT_RULES/`。
+上游 `.agents/skills/writing-commit-messages` 保持原样，只用于准备回馈上游；fork 提交遵守根规则的 `type(scope): 中文描述`。`.agents/commands/review-branch` 可作为只读提示，输出服从 `code-review` 域。
 
-## 共享安全门（PreToolUse）
+## 共享安全门
 
-以下描述的是策略与适配器在**已加载、受信任且确实收到调用**时的判定，不是所有客户端的无条件保障。离线 fail-closed 不能覆盖未加载或未信任的 hook；真实客户端状态单列在验证账本，Codex 本次 shell 拦截探针为 FAIL。权限基线不因这些离线结果而自动变得安全。
+### 最小核心防线
 
-### 策略
+2026-10 授权保留四类 deny，未新增 ask。SHELL 三条与 FILE 两条的精确正则以策略文件为准：
 
-`dangerous_patterns.conf` 每行 `SECTION<TAB>regex<TAB>理由<TAB>deny|ask`：
+| 类别 | 处理范围 |
+|---|---|
+| force push | `-f`、`--force`、`--mirror`、`+refspec`，含引号、包装器与全局 git 参数；现行正则未拒绝 `--force-with-lease`，根规则仍禁止 force push |
+| 根/家目录删除 | `rm`、PowerShell 删除命令及别名以根、家目录、盘符根和对应通配符为操作数；普通具体目录不因此被拒绝 |
+| 凭据读取 | shell 读取命令、解释器，以及 Claude 原生 `Read` 的目标路径；`.env` 变体、私钥与 `.ssh/` 按共享规则判定 |
+| 凭据写入 | Claude 文件工具与 Codex 补丁头路径；模板例外为 `.env.example`、`.env.sample`、`.env.template`，`.envrc` 不匹配凭据规则 |
 
-- SHELL 段匹配 Bash 命令全文；另把反斜杠续行（bash）与反引号续行（PowerShell）并成一行再匹配一次，任一命中即算。
-- FILE 段匹配写文件工具（Edit、Write、MultiEdit、NotebookEdit）的目标路径，以及 Codex `apply_patch` 补丁头里的路径（见下文）：先相对化到仓库根（由 hook 文件位置推导，不依赖会话 cwd），再按大小写不敏感匹配。
-- 同一调用同时命中 deny 与 ask 时，deny 优先。
+本轮将原生 `Read` 接入同一 FILE 策略，补齐此前 shell 读取与原生读取之间的变体缺口；嵌套 `tool_input.file_path`、`path`、`notebook_path` 均由共享门提取，先按仓库根相对化再匹配。`.pub` 只按相应私钥模式的例外处理，不把整个 `.ssh/` 目录视为可读。
 
-2026-10 用户授权把安全门收窄为「最小核心防线」：只保留以下四类 deny，其余策略规则与 ask 级规则全部放开。放开的操作（推送 `upstream`、`--no-verify`、`git add -f`、历史清理、`gh` 写操作与发版触发、系统级安装、shell 改写生成物、改安全门与客户端配置、`reset --hard`、`pkill` 等）不再被拦截，但根 `AGENTS.md` 与 `docs/AGENT_RULES/` 的流程要求不变，仍须遵守。
+推送 `upstream`、跳过 hook、强制暂存、发布触发、系统级安装、修改生成物与安全门等，已不在 hook 拒绝集合；根规则的授权、治理与生成流程仍有效。hook 不是完整 shell 解析器，也不是操作授权来源。
 
-deny（SHELL 段，共三条）：
+### 协议与执行
 
-- force push（`-f`、`--force`、`--mirror`、`+refspec`；参数带引号也算，如 `"+HEAD:gx_ghostty"`、`"--force"`）。`--force-with-lease` 不在拒绝之列（原 ask 规则已放开）。
-- 删除命令以根目录、家目录或盘符根为操作数：`rm`、`Remove-Item` 及别名（`ri`、`rd`、`del`、`erase`）后跟 `/`、`/*`、`//`、`~`、`~/`、`~/*`、`$HOME`/`${HOME}`（含 `/*` 变体）或 `C:\`、`C:/*`、`/c/`、`/c/*` 这类盘符根；`--` 分隔符、多次短选项与大小写命令名都算。普通目标（`rm -rf build/`、`rm -rf ~/src/x`、`rm -rf /tmp/x`）照常放行。
-- 读取私钥、`.ssh/` 或 `.env`。读取类命令除 `cat`、`head`、`cp` 等外，还包括 `grep`、`rg`、`sed`、`awk`、`sort`、`diff` 等文本工具，`python`、`node`、`perl`、`ruby` 解释器，以及 PowerShell 的 `Get-Content`、`gc`、`type`、`Select-String`、`Copy-Item`（不区分大小写）。
+- SHELL 匹配真实命令位置，并处理续行、包装器与带引号命令。文本提及通常放行，但引号或 heredoc 中看起来像命令的片段可能被保守拒绝；边界用成对探针锁定。
+- Codex `apply_patch` 不提供普通 `file_path`，共享门提取 `*** Add/Update/Delete File:`、`*** Move to:` 的路径；shell 调用补丁工具时同样提取。普通 Write/Edit 正文不当作补丁解析。
+- 已受控的调用遇到策略缺失/损坏、非法 JSON、缺解释器或共享门失败，注册入口转为 exit 2，并向 stderr 写原因。非受控工具不参与此判定。
+- Claude 注册命令使用 `${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}` 和 Git Bash；Codex POSIX 使用 `command`，Windows 使用 PowerShell 的 `command_windows`，通过 `$?` 与 `$LASTEXITCODE` 统一转 exit 2。不能把 POSIX `|| exit 2` 直接搬到 Windows PowerShell。
+- `block_dangerous.sh` 依次尝试可运行的 `python3`、`python`。共享引擎的 C 级看门狗限制单次求值 10 秒，客户端注册 timeout 为 30 秒；测试覆盖病态长选项与失败关闭，不由此承诺所有 shell 文本都可精确识别。
+- Claude 输出 `hookSpecificOutput.permissionDecision`；Codex 适配器只出 deny，保留的 ask 机制映射为 deny。扁平 `permissionDecision/reason` 不是本仓采用的 Codex schema。
 
-deny（FILE 段，共两条）：
+当前策略没有 ask。修改入口或 matcher 时同步更新 `scripts/test_ai_tool_hooks.py`，既测拒绝，也测合法命令、模板与纯文本放行；使用真实工具 payload 和原样注册命令，不能只直调引擎。
 
-- 凭据写入：`.env` 及其变体（`.env.example` 等模板与上游的 `.envrc` 除外）。
-- 私钥与 SSH 目录写入：`id_rsa` 等非 `.pub` 私钥、`*.pem`、`*.key`、`*.p12`、`*.pfx` 与 `.ssh/`。
+## 权限与加载边界
 
-ask：当前策略没有 ask 规则（机制保留；未获新的用户授权不得恢复限制）。
-
-### 命令位置锚定
-
-所有 SHELL 规则共用同一个前缀，只在以下位置命中：
-
-- 行首；
-- `;`、`&`、`|`、`(`、`)`、`{`、反引号、`$(` 之后，其中 `)` 覆盖 `case` 分支；
-- 上述位置之后的 shell 关键字 `if`、`elif`、`while`、`until`、`then`、`do`、`else` 与 `!` 之后；
-- `sudo`、`env`、`xargs`、`timeout`、`bash -c`、`sh -c`、`eval`、`powershell`、`pwsh`、`wsl`，以及 PowerShell 的 `iex`、`Invoke-Expression`、`Start-Process`（不区分大小写）等包装词之后，而且包装词本身也要处在命令位置；
-- 容许 `VAR=x` 前缀、`git -C <path>` 这类全局选项，以及用 `/` 或 `\` 分隔的命令路径；
-- 命令名、git 子命令与 push 的危险参数可以带引号（`"git" push`、`& "git" push`、`git "push"`），参数之间可以是逗号（`Start-Process git -ArgumentList "push","--force"`）。
-
-关键字和包装词分开处理：关键字后面紧跟的就是命令，所以 `if rg -q 'git push -f' docs; then …` 仍然放行；包装词会跳过任意参数，误拦面更大，因此不把关键字并进包装词列表。
-
-git 的全局选项用无歧义的 `--?\w[\w-]*` 逐个跳过。旧写法 `-{1,2}[\w-]+` 对 `--x` 有两种切分，匹配失败时指数回溯：带 22 个长选项的命令实测要 7 秒，24 个要 22 秒，而 hook 超时等于放行。测试锁定 40 个长选项在 1 秒内判完。包装词之后的参数跳过仍有平方级最坏情况（单行几万字符、同一命令名重复上千次的刻意构造），由下文的判定看门狗兜底。
-
-因此：
-
-- 真执行会被拦：直接执行、`&&` 链式、`sudo`、`xargs`、`bash -c '…'`、`iex`/`Invoke-Expression`/`Start-Process`/`wsl` 包装、`VAR=x` 前缀、`git -C path`、`if`/`while`/`until`/`!` 与 `case` 分支里的命令、用续行拆开的命令、带引号的命令名与参数，以及 `bash <<EOF` 正文里位于行首的命令。
-- 只是提到命令不会被拦：`rg` 的搜索词、python heredoc 里的字符串、`git commit -m` 的说明、`echo` 的参数。
-
-正则看不到引号的边界，以下误拦是有意保留的保守行为：
-
-- 引号里出现 `;`、`&&`、`(`、`)` 或反引号，后面紧跟危险命令。双引号里的反引号确实会执行。
-- heredoc 正文里某一行以危险命令开头。
-- 读取类命令的参数里出现 `.env`、`id_rsa`、`.ssh`、`*.pem` 等字面量，例如 `rg '\.env' docs/`。换一个不含这些字面量的检索词即可。
-
-### Codex 的 apply_patch
-
-Codex 改文件走 `apply_patch`，参数里没有 `file_path`。共享门从 `apply_patch` 的 `tool_input` 里任一字符串值提取补丁头 `*** Add File:`、`*** Update File:`、`*** Delete File:`、`*** Move to:` 之后的路径，再套 FILE 规则；Bash 命令调用 `apply_patch`（例如 heredoc 形式）时同样提取。Write、Edit 写入的正文不解析，文档里的补丁示例不会误拦。
-
-这是尽力而为的覆盖：离线探针已覆盖补丁头的各种写法，但 Codex 真实会话里 hook 收到的 `tool_name` 是否就是 `apply_patch`、补丁文本放在哪个键里，都未实测（PENDING）。对不上时 FILE 规则不生效；SHELL 段也只能在 hook 已加载、受信任且实际收到相应命令时判定，不能视为客户端漏载时的备用保障。
-
-### 失败关闭与协议
-
-- 策略任一行非法、文件缺失或不是 UTF-8 时，受控工具（Bash、写文件工具、`apply_patch`）一律 exit 2，原因写到 stderr；其他工具照常放行。
-- hook 只注册在受控工具上，所以 stdin 为空、不是合法 JSON 或不是 JSON 对象时，同样按失败关闭处理（exit 2）。
-- 注册命令本身也失败关闭。Claude Code 与 Codex 只把 exit 2 当拦截（ZCode 沿用 Claude 协议，未实测），127（脚本或解释器找不到）、1 等其他退出码只记 hook 失败，工具照常执行；因此注册命令都把失败统一转成 exit 2：
-  - Claude Code：`bash "${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel)}/.claude/hooks/block_dangerous.sh" || exit 2`。Claude Code 给 hook 导出 `CLAUDE_PROJECT_DIR`，会话 cwd 在仓库外也照常判定。
-  - ZCode：`$(git rev-parse --show-toplevel)` 形式加 `|| exit 2`。ZCode 没有文档化的项目目录变量，这里不臆造；cwd 在仓库外时所有受控调用都被拦。
-  - Codex（POSIX）：`command = 'python3 "$(git rev-parse --show-toplevel)/.codex/hooks/pre_tool_use_policy.py" || exit 2'`。Codex 0.160 把 exit 2 加 stderr 原因当作拦截（可执行文件里有 `PreToolUse hook exited with code 2 but did not write a blocking reason to stderr` 的报错），`python3` 缺失时 shell 自己会往 stderr 写原因。
-  - Codex（Windows）：Codex 在 Windows 上经 PowerShell 执行 `command_windows`，内容是同一条 `python3 "$(git rev-parse --show-toplevel)/…/pre_tool_use_policy.py"`，后接 `; if (-not $? -or $LASTEXITCODE -ne 0) { exit 2 }`。POSIX 写法在这里不能用：Windows PowerShell 5.1 直接拒绝 `||`（解析错误，exit 1），PowerShell 7 里 `|| exit 2` 不生效，失败一律以 exit 1 结束，两者对 Codex 都等于放行。`$?` 覆盖 `python3` 找不到的情况（此时 `$LASTEXITCODE` 不会被设置，还停留在 `git rev-parse` 的 0），`$LASTEXITCODE` 覆盖安全门或 Python 的非 0 退出。键名 `command_windows` 与 `commandWindows` 都被 Codex 0.160 接受：把任一个设成整数，`codex -c … features list` 都报 `invalid type: integer, expected a string`，未知键则被忽略。
-- `block_dangerous.sh` 依次尝试 `python3`、`python`；第一个解释器无法运行时（例如 Windows 应用商店的 `python3` 占位程序）回退到下一个，两者都不可用时 exit 2。Codex 适配器加载不到共享门或共享门运行出错时同样 exit 2。
-- 判定看门狗：客户端在 hook 超时（30 秒）后放行工具，而病态命令能让正则引擎在不释放 GIL 的情况下长时间运行。共享门用 `faulthandler` 的 C 级看门狗限时 10 秒（`pre_tool_use_gate.py::EVALUATION_DEADLINE_SECONDS`），超时以 exit 1 结束并把调用栈写到 stderr；注册命令把它转成 exit 2。`block_dangerous.sh` 最多试两个解释器，两次限时加启动仍在 30 秒内。
-- Claude Code 与 ZCode 收到 `hookSpecificOutput.permissionDecision`，取值 deny 或 ask。
-- Codex 收到同一结构，但从不出现 ask：Codex 0.160 把 ask 当作 hook 失败并继续执行工具，所以 ask 级规则按 deny 返回，理由里注明。Codex 的输出键集合按其可执行文件内嵌的 PreToolUse 输出 schema（两级都是 `additionalProperties: false`）锁进测试。扁平的 `{"permissionDecision", "reason"}` 不在该 schema 内，属于无效输出；按 Codex 文档，hook 只会被记为失败，工具照常执行，所以本仓不用这种写法。
-
-### 修改流程
-
-只改 `dangerous_patterns.conf`，然后跑 `python -m unittest scripts.test_ai_tool_hooks`。新增模式要同时补「真执行被拦」与「文本提及放行」两组探针；探针里的危险字面量用字符串拼接构造，避免被宿主会话自身的安全门拦下。改注册命令或 matcher 时，同步改测试里锁定的命令与 matcher 常量。
-
-## 权限
-
-- **Claude Code**：
-  - `defaultMode: acceptEdits`。
-  - allow：仓内 `Read(./**)` 与 `Edit(./**)`，Glob、Grep、WebSearch、WebFetch、Agent、Skill，以及整工具 `Bash`（2026-10 白名单放开，不再限定命令前缀）。
-  - deny：凭据/私钥的读取与写入，即 `Read`/`Edit` 的 `.env`（含变体）、`*.pem`、`*.key`、`id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`（不含 `.pub`）与 `.ssh/`。
-  - 不设 ask 列表：ask 在任何模式下都会弹窗，allow 与 hook 都压不住。
-  - 不写 `Write(...)` 路径规则：Claude Code 只按 `Read(...)`/`Edit(...)` 判定文件权限，`Edit` 规则同时覆盖 Write 与 NotebookEdit。
-  - reviewer 的 `permissionMode` 会被主会话的 acceptEdits 覆盖，所以只读边界靠工具白名单（Read、Grep、Glob、Bash）与 `disallowedTools`。
-- **Codex**：
-  - `approval_policy = "never"` + `sandbox_mode = "danger-full-access"`，是用户授权的既有基线，本仓不改 sandbox、model 或审批权限。它不自带破坏性操作保障；安全门只有在项目配置已加载、当前 hook hash 已受信任且调用确实经过它时才参与判定，当前真实拦截为 FAIL。
-  - `[shell_environment_policy]` 继承全部环境变量，但排除 `*KEY*`、`*SECRET*`、`*TOKEN*`、`*PASSWORD*`。
-  - reviewer 用 `config_file` 注册，`sandbox_mode = "read-only"`。
-  - 项目层配置只在 Codex 信任本项目后加载；非托管 hook 首次出现或内容变更后，要在 `/hooks` 里审阅并信任，否则会被跳过。
-- **ZCode**：只有 hooks；`hooks.enabled: true` 与毫秒单位的 `timeoutMs` 缺一不可。
-- **Kimi Code**：项目不提供配置，审批行为由用户自己的设置决定。
-
-## Kimi Code
-
-- **规则**：会话启动时注入根 `AGENTS.md`，文件落盘变化后提示重读。2026-10-07 用 Kimi Code 2.1.1 新会话确认 fork 段也自动注入；在任何工具调用前已复述三条 fork 规则，证据见验证账本。
-- **skills**：按[官方文档](https://www.kimi.com/code/docs/en/kimi-code-cli/customization/skills.html)，项目级扫描 `.kimi-code/skills/` 与 `.agents/skills/`，用户级扫描 `$KIMI_CODE_HOME/skills/` 与 `~/.agents/skills/`。
-  - 本仓 `.agents/skills/writing-commit-messages` 是上游 skill，格式为 `<subsystem>: <summary>`。Kimi Code 与 Codex 都会发现它，本会话的项目 skill 列表里就有它；Claude Code 不读取 `.agents/`。
-  - 提交信息一律按根 `AGENTS.md`「提交规范」的 `type(scope): 中文描述`，fork 规则优先；该 skill 只用于准备回馈上游的提交。
-  - `.agents/commands/review-branch` 仍可作为审核提示使用，结论按 `code-review` 的格式输出。
-- **hooks**：按[官方文档](https://www.kimi.com/code/docs/en/kimi-code-cli/customization/hooks.html)，Kimi Code 的 hooks 只写在用户级 `~/.kimi-code/config.toml` 的 `[[hooks]]` 里，没有项目级 hooks，所以本仓安全门不会自动作用于 Kimi 会话；而且 Kimi 的 hook 出错或超时都按放行处理（fail-open）。
-  - 需要时可以在用户配置里自行挂接，下面的写法未经验证：
-    ```toml
-    [[hooks]]
-    event = "PreToolUse"
-    matcher = "^(Bash|Write|Edit)$"
-    command = 'python3 "$(git rev-parse --show-toplevel)/.codex/hooks/pre_tool_use_policy.py" || exit 2'
-    timeout = 30
-    ```
-  - 这里选 Codex 适配器，是因为 Kimi 文档只描述了 deny（exit 2，或 `hookSpecificOutput.permissionDecision: "deny"`），没有提到 ask；末尾的 `|| exit 2` 把启动失败也转成 deny。共享门已兼容 Kimi 写文件工具的 `path` 参数。如果 Kimi 在 Windows 上经 PowerShell 执行 hook，`||` 同样失效，要换成 `.codex/config.toml` 里 `command_windows` 的写法。
+- Claude 项目保留 `acceptEdits` 与整工具 Bash allow；原生权限 deny 是补充，Read/写入的凭据变体由共享 FILE 门完整判定。不加 Write 路径规则或 ask 白名单。
+- Codex 项目保留已授权的 `approval_policy = "never"`、`sandbox_mode = "danger-full-access"`，不改变父会话的实际权限边界。环境继承排除 `*KEY*`、`*SECRET*`、`*TOKEN*`、`*PASSWORD*`；这不构成读取凭据的授权。
+- Codex 的项目配置受项目信任控制，非托管 hook 还需审阅当前 hash。不得自动授予信任，不读取私人会话或全层配置 RPC。角色发现、`hooks=true` 与 `git status` 成功都不能代证拦截。
+- Kimi 的用户级 `[[hooks]]` 与 ZCode 用户级/插件 hooks 仅为可选接入，不在本任务自动写入。尤其 ZCode 项目 `{}` 不应被解释为已经保护工具调用。
 
 ## 验证账本
 
-只把实际跑过的检查记为 PASS。离线探针都在 `scripts/test_ai_tool_hooks.py` 里，2026-10-07 在 Windows 11 上实测：
+### 2026-10-22 本轮
 
-- 从 Git Bash 运行 `python -m unittest scripts.test_ai_tool_hooks`：62 项通过，exit 0。
-- 从 cmd.exe 在最小 Windows PATH 下运行同一命令：此时 `bash` 先解析到 WindowsApps 的 WSL 启动器，测试改从 `git --exec-path` 推导出 Git Bash，62 项同样全部通过，exit 0。
-- 2026-10-21 策略收窄为最小核心防线后，从 Git Bash 重跑同一命令：64 项通过，exit 0。
-- PowerShell 测试在本机用 Windows PowerShell 5.1.26100 与 PowerShell 7.6.6 原样执行注册的 `command_windows`；Windows 上两者都找不到时测试失败而不是跳过，只有非 Windows 主机才跳过。
-- `command_windows` 的键名用 `codex -c … features list`（0.160.0）离线核对：把它设成整数时配置加载报类型错误，未知键不报错；同一 hooks 段放进临时 `CODEX_HOME` 的 `config.toml` 时加载通过。
+本机版本：Codex `0.163.0-alpha.11`、Claude Code `2.1.76`。本轮证据在 `.local/evidence/ai-refresh-20261022/ai-config/`，不提交私人配置或会话。
 
-| 项 | Claude | Codex | Kimi | ZCode |
-|---|---|---|---|---|
-| 配置可解析且形状锁定 | PASS（JSON；无 ask 列表；hook 注册与脚本存在） | PASS（tomllib；数组表 hooks、matcher 含 `apply_patch`、秒单位 timeout、reviewer `config_file` 存在且为 read-only） | N/A（无项目配置） | PASS（JSON；`enabled: true`、`timeoutMs: 30000`） |
-| 引擎成对探针（真执行拦 / 文本提及放行 / FILE 绝对与相对路径） | PASS | PASS | N/A | PASS |
-| `apply_patch` 补丁头的 FILE 判定（离线） | N/A（无此工具） | PASS | N/A | N/A（无此工具） |
-| 40 个长选项的命令 1 秒内判完（防回溯超时） | PASS | PASS | N/A | PASS |
-| 判定看门狗（超时以非 0 结束，注册命令转成 exit 2） | PASS | PASS | N/A | PASS |
-| 按注册命令原样经 Git Bash 执行（仓库根与子目录两种 cwd） | PASS | PASS（`command`） | N/A | PASS |
-| 按 `command_windows` 原样经 powershell.exe 5.1 与 pwsh 7 执行 | N/A | PASS（deny 输出 JSON 且 exit 0；空 payload、仓库外 cwd、缺 `python3` 都 exit 2） | N/A | N/A（ZCode 无此字段，见下文第 6 步） |
-| 注册命令失败关闭（仓库外 cwd、stdin 非 JSON、缺解释器都 exit 2） | PASS（设了 `CLAUDE_PROJECT_DIR` 时仓库外照常判定） | PASS | N/A | PASS |
-| 协议输出 | PASS（deny / ask） | PASS（只出 deny，键集合符合 0.160 schema） | N/A | PASS（Claude 协议输出；ZCode 是否按该协议执行未实测） |
-| 失败关闭（策略损坏、缺 Python、缺共享门、共享门运行出错） | PASS | PASS | N/A | PASS |
-| 适配器完整性（python3 调用的文件过 `ast.parse`，bash 调用的文件过 `bash -n`） | PASS | PASS | N/A | PASS |
-| 规则提醒 `paths` 的每个 glob 命中 Git 可见文件 | PASS | N/A | N/A | N/A |
-| 本机客户端 | PENDING（未安装 claude） | PASS（`codex --version`：codex-cli 0.160.0） | PASS（`kimi --version`：2.1.1） | PENDING（未安装 zcode） |
-| 严格配置解析（真实启动） | PENDING | PASS（0.160.0，`codex exec --strict-config --ephemeral` 短真实调用 exit 0；不代证项目层实际生效） | N/A | PENDING |
-| 新会话加载规则入口 | PENDING | PASS（0.160.0，根 `AGENTS.md` 自动注入） | PASS（2.1.1，工具调用前已复述 fork 三条规则） | PENDING |
-| 项目层配置实际生效 | PENDING | PENDING（项目层是否受信任并被加载尚未确认） | N/A（无项目配置） | PENDING |
-| 真实会话中 shell hook 拦截 | PENDING | FAIL（2026-10-07 两条探针未出现预期 deny，见下文；探针命令基于旧策略，2026-10-21 起按下方新探针补验） | N/A（无项目级 hooks） | PENDING |
-| 信任流程与真实 `apply_patch` hook | PENDING | PENDING（未修改信任状态；FILE 探针未完成） | PENDING（新会话信任流程未测） | PENDING |
-| MCP | N/A（本仓无项目级 MCP） | N/A | N/A | N/A |
+| 检查 | 状态与边界 |
+|---|---|
+| hook 定向回归 | PASS：`python scripts/run_unittests.py test_ai_tool_hooks`，68 tests / 13 units，wall 5.43 s；日志 `targeted-tests.txt` |
+| 原生 Read 变体与模板 | PASS：修复前子例失败、修复后上述回归通过；`read-regression-before.txt` 保留失败证据 |
+| 原样注册入口 | PASS：上述回归包含 Git Bash、Windows PowerShell 5.1 与 PowerShell 7 的命令、失败关闭和协议 |
+| Claude 项目角色发现 | PASS：`claude agents --setting-sources project` exit 0，列出项目 code-reviewer；只证明角色发现 |
+| Codex 严格诊断组合 | 不支持：本机 `--strict-config features list`、`--strict-config debug prompt-input` 均 exit 1；`native-config-checks.json` 记录错误，不能用这两种组合签署严格配置通过 |
+| Codex 非 strict 原生诊断 | PASS：features list exit 0、hooks 开关可见；debug prompt-input exit 0 且 JSON 含根规则，见 `native-config-readonly.json`；不证明未知字段会被拒绝 |
+| Codex 项目角色发现 | PENDING：隔离无凭据 CODEX_HOME 的诊断未列出四个项目角色，原因未单独确定；未改变信任 |
+| 当前新会话角色真实使用 | PENDING：尚未进行模型调用 |
+| 当前项目/hook 信任与原生拦截 | PENDING：未改变信任状态，尚无真实 shell / Read / apply_patch 拦截结论 |
+| ZCode 项目 hook | N/A：官方忽略项目级配置；用户级/插件接入未配置、未验收 |
+| MCP | N/A：本仓无项目级 MCP |
 
-2026-10-07 的真实客户端补证：
+配置代理的后续原生只读诊断与完整框架门须按实际结果补证，不能从上述版本号或解析结果外推。
 
-- **Kimi Code 2.1.1**：用 `kimi --output-format stream-json -p <短只读提示>` 开新会话，在任何工具调用前答出中文提交规范、Zig 必须经 `scripts/zigw.py`、Windows 只有 lib-vt 三条 fork 规则（第三条是当时 fork 段的说法，现已过时：Windows 已有 win32 app）；唯一工具调用为 `git --no-optional-locks status --short --branch`，exit 0，没有通过 Read 临时补读规则。这证明新会话自动注入，不证明信任流程或 hooks。
-- **Codex 0.160.0**：`codex exec --strict-config --ephemeral <短提示>` 的真实调用 exit 0，新会话自动注入根 `AGENTS.md`。启动头显示 `read-only`，但 `exec` 默认即为只读，不能据此判定项目配置未加载；项目层实际生效仍为 PENDING。`codex --strict-config --version` 不加载配置，不能代替本次真实调用。
-- **Codex 拦截失败**：`gh pr create --help` 实际进入 gh，因 gh 配置访问 `Access denied` 退出 1，而不是 hook deny；`git clean -n -d` 实际执行、exit 0。两项预期拒绝断言均为 FAIL（这两条当时分别命中旧策略的 gh 写操作 deny 与 `git clean` ask，2026-10-21 起已放开，不能再用作探针）。`git status` 成功也不能代证 hook 参与。`codex features list` 显示 `hooks=true`，但功能开关开启不证明项目 hook 已加载或受信任。
-- [Codex 官方 hooks 文档](https://developers.openai.com/codex/hooks/)明确 `exec_command` 也匹配 `Bash`，当前 `^(Bash|apply_patch)$` matcher 无须因此改名。项目受信任与当前 hook hash 被单独信任是前提，漏拦的具体原因仍为 PENDING，不能归因于 matcher、PowerShell 或配置层中的某一项。
-- `command -v claude` 与 `command -v zcode` 均 exit 1，客户端未安装；离线适配器测试不能把它们的真实会话状态改成 PASS。
+### 历史证据
 
-补验方式：由人类在对应客户端里从仓库根开新会话，先做只读检查，不由 agent 自动授予信任：
+历史结果只对当时版本与策略有效：
 
-1. 规则入口：Claude Code 用 `/context` 或 `/memory` 确认 `CLAUDE.md` 与导入的 `AGENTS.md` 已加载；其他客户端先复述 fork 规则再调用工具。Codex 用 `/debug-config` 查看项目配置来源与有效值，用 `/hooks` 只读检查 hook 加载状态及当前 hash 的信任状态。是否信任项目或 hook 由人类决定；不读取私有配置、会话文件，也不使用 `config/read` 全层 RPC。
-2. 拦截（force push）：执行 `git push --force --dry-run origin <分支>`，应被 deny；`--dry-run` 让它即使漏拦也不改远端。
-3. 拦截（凭据读取）：执行 `cat .env`（仓库里没有这个文件），应被 deny；漏拦也只会报文件不存在。
-4. FILE：Claude Code 与 ZCode 写 `.env.probe.txt`，Codex 用 `apply_patch` 新增同一文件，都应被 deny；漏拦也只会在工作区留下一个未跟踪文件，删掉即可。
-5. 放行：执行 `git status`，应直接通过。
-6. Windows 上的 hook shell：
-   - Codex：确认它在 Windows 上执行的是 `command_windows`，而且是经 PowerShell 执行。可以在 `docs/` 下用 `apply_patch` 新增一个文件看能否放行，再按第 4 步看能否拦截。只要 hook 能在 Windows 上判定，就说明 `$(git rev-parse --show-toplevel)` 已展开、退出码判定生效。
-   - ZCode：注册命令用的是 POSIX 的 `|| exit 2`。如果 ZCode 在 Windows 上经 PowerShell 执行 hook，会遇到与 Codex 相同的问题：Windows PowerShell 5.1 解析失败，PowerShell 7 的失败只剩 exit 1，都等于放行。ZCode 的配置没有类似 `command_windows` 的字段，这里不臆造，记 PENDING；补验时让它在仓库外的 cwd 执行 `git status`，应被拦截。
-   - Claude Code：注册命令同样依赖 POSIX shell（`${…:-…}` 与 `||`），要确认 Windows 上的 hook 经 Git Bash 执行。在 Windows 上做第 2 步即可：换成其他 shell 时这两种语法会解析失败，表现为 hook 报错、工具照常执行。
+- 2026-10-07：Git Bash 与最小 cmd PATH 下，旧 `test_ai_tool_hooks` 各 62 项通过；cmd 探针从 `git --exec-path` 找 Git Bash。2026-10-21 最小防线策略的同组测试为 64 项通过。
+- 2026-10-07，Kimi Code 2.1.1：新会话在调用工具前复述了 fork 三条规则，之后只运行只读 git status，证明自动注入；当时“Windows 只有 lib-vt”的第三条已经过时，不能沿用为现状。未验证 hook 或信任流程。
+- 同日，Codex 0.160.0：真实 `codex exec --strict-config --ephemeral` 短调用 exit 0，根规则已注入；启动显示 read-only 不能证明项目配置没加载。项目配置来源与 hook 信任仍未确认。
+- 同日，Codex 两条旧拦截探针 FAIL：`gh pr create --help` 进入 gh 后因配置访问拒绝退出 1，`git clean -n -d` 实际执行并 exit 0。两条命令已在 2026-10-21 放开，不能用作当前拒绝探针，也不能据旧失败断定新配置已修复。
+- Codex 0.160 的数组表、`command_windows`/`commandWindows` 类型与输出 schema 曾做离线核对；`features list` 中的 `hooks=true` 从未证明实际调用。当前入口仍需原生补验。
+- 当时 Claude 与 ZCode 的 `command -v` 均未发现客户端；该历史安装状态已被本轮 Claude 版本检查更新，旧 ZCode 适配器离线 PASS 也不代表官方支持项目 hook。
 
-补验后把对应格改成 PASS 并注明日期与客户端版本。
+## 补验方式
+
+由人类从仓库根开对应客户端的新会话，先只读查看来源；不由 agent 自动 trust。
+
+1. Claude 用 `/context` 或 `/memory` 核对导入；Codex 用客户端支持的 `/debug-config`、`/hooks` 核对项目层和当前 hash。复述规则后再调用工具，分别记录角色发现、规则加载和 hook 状态。
+2. 在不接触真实凭据的临时输入上测试 shell force-push dry-run、原生 Read `.env.probe.txt`、写入同名探针的拒绝，以及模板和普通 git status 的放行。漏拦时只处理测试产物，保留失败证据。
+3. Codex 实际运行 `apply_patch`，核对真实 tool_name、payload 与 FILE 拒绝；Windows 要确认走 `command_windows`。Claude 核对 Git Bash 注册入口与原生 Read。步骤和离线协议通过互不代证。
+4. 每项注明客户端版本、命令、退出码和证据路径；未完成继续 PENDING。ZCode 只有在用户明确配置用户级/插件 hook 后，才进行其原生接入验收。
+
+## 官方资料
+
+2026-10-22 核对的能力说明：
+
+- [Codex 子智能体与角色发现](https://learn.chatgpt.com/docs/agent-configuration/subagents)
+- [Codex hooks](https://developers.openai.com/codex/hooks/)
+- [ZCode hooks：项目级配置被忽略](https://zcode.z.ai/en/docs/hooks)
+- [Kimi skills](https://www.kimi.com/code/docs/en/kimi-code-cli/customization/skills.html) 与 [hooks](https://www.kimi.com/code/docs/en/kimi-code-cli/customization/hooks.html)

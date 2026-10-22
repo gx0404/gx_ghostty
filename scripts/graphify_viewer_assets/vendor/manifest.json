@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "library": {
+    "name": "three",
+    "version": "0.186.1",
+    "license": "MIT",
+    "source": "https://registry.npmjs.org/three/0.186.1"
+  },
+  "builder": {
+    "name": "esbuild",
+    "version": "0.28.2"
+  },
+  "inputs": {
+    "scripts/graphify_viewer_assets/vendor/build/package.json": "1ef134f7b5a9cbca97364c79374a1ff86a02af1d9261bb94480dbf8f04fe54ad",
+    "scripts/graphify_viewer_assets/vendor/build/package-lock.json": "16432f8e03abe5f97fa0195901d3bab3723034b5296444f255c0616313597e31",
+    "scripts/graphify_viewer_assets/vendor/build/vendor-entry.mjs": "9481a4ed7dbe1efb99fb115d3dc591b2819d388cfd4c8c5056ec2efe3168a8de",
+    "scripts/graphify_viewer_assets/vendor/build/build_vendor.mjs": "257022f35167057ea1425378cb5fcee90f7467e4f268038186cfa169e2540703"
+  },
+  "outputs": {
+    "three.bundle.js": "292d95337d06ca8f7e99c481f100660a3a05491a8787eb73e1d33d77056c1312",
+    "LICENSE.txt": "8b378ebe60e2fe500158cb0ac71cb5e8b7d92953c2abcc63a0eb90499653b5bc"
+  }
+}

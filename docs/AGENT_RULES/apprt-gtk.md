@@ -79,7 +79,7 @@
 - **Windows 主机经 WSL**（Ubuntu 24.04 克隆，`just wsl setup --apt` 装依赖与 zh_CN、en_US 的 UTF-8 locale）：`just wsl sync <worktree> --dirty` 同步，`just wsl build --gtk` 构建，`just wsl test --gtk --filter <name>` 跑单测（GX 层 `apprt.gtk.gx`），`just wsl smoke --out <目录> [--lang zh_CN|en] [--xdotool <脚本>]` 在 Xvfb 下截图，`just wsl scenario --out <目录> [G01 …]` 回放 `test/gui/gtk/G*.toml`；读图且日志无 `Theme parser error`、`css parsing failed` 才记 PASS。Windows 本身没有 GTK 与 gettext，只能跑 `just fmt-check` 与 `python scripts/run_unittests.py test_gtk_gx_contract`（GX 层对上游模板、菜单与 action 的引用；改 GX 层或同步上游后跑）。
 - **Linux 机器**（GTK4、libadwaita 头文件不低于登记表最高版本、blueprint-compiler ≥ 0.20、gettext、pkg-config）：
   - 构建 `just build -Dapp-runtime=gtk`，需要时加 `-Dgtk-x11=`、`-Dgtk-wayland=`；单测 `just test -Dapp-runtime=gtk --filter <name>`；Ubuntu 24.04 的打包配方见 `packaging-dist.md`。
-  - 翻译：`just zig build update-translations` 后审 `po/` diff，再跑 `.github/scripts/check-translations.sh`（脚本直接用 PATH 上的 `zig`，须为钉版 0.16.0）。
+  - 翻译：`just zig build update-translations` 后审 `po/` diff，再跑 `.github/scripts/check-translations.sh`（脚本直接用 PATH 上的 `zig`，须为钉版 0.17.0）。
   - Blueprint：`nix/build-support/check-blueprints.sh` 后 `git diff --exit-code`（沿用上游 CI）。
   - 看译文：`zig-out/bin/ghostty --language=zh-CN`（或 `en`）。
 - **CI**：gx-ci 的 push/PR 路径只跑 `-Dapp-runtime=none`，不编译 GTK；GTK 改动手动触发 gx-ci 并打开 `gtk_smoke`，`gtk-smoke` job 构建、截图并跑 `--filter apprt.gtk.gx` 单测（报告进 `gx-gtk-smoke-evidence`）。

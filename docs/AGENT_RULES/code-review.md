@@ -4,7 +4,7 @@
 
 - 由 `--task review` 触发，不按路径路由；`just rules-review <paths>` 会同时带出改动路径对应的领域文档。适用于审核本仓任何改动：工作区与暂存区 diff、分支上的 fork 提交、上游同步合并、CI 与发版改动。
 - 审核者只读：不改文件，不跑会改仓库状态的命令（`just setup`、`just fmt`、`just graph`、`just kb`、`just install-hooks`、任何 git 写操作），也不在 GitHub 上评论、批准或开 issue / PR。
-- 两种运行方式：专用 reviewer（Claude 的 code-reviewer、Codex 的只读沙箱 reviewer）只跑 resolver 与只读 git 命令，构建、测试写成建议命令并标 PENDING；在有完整权限的会话里审核时可以实跑构建与测试，它们留在 `.zig-cache/`、`.local/zig-cache/`、`zig-out/` 的缓存不算改状态。
+- 两种运行方式：专用 reviewer 依职责约定只跑 resolver 与只读 git 命令，构建、测试写成建议命令并标 PENDING；角色声明不提供独立沙箱，实际权限继承父会话。在有完整权限的会话里审核时可以实跑构建与测试，它们留在 `.zig-cache/`、`.local/zig-cache/`、`zig-out/` 的缓存不算改状态。
 
 ## 符号真源
 

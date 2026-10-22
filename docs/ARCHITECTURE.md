@@ -11,7 +11,7 @@ fork 自 `ghostty-org/ghostty`，产品名 Ghostty GX。终端核心、渲染器
 - **GTK 的 GX 层** `src/apprt/gtk/gx/`：运行时切换界面语言、GX 菜单与启动配置、设置对话框、快捷键速查、herdr 应用模式与 GX 样式（第 8 节）。
 - **打包、发布与开发框架**：Windows 便携 zip 与 Inno Setup 安装包、GX Shell 组件 stage、`gx-release` 发布链（第 13 节），以及 `docs/`、`scripts/`、`justfile` 组成的 AI 协作框架。
 
-改动过的上游源码都登记为 fork 补丁，见 [FORK_PATCHES.md](FORK_PATCHES.md)（GX-0001～GX-0012、GX-0014～GX-0016、GX-0021～GX-0024 与 GX-0026，登记了 43 个上游文件，其中 42 个带着补丁、`src/apprt/gtk/class/command_palette.zig` 已恢复上游原样；GX-0013、GX-0017～GX-0020 与 GX-0025 未使用）。Zig 版本 0.16.0（`build.zig.zon` 的 `minimum_zig_version`；`src/build/zig.zig::requireZig` 编译期要求 0.16.x，fork 经 `scripts/zigw.py` 钉死 0.16.0）。
+改动过的上游源码、补丁编号与状态以 [FORK_PATCHES.md](FORK_PATCHES.md) 登记表为准。Zig 最低版本为 `build.zig.zon` 的 `minimum_zig_version`（当前 0.17.0），fork 经 `scripts/zigw.py` 使用同版本钉版；不从历史测试日志推断当前工具链。
 
 | 产物 | 说明 | 根文件 / 构建逻辑 |
 |---|---|---|
@@ -24,7 +24,7 @@ fork 自 `ghostty-org/ghostty`，产品名 Ghostty GX。终端核心、渲染器
 | 目标 | 默认 apprt / 渲染 / 字体 | 主要产物 | fork 的构建与验证 |
 |---|---|---|---|
 | Linux、FreeBSD | `gtk` / OpenGL（EGL）/ `fontconfig_freetype` | `bin/ghostty`、`share/` 资源、libghostty-vt | gx-ci `linux-main`（`-Dapp-runtime=none`）与手动 `gtk-smoke`；本机经 `just wsl`；FreeBSD 没有 CI |
-| Windows | `win32`（GX-0003）/ OpenGL（WGL，GX-0004）/ `freetype_windows`（DirectWrite 发现，GX-0009）；gettext i18n 关闭 | app 按 `x86_64-windows-gnu` 构建（`just build` 自动补目标）：`bin/ghostty.exe`、`share/`，同时装 libghostty-vt；`-Demit-lib-vt` 只出库 | gx-ci `windows`（lib-vt）与 `windows-app`（构建，手动 `win_smoke` 截图）；本机 `just build`、`just test`、桌面截图 |
+| Windows | `win32`（GX-0003）/ OpenGL（WGL，GX-0004）/ `freetype_windows`（DirectWrite 发现，GX-0009）；gettext i18n 关闭 | app 按 `x86_64-windows-gnu` 构建（`just build` 自动补目标）：`bin/ghostty.exe`、`share/`，同时装 libghostty-vt；`-Demit-lib-vt` 只出库 | gx-ci `windows`（lib-vt）与 `windows-app`（构建、定向单测，手动 `win_smoke` 截图）；本机 `just build`、`just test`、桌面截图 |
 | macOS | `none`（internal 库用 `embedded`）/ Metal / `coretext` | `GhosttyKit.xcframework`、`Ghostty.app`（`-Demit-macos-app=false` 可跳过）、libghostty-vt | 手动 gx-ci `macos`（lib-vt 单测）；`gx-release` 的 `macos=true` 构建未签名 app |
 | iOS、Android | — | 只有 libghostty-vt（全量构建遇 iOS 报 `UnsupportedTarget`） | 无 |
 | wasm32-freestanding | — | 只有 libghostty-vt：`bin/ghostty-vt.wasm` 与静态归档 | gx-ci `lib-vt-cross` |
@@ -113,7 +113,7 @@ Surface（src/Surface.zig）
 | `renderer` | `Surface.init` → `src/renderer/Thread.zig::threadMain` | xev 循环：drain mailbox → `updateFrame` → `drawFrame`；光标闪烁、动画、空闲压缩；Windows 上 WGL 上下文在这个线程创建、使用与销毁 |
 | `search` | 首次 `.search` 绑定动作（`Surface.performBindingAction`） | `src/terminal/search/Thread.zig::threadMain`，结果经 `Surface.searchCallback` 回送 |
 
-另有预热等辅助线程。win32 apprt 自己不建线程：标签标题轮询、herdr 应用模式检查、剪贴板重试、通知图标都用 GUI 线程的 `WM_TIMER`；菜单与对话框跑模态消息循环，循环中照常分发其他消息，所以调用方返回后要重新解析可能已被释放的指针（`src/apprt/win32/ui/Dialogs.zig`、`src/apprt/win32/ui/MenuPopup.zig` 的模块文档）。ConPTY 的控制台宿主（`OpenConsole.exe` 或系统 conhost）是独立进程。
+另有预热和平台辅助线程。win32 的 HWND、D2D 与 UI 状态只归 GUI 线程；IPC、UIA、WinRT、URL 与动画辅助线程使用 owned 快照或投递消息，不借用活 Surface。标签轮询等定时任务仍在 GUI 线程。模态循环照常派发消息，返回后必须重新解析对象。ConPTY 的 `OpenConsole.exe` 或系统 conhost 是独立进程。
 
 队列都是 `src/datastruct/blocking_queue.zig::BlockingQueue`：容量 64、内部 mutex、无阻塞 pop，靠事件循环唤醒。
 
@@ -164,6 +164,8 @@ Surface（src/Surface.zig）
 | `ui/Palette.zig`、`ui/trigger.zig`、`ui/Keybinds.zig` | 命令面板（分组、`gx.fuzzy` 的中英文与拼音首字母模糊匹配、本次运行内的 frecency、主题预览；`ui/fuzzy.zig` 只是转发到 `gx.fuzzy` 的过渡文件）；按键显示与反查（菜单提示经 `trigger.Hints` 跳过被占用的按键）；快捷键速查表（被占用的按键带警告标记与原因） |
 | `ui/Settings.zig`、`ui/settings/*.zig` | 设置浮层：模态、背后变暗，六个分区，改动写入 `gui-settings.ghostty` 后重载 |
 | `ui/Dialogs.zig` | 主题化模态对话框：关闭与退出确认（列出仍在运行的进程）、剪贴板授权与不安全粘贴（带预览）、子进程退出、关于（带非官方分支声明）；任务模态，嵌套上限 4 层，对话框期间推迟 `WM_CLOSE`；另存为用系统对话框 |
+| `Session.zig`、`ipc/`、`Remote*.zig`、`Leaf.zig`、`Pane.zig` | 会话、单实例与跨进程窗格；源端保留 PTY/核心/渲染，目标端持画面与 UI，认证依原生身份，断连不重放输入 |
+| `ShellIntegration.zig`、`shell/`、`ole_drop.zig`、`Drop*.zig`、`ui/uia*.zig` | 安装版 Shell 身份与通知、OLE/跨权限拖放、UIA 快照；普通/提权隔离和许可边界见 GX_FEATURES.md |
 | `ui/SearchBar.zig`、`ui/LinkPreview.zig`、`ui/ResizeOverlay.zig`、`ui/ShortcutNotice.zig`、`ui/wstr.zig` | 查找栏（`当前/总数` 计数）、链接预览气泡、改尺寸时的列×行提示、默认复制/粘贴/查找/分屏键被占用时窗口底部的提示条（每次运行一次）；UTF-8 → UTF-16 |
 
 窗口最小宽度以 `chrome/caption_layout.zig::minTrackSize` 为真源：非提权为 510 DIP，进程实际提权且标签栏显示管理员标记时为 538 DIP；控件尺寸按目标 DPI 逐项取整。`Window.zig` 的尺寸约束、普通窗口恢复与会话恢复共用此规则；会话先放宽宽高，再移入目标显示器工作区。较窄的已保存窗口和较小的 `window-width` 会被放宽，可能限制贴靠布局（例如 1920 宽、125% 缩放时，非提权最小宽度 639 px 可放入三栏，提权时 674 px 不可）。
@@ -188,29 +190,32 @@ Windows 主菜单根与设置宿主按顶层窗口保留，Esc、失焦与关闭
 
 | 模块 | 作用 |
 |---|---|
-| `config_layers.zig`、`config_types.zig`、`defaults.ghostty`、`defaults-windows.ghostty`、`theme.zig`、`themes/` | 配置分层与各层输入的快照 `Layers`（下文）、`gx-*` 键的值类型、内嵌的 GX 默认值、内置主题 `GX Mocha` |
+| `config_layers.zig`、`config_types.zig`、`defaults.ghostty`、`defaults-windows.ghostty`、`theme.zig`、`themes/` | 配置分层与各层输入的快照 `Layers`（下文）、`gx-*` 键的值类型、内嵌的 GX 默认值、内置明暗主题 `GX Latte`、`GX Mocha` |
 | `gui_settings.zig`、`settings_map.zig` | 设置界面的覆盖文件 `gui-settings.ghostty`（逐行编辑、原子替换）；与界面无关的设置模型（选项、写入的键、待保存的改动；「恢复默认」删键） |
-| `state_file.zig`、`window_state.zig`、`palette_history.zig` | 状态目录（Windows `%LOCALAPPDATA%\ghostty\`，Linux `$XDG_STATE_HOME/ghostty/`）的原子读写、窗口位置记忆、命令面板使用记录（只存键的哈希）；尚无 apprt 调用 |
+| `state_file.zig`、`window_state.zig`、`palette_history.zig` | 状态目录的原子读写、窗口位置记忆、命令面板使用记录（只存键的哈希）；窗口恢复与面板调用方在各 apprt 中 |
 | `i18n.zig`、`i18n/gx.zh_CN.po`、`i18n/zh_CN.zig` | 界面语言（`zh-CN`/`en`，进程级，可运行时切换）与 zh-CN 译表；译表由 `just i18n` 从 `po/zh_CN.po` 与 `gx.zh_CN.po` 生成 |
-| `ui_color.zig`、`ui_tokens.zig`、`chrome.zig`、`motion.zig` | 界面库：WCAG 对比度与只调 OKLab 明度的对比度修正、由终端颜色派生的设计 token（含高对比度的系统色）、标签条与窗口边框配色、Fluent 时长与缓动曲线；win32 的 `ui/style.zig`、`ui/anim.zig` 以它们为真源，GTK 尚未接入 |
-| `fuzzy.zig`、`pinyin.zig`、`pinyin/initials.zig` | 模糊匹配与 frecency，汉字可按拼音首字母匹配；首字母表由 `just pinyin` 从钉版 pinyin-data 生成 |
+| `ui_color.zig`、`ui_tokens.zig`、`chrome.zig`、`motion.zig` | 界面库：WCAG 对比度与只调 OKLab 明度的对比度修正、由终端颜色派生的设计 token（含高对比度的系统色）、标签条与窗口边框配色、Fluent 时长与缓动曲线；win32 的 `ui/style.zig`、`ui/anim.zig` 与 GTK 的 `src/apprt/gtk/gx/style.zig`、`src/gx/gtk_css.zig` 消费这些共享值 |
+| `fuzzy.zig`、`pinyin.zig`、`pinyin/{initials,syllables}.zig` | 模糊匹配与 frecency，支持首字母与全拼；两张表从仓内钉版 pinyin-data 离线生成 |
 | `theme_swatch.zig`、`shortcuts.zig` | 主题文件的颜色与列表色块缓存；快捷键速查的模型、键名与搜索 |
 | `branding.zig` | 两个 apprt 的「关于」用的产品名、维护者、链接与非官方分支声明（msgid） |
 | `profiles.zig` | 启动配置探测（Windows：GX Zsh、herdr、PowerShell 7、Windows PowerShell、命令提示符、Git Bash、MSYS2 UCRT64、Nushell、各 WSL 发行版；Linux：GX Zsh、herdr、登录 shell、zsh、bash、fish）加 `gx-launch-profile`，以及默认启动配置的顺序 |
-| `proc.zig`、`policy.zig`、`confirm.zig`、`app_mode.zig` | 列进程（Linux `/proc`，Windows Toolhelp32）、空闲进程策略、关闭确认（GX-0012）、herdr 应用模式判定；另有共享进程表快照 `Shared`、一次确认只拍一张表的 `Scope` 与应用模式迟滞 `State`，尚无 apprt 调用 |
-| `leader.zig`、`unread.zig`、`url_policy.zig` | 前台程序归类（远程、超级用户、容器）、后台标签的新输出、OSC 8 链接放行策略；尚无 apprt 调用 |
-| `perf.zig` | `GHOSTTY_GX_PERF=1` 时的耗时样本（`info(gx_perf)` 日志行，`just perf` 汇总），现记配置加载与构建 |
+| `proc.zig`、`policy.zig`、`confirm.zig`、`app_mode.zig` | 列进程（Linux `/proc`，Windows Toolhelp32）、空闲进程策略、关闭确认（GX-0012）、herdr 应用模式判定；周期检查共用 `Shared`，关闭确认用 `Scope`，应用模式用 `State` 迟滞 |
+| `leader.zig`、`unread.zig`、`url_policy.zig` | 前台程序归类（远程、超级用户、容器）、后台标签新输出与 OSC 8 链接策略；GTK 应用模式与 Windows 打开链接等调用方消费 |
+| `perf.zig` | `GHOSTTY_GX_PERF=1` 时的耗时样本（`info(gx_perf)` 日志行），采集与验收范围见 TESTING.md |
 | `action.zig` | `gx:<name>[:<argument>]` 动作的类型、解析、格式化与标题 msgid（GX-0014） |
 | `win32_input.zig`、`conpty.zig`、`osc7.zig`、`path_quote.zig` | Windows 终端支持：KEY_EVENT_RECORD 编码（GX-0006）、随包 ConPTY（GX-0007）、OSC 7 路径转换（GX-0008）、拖放路径的 shell 引用 |
-| `gtk_css.zig` | 由终端主题生成 GTK 的 GX 配色 CSS（GX-0016） |
+| `gtk_css.zig` | 由共享 token 生成 GTK 的 GX 配色 CSS（GX-0016） |
+| `ui_ref.zig`、`session.zig`、`session_cwd.zig` | 活记录值引用；有界会话布局与明确 WSL profile 的 guest cwd，恢复时按当前可信配置解析 |
+| `ipc/`、`remote_protocol.zig`、`remote_view.zig`、`remote_binding.zig` | 原生身份校验、本机请求去重、远程帧/输入与绑定续延；GUI 完成后才 ACK |
+| `keybind_edit.zig`、`launch_profile_edit.zig`、`fluent/` | overlay 编辑模型、来源限制与草稿；离线 Fluent 图标几何 |
 
 **配置分层**（`src/gx/config_layers.zig`，GX-0010）：从低到高依次是内嵌的 GX 默认值（`defaults.ghostty`，Windows 另加 `defaults-windows.ghostty`）、用户配置文件及其 `config-file` 引入的文件、设置界面写的 `gui-settings.ghostty`（与用户配置在同一目录）、命令行（`-e` 及其命令最后）。各文件仍按上游顺序读取，重放步骤再按层排序重建，所以主题加载与明暗切换的重放保持层序；某层设置 `font-family*` 时替换而不是追加低层的列表。环境变量 `GHOSTTY_GX_DEFAULTS=0`（或 `false`、`off`、`no`）时按上游方式加载。配置目录：Linux 为 `$XDG_CONFIG_HOME/ghostty`（缺省 `~/.config/ghostty`）；Windows 为 `%XDG_CONFIG_HOME%\ghostty`，未设时 `%LOCALAPPDATA%\ghostty`（`src/os/xdg.zig::config`）。`GX Mocha` 在加载前写进 `<配置目录>/themes`（每个进程只写一次），文件首行带 GX 标记，同名但没有标记的用户文件不动。
 
 `Layers` 读一次各层输入后可在内存里按覆盖重建，并说明某个键的值来自哪一层；`rebuild` 按配置记录的输入在内存里重建、除主题外不再读盘，GTK 的语言切换与 win32 的 `toggle_background_opacity` 都经它。覆盖文件读不出、`language` 不受支持时记为诊断，此后每次重放与重建都会再报（`+validate-config` 因此退出 1）。
 
-GX 默认值：主题 `GX Mocha`、`language = zh-CN`、`font-family = JetBrainsMono Nerd Font` 并把 CJK 区段经 `font-codepoint-map` 交给 `Noto Sans CJK SC`、12 号字、内边距 10/8、闪烁块光标、右键菜单、`confirm-close-surface = true`、`gx-herdr-app-mode = true`、解绑 Alt+1～8、`gx:` 快捷键与三个命令面板条目；Windows 另设 `quit-after-last-window-closed = true` 与 `shift+insert=paste_from_clipboard`（Windows 没有选择剪贴板）。win32 apprt 能让窗口材质透到终端时（加载前调 `src/gx/config_layers.zig::setMaterialOpacity`），各层都没设 `background-opacity` 的材质在默认值层补一条：`mica`、`tabbed` 为 0.3，`acrylic` 为 0.75（`materialOpacity`）。fork 配置键：`gx-launch-profile`、`gx-herdr-app-mode`、`gx-window-material`、`gx-idle-processes`、`gx-open-config-ui`、`gx-ctrl-scroll-zoom`（只在 Windows，默认 true，尚未实现）；`language` 只认 `zh-CN` 与 `en`，默认 `zh-CN`。
+默认主题为 `light:GX Latte,dark:GX Mocha`，语言为 `zh-CN`；其余默认值与 fork 键以 `src/gx/defaults*.ghostty`、`src/config/Config.zig` 的 doc comment 为准，平台差异见 [GX_FEATURES.md](GX_FEATURES.md)。`gx-ctrl-scroll-zoom` 已在 Windows 与 GTK 接入；单实例默认开启且只在 Windows，会话恢复默认关闭且支持两端，两者改动均需完全重启。
 
-**GX 绑定动作**：`gx:settings`、`gx:main_menu`（默认 Ctrl+Shift+M）、`gx:keybinds`（默认 Ctrl+Shift+/）、`gx:new_tab_profile:<id>`、`gx:new_window_profile:<id>`；`gx:settings_page:<页>`、`gx:new_tab_menu`、`gx:context_menu`、`gx:move_split_to_tab`、`gx:move_split_to_window`、`gx:tab_switcher` 已能解析，两个 apprt 尚未实现，执行时返回未执行。核心 `Surface.performBindingAction` 把它交给 apprt 的 `gxAction`（`src/apprt/win32/App.zig::gxAction`、`src/apprt/gtk/App.zig::gxAction`）；没有实现的 apprt 记日志并返回未执行，带 `performable:` 的绑定把按键交给终端。
+**GX 绑定动作**由 `src/gx/action.zig::Action` 解析，win32 `App.performGx` 与 GTK `gx/app.zig::performGxAction` 执行全部已定义动作，包括设置子页、菜单、标签切换与分屏迁移。没有可作用的目标时返回 false，`performable:` 绑定把按键交还终端。动作名与会话 profile ID 是持久化契约。
 
 ## 8. GTK 的 GX 层
 
@@ -269,7 +274,8 @@ GTK 的上游文字仍走 gettext（`_`/`N_`/`C_` 与 `po/`），只有装了对
 | `build.zig.zon.{json,nix,txt}`、`flatpak/zig-packages.json` | `build.zig.zon` → `nix/build-support/check-zig-cache.sh --update`（需要 Nix） | 同一脚本不带参数 |
 | `po/com.mitchellh.ghostty.pot`、`po/*.po` | `src/apprt/gtk/` 的 `.zig` 与 `.blp`、`src/input/command.zig`、`dist/linux/ghostty_nautilus.py` → `zig build update-translations` | `.github/scripts/check-translations.sh` |
 | `src/gx/i18n/zh_CN.zig` | `po/zh_CN.po` 与 `src/gx/i18n/gx.zh_CN.po` → `just i18n` | `just i18n-check` |
-| `src/gx/pinyin/initials.zig` | 钉版 pinyin-data 0.15.0 的三个文件（sha256 钉在 `scripts/gx_pinyin.py`）→ `just pinyin`（联网） | `just pinyin-check`（离线） |
+| `src/gx/pinyin/{initials,syllables}.zig` | 仓内钉版 pinyin-data → `just pinyin`（显式 `--download` 才联网） | `just pinyin-check`（离线） |
+| `src/gx/fluent/paths.zig` | 仓内钉版 MIT SVG → `just fluent`（离线） | `just fluent-check` |
 | `vendor/glad/` | `glad.zip` → `Makefile` 的 `glad` 目标 | 无 |
 | `build.zig.zon` 的 `iterm2_themes` 条目 | 上游每周的 `update-colorschemes.yml`（已归档，随同步获得） | 同第一行 |
 | `CODEOWNERS`、`.github/VOUCHED.td` | 上游 vouch 机器人（已归档） | 只随同步更新 |
@@ -305,8 +311,8 @@ Windows 包的第三方下载都在 `scripts/gx_windows_package.py::DOWNLOADS`/`
 
 ## 14. 图谱与知识库
 
-- **图谱**：`just graph`（`scripts/graphify.py`，钉版 graphifyy 0.9.73，装在 `.local/tools/venv`）以仓库根为索引根、`.graphifyignore` 为排除表；入库 `graphify-out/GRAPH_REPORT.md` 与 `graphify-out/source-fingerprint.json`，约 20 MB 的 `graph.json` 只留本机；`just graph-query <问题>` 查询。指纹覆盖 graphify 会索引的全部代码扩展名（`scripts/graphify_fingerprint.py::INDEXED_EXTENSIONS`，至少含 `.zig .swift .c .h .cpp .cc .hpp .m .mm .metal .py .sh .bash`）中未被排除的文件、管线脚本与入库报告，没有 `graph.json` 也能 `just graph-check`。graphify 固定跳过名为 `build`、`dist`、`target` 的目录，所以 `src/build/**` 不在图里，查构建逻辑要直接读源码；新鲜度只在 `gx-release` 的 prepare 与上游同步后（`just generated-check`）强制。
-- **知识库**：`docs/kb/chunks.json`，`just kb` 构建、`just kb-check` 校验、`just kb-query <词>` 检索（BM25）。语料是根与嵌套 `AGENTS.md`、上游与 fork 的说明文档、`docs/AGENT_RULES/*.md`、`src/**/*.zig` 的 `//!` 与 `pub` 签名、`include/ghostty/**/*.h` 的声明摘要；`kb-check` 属于 `framework-check`。
+- **代码图谱与离线浏览器**：抽取、来源、3D/2D 交互、预算与检查入口统一见 [GRAPH.md](GRAPH.md)。原始图谱和浏览器各自有新鲜度检查；浏览器不补造 Graphify 未抽取的关系。
+- **知识库**：`docs/kb/chunks.json` 由 `just kb` 构建、`just kb-check` 校验、`just kb-query <词>` 检索。文档、Zig 公开结构与 C 声明的语料规则见 `scripts/build_agent_kb.py`；函数体不进结构层，freshness 不证明语义正确。
 
 ## 15. 上游同步面
 
@@ -315,8 +321,8 @@ Windows 包的第三方下载都在 `scripts/gx_windows_package.py::DOWNLOADS`/`
 | fork 独占 | 第 2 节列出的 fork 新增路径 | 不冲突；上游新路径要在 `routes.toml` 登记 |
 | 上游文件 + 追加段 | 根 `AGENTS.md`（`<!-- gx-fork: … -->` 以下）、`.gitignore`、`.prettierignore`（`# --- GX fork：` 段） | 标记以上取上游，标记段原样保留 |
 | 上游文件 + 开头声明块 | 根 `README.md`（`<!-- gx-fork: … -->` 到 `<!-- /gx-fork -->`） | 声明块原样保留在开头，其后取上游 |
-| 上游文件 + 补丁 | [FORK_PATCHES.md](FORK_PATCHES.md) 登记表里状态为 `active` 的 42 个文件，集中在 `src/Surface.zig`、`src/config/Config.zig`、`src/termio/`、`src/apprt/gtk/class/`、`src/renderer/`、`src/font/` 与 `build.zig`，另有 GTK 的 `src/apprt/gtk/css/style.css` 与构建的 `src/build/GhosttyExe.zig` | 按补丁小节的「同步冲突处理」复核，热点见 [DEVELOPMENT.md](DEVELOPMENT.md)「上游同步」 |
+| 上游文件 + 补丁 | [FORK_PATCHES.md](FORK_PATCHES.md) 登记表里状态为 `active` 的文件，集中在 `src/Surface.zig`、`src/config/Config.zig`、`src/termio/`、`src/apprt/gtk/class/`、`src/renderer/`、`src/font/` 与 `build.zig`，另有 GTK 的 `src/apprt/gtk/css/style.css` 与构建的 `src/build/GhosttyExe.zig` | 按补丁小节的「同步冲突处理」复核，热点见 [DEVELOPMENT.md](DEVELOPMENT.md)「上游同步」 |
 | 上游文件移位 | 15 个上游 workflow 原样移到 `.github/workflows-archive/` | 上游新增的 workflow 也 `git mv` 进归档，不启用 |
 | 上游独占 | 其余全部，含 `.agents/`、9 份嵌套 `AGENTS.md`、`CODEOWNERS`、lint 配置、`dependabot.yml` | 取上游 |
 
-流程：`main` 只快进到 `upstream/main`；在 `gx_ghostty` 上 `git merge --no-ff main`，信息用 `chore(sync): 合并上游 main（<sha>）`；再跑 `just framework-check`、`just ci-check`，重建 KB 与图谱后跑 `just generated-check`。永不 force push、不推送 `upstream`。步骤见 [DEVELOPMENT.md](DEVELOPMENT.md)「上游同步」。
+流程：`main` 只快进到 `upstream/main`；在 `gx_ghostty` 上 `git merge --no-ff main`，信息用 `chore(sync): 合并上游 main（<sha>）`；按 [DEVELOPMENT.md](DEVELOPMENT.md) 重建图谱、浏览器与 KB，再跑完整验收门。永不 force push、不推送 `upstream`。步骤见 [DEVELOPMENT.md](DEVELOPMENT.md)「上游同步」。

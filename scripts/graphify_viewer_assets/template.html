@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>gx_ghostty 源码星图</title>
+<style>@@CSS@@</style>
+</head>
+<body data-view="@@VIEW@@">
+<a class="skip" href="#results">跳到节点列表</a>
+<header class="topbar">
+  <a class="brand" href="overview.html" aria-label="gx_ghostty 源码星图首页"><svg viewBox="0 0 40 40" aria-hidden="true"><path d="M8 24V16a12 12 0 0 1 24 0v16l-6-4-6 4-6-4-6 4z"/><circle cx="16" cy="17" r="1.5"/><circle cx="25" cy="17" r="1.5"/><path class="orbit" d="M2 28Q20 10 38 14"/></svg><span><strong>gx_ghostty</strong><span class="brand-sub">源码星图</span></span></a>
+  <div class="search-wrap"><label class="sr-only" for="search">搜索全部节点</label><span aria-hidden="true" class="search-icon">⌕</span><input id="search" type="search" placeholder="搜索符号、文件或路径" autocomplete="off" spellcheck="false"><kbd aria-hidden="true">/</kbd></div>
+  <div class="header-actions"><button id="toggleExplore" aria-pressed="false">沉浸探索</button><button id="helpButton" aria-expanded="false" aria-controls="helpPanel" title="键盘与图例">帮助</button></div>
+</header>
+<div class="mobile-tabs" aria-label="面板"><button id="showList" aria-controls="listPanel" aria-expanded="false">查找与筛选</button><button id="showDetail" aria-controls="detailPanel" aria-expanded="false">节点详情</button></div>
+<main class="workspace">
+  <aside id="listPanel" class="panel list-panel" aria-label="查找与筛选">
+    <div class="panel-heading"><h2>探索代码</h2><button class="panel-close" id="closeList" aria-label="关闭查找面板">×</button></div>
+    <div class="filters"><label for="module">模块</label><select id="module"><option value="">全部模块</option></select><label for="kind">节点类型</label><select id="kind"><option value="">全部类型</option></select></div>
+    <div class="list-heading"><span id="resultCount" role="status" aria-live="polite">正在读取目录</span><button id="clearFilters" class="text-button">清除筛选</button></div>
+    <div class="result-scroll"><ul id="results" tabindex="-1" aria-label="节点搜索结果"></ul><p id="emptyResults" class="empty" hidden>没有匹配的节点。试试符号的一部分或清除筛选。</p><button id="moreResults" class="wide" hidden>显示更多结果</button></div>
+    <div class="list-footer"><span class="status-dot"></span>完整目录离线可用<span id="catalogCount"></span></div>
+  </aside>
+  <section class="map-panel" aria-label="交互源码星图">
+    <div class="map-heading"><div class="map-navigation"><nav id="breadcrumbs" aria-label="星图层级"></nav><div id="fileJumpWrap" class="file-jump" hidden><label class="sr-only" for="fileJump">展开模块中的文件</label><select id="fileJump"><option value="">选择文件继续展开</option></select></div></div><span id="renderMode" class="render-mode">准备三维视图</span></div>
+    <div id="stage" tabindex="0" role="application" aria-label="源码星图。拖动旋转，滚轮缩放；方向键旋转，加减键缩放。节点也可从列表访问。"><div id="labels" aria-hidden="true"></div><div id="tooltip" role="tooltip" hidden></div></div>
+    <div class="map-intro" id="mapIntro"><span class="intro-rule"></span><h1>从全景，走进一行代码。</h1><p>模块组成星团，文件与符号逐层展开。</p></div>
+    <div id="mapNotice" class="map-notice" role="status" hidden></div>
+    <div class="map-bottom"><div class="legend"><span><i class="legend-dot"></i>直接提取</span><span><i class="legend-dash"></i>推断关系</span><span id="sceneCount"></span></div><div class="map-tools" aria-label="星图操作"><button id="zoomIn" aria-label="放大">＋</button><button id="zoomOut" aria-label="缩小">−</button><button id="resetView">重置视角</button><button id="toggle2d" aria-pressed="false">二维视图</button></div></div>
+  </section>
+  <aside id="detailPanel" class="panel detail-panel" aria-label="节点详情与分析">
+    <div class="panel-heading"><h2 id="detailHeading">图谱分析</h2><button class="panel-close" id="closeDetail" aria-label="关闭详情面板">×</button></div>
+    <div id="overviewInfo">
+      <p class="lead">理解结构，追溯证据。</p><p class="muted">选择星团展开模块，或搜索一个符号查看它的来源与一跳关系。</p>
+      <dl class="stats" id="stats"></dl>
+      <h3>模块分布</h3><ul id="moduleList" class="module-list"></ul><button id="moreModules" class="text-button" hidden>查看全部模块</button>
+      <details class="boundaries"><summary>图谱边界与来源</summary><ul id="limitations"></ul><p>位置是确定性的展示布局，不表示调用顺序或社区重要性。推断关系需回读源码核实。</p><p id="fingerprint" class="hash"></p></details>
+    </div>
+    <div id="nodeInfo" hidden><div id="selection"></div><div class="relation-heading"><h3>一跳关系</h3><label class="sr-only" for="evidence">关系证据</label><select id="evidence"><option value="">全部证据</option><option value="EXTRACTED">直接提取</option><option value="INFERRED">推断</option><option value="AMBIGUOUS">不明确</option></select></div><p id="relationStatus" class="muted" role="status" aria-live="polite"></p><div id="relationError" class="error-box" hidden><p id="relationErrorText"></p><button id="retryRelations">重新加载关系</button></div><ul id="relations" class="relations"></ul><button id="moreRelations" class="wide" hidden>加载下一页关系</button></div>
+  </aside>
+</main>
+<footer class="statusbar"><span id="viewStatus">Graphify AST · 本地构建快照</span><span>布局不等同于调用图</span><a id="alternateView" href="detail.html">一跳关系视图</a></footer>
+<div id="helpBackdrop" class="help-backdrop" hidden></div>
+<section id="helpPanel" class="help-panel" role="dialog" aria-modal="true" aria-labelledby="helpTitle" hidden tabindex="-1"><button id="closeHelp" class="dialog-close" aria-label="关闭帮助">×</button><h2 id="helpTitle">探索星图</h2><p>点击模块查看文件，再点击文件查看符号。选择符号后，右侧列出关系与来源证据。</p><dl><dt>/</dt><dd>搜索全部节点</dd><dt>Esc</dt><dd>关闭帮助或窄屏面板，退出沉浸模式</dd><dt>方向键</dt><dd>星图聚焦时旋转；二维视图中平移</dd><dt>＋ / − / 0</dt><dd>缩放 / 重置视角</dd><dt>Tab / Enter</dt><dd>在列表、筛选、关系与来源间导航</dd></dl><p>实线表示直接提取，琥珀虚线表示推断。概览关系经过聚合，一跳图最多绘制 40 个邻居；完整关系可继续分页。二维视图保留相同的节点与来源功能。</p><label class="motion-control"><input id="reduceMotion" type="checkbox">减少动态效果</label></section>
+<div id="fatalError" class="fatal" role="alert" hidden></div>
+<noscript><p class="fatal">源码星图需要 JavaScript。启用后重新打开此离线页面。</p></noscript>
+<script type="application/json" id="graph-data">@@DATA@@</script>
+<script>@@VENDOR_JS@@</script>
+<script>@@SCENE_JS@@</script>
+<script>@@APP_JS@@</script>
+</body>
+</html>

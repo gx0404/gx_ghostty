@@ -28,10 +28,10 @@
 | 命令 | 作用 | 前置 | 副作用 / 输出 | 退出码 |
 |---|---|---|---|---|
 | `just` / `just default` | 默认配方，执行 `just --list` 列出全部配方 | `just` | 只读 | 0 |
-| `just setup <参数…>` | `setup_env.py`：第一步安装钉版 Zig 0.16.0（sha256 校验，自定义源 → 内置镜像 → 官方源），`GX_GHOSTTY_ZIG` 或 `ZIG` 已指向可用的 0.16.0 时跳过；第二步建 `.local/tools/venv` 并装 `graphifyy==0.9.73`（有 uv 用 uv，否则 venv + pip）。参数原样交给脚本：`--innosetup` 另加第三步，安装 sha256 钉版的 Inno Setup 7.1.0（仅 Windows，`just package-windows` 打安装包要用）；`--force` 覆盖重装损坏的钉版 Zig | 网络；Python ≥ 3.10 | 写 `.local/toolchains/zig/zig-0.16.0/` 与 `.local/tools/venv/`；`--innosetup` 另写 `.local/cache/innosetup/`（安装包）与 `.local/tools/innosetup/`（以 `/CURRENTUSER /PORTABLE=1` 安装，不写注册表、不建卸载项）。各步幂等，已装且有效则跳过 | 0 成功；任一步失败（含非 Windows 主机上的 `--innosetup`）1；用法错误（如 `--check` 与 `--innosetup` 同用）2 |
+| `just setup <参数…>` | `setup_env.py`：第一步安装钉版 Zig 0.17.0（sha256 校验，自定义源 → 内置镜像 → 官方源），`GX_GHOSTTY_ZIG` 或 `ZIG` 已指向可用的 0.17.0 时跳过；第二步建 `.local/tools/venv` 并装 `graphifyy==0.9.73`（有 uv 用 uv，否则 venv + pip）。参数原样交给脚本：`--innosetup` 另加第三步，安装 sha256 钉版的 Inno Setup 7.1.0（仅 Windows，`just package-windows` 打安装包要用）；`--force` 覆盖重装损坏的钉版 Zig | 网络；Python ≥ 3.10 | 写 `.local/toolchains/zig/zig-0.17.0/` 与 `.local/tools/venv/`；`--innosetup` 另写 `.local/cache/innosetup/`（安装包）与 `.local/tools/innosetup/`（以 `/CURRENTUSER /PORTABLE=1` 安装，不写注册表、不建卸载项）。各步幂等，已装且有效则跳过 | 0 成功；任一步失败（含非 Windows 主机上的 `--innosetup`）1；用法错误（如 `--check` 与 `--innosetup` 同用）2 |
 | `just doctor` | `setup_env.py --check`：只读体检。必需项 zig、python、git、MSVC（仅 Windows）、venv、graphify；可选项 hooksPath、symlink 与 innosetup（仅 Windows），以及 codex、claude、kimi、zcode、actionlint、uv。symlink 在系统临时目录试建一次符号链接：成功报 FOUND；失败报 OPTIONAL，说明未开启开发者模式，tinyio 符号链接用例会以 `PermissionDenied` 失败。innosetup 在 `.local/tools/innosetup/` 有完整的钉版 Inno Setup 时报 FOUND，否则 OPTIONAL 并提示 `just setup --innosetup` | Python | 只读，不在仓库里建任何东西（symlink 探测只用仓库外的临时目录，用后即删）；输出 STATUS / ITEM / DETAIL 表，状态为 FOUND / MISSING / OPTIONAL，附修复提示 | 0；任一必需项 MISSING 时 1，可选项不影响退出码 |
 | `just install-hooks` | `git config core.hooksPath .githooks`，启用 `.githooks/commit-msg`。钩子必须以可执行模式 `100755` 入库，否则 Linux/macOS 上的 git 会忽略它；Windows 克隆的 `core.filemode=false` 让普通 `git add` 记成 `100644`，所以首次提交用 `git add --chmod=+x .githooks/commit-msg`，入库后由 `scripts/test_conventional_commits.py` 校验模式 | Git | 修改本仓 `.git/config` | 透传 git 的退出码 |
-| `just zig <参数…>` | 直通 `zigw.py`，用钉版 Zig 执行任意子命令，如 `just zig version`、`just zig build --help`、`just zig build test-lib-vt-schema` | 钉版 Zig，或 `GX_GHOSTTY_ZIG`、`ZIG` 指向的 0.16.0 | 取决于子命令；未设置 `ZIG_GLOBAL_CACHE_DIR` 时全局缓存写 `.local/zig-cache/global/` | 透传 zig 的退出码；找不到 Zig、版本不是 0.16.0 或覆盖变量指向无效文件时 2 |
+| `just zig <参数…>` | 直通 `zigw.py`，用钉版 Zig 执行任意子命令，如 `just zig version`、`just zig build --help`、`just zig build test-lib-vt-schema` | 钉版 Zig，或 `GX_GHOSTTY_ZIG`、`ZIG` 指向的 0.17.0 | 取决于子命令；未设置 `ZIG_GLOBAL_CACHE_DIR` 时全局缓存写 `.local/zig-cache/global/` | 透传 zig 的退出码；找不到 Zig、版本不是 0.17.0 或覆盖变量指向无效文件时 2 |
 
 ### 规则、版本与框架门
 
@@ -51,12 +51,13 @@
 
 | 命令 | 作用 | 前置 | 副作用 / 输出 | 退出码 |
 |---|---|---|---|---|
+| `just graph-view` / `just graph-view-check` | `graphify_viewer.py build` / `check`：从新鲜原图生成/校验离线 3D/2D 浏览器，详见 [GRAPH.md](GRAPH.md) | Python、Git；本机已有 `graph.json` | build 只写 `graphify-out/framework/`；check 只读 | 0 成功；失败非 0 |
 | `just kb` | `build_agent_kb.py --confirm`：重建知识库 | Python、Git | 原子写入 `docs/kb/chunks.json`（确定性的 schema 2 JSON：每个文档一行头、每片一行；入库，审 diff），打印文档数、片数与体积 | 0；语料读取失败 2 |
 | `just kb-check` | `build_agent_kb.py`：内存重建后与产物逐字节比较，列出变化来源；旧 schema 的产物报「格式或 schema 变化」 | Python、Git | 只读 | 0 新鲜；缺失或过期 1；语料读取失败 2 |
 | `just kb-query <词…>` | `agent_kb.py`：BM25 检索知识库，中英文都可；`--top <n>` 改返回条数（默认 8），`--json` 输出 JSON（`id` 为 `path#anchor`）。查询词含 `&`、`>` 等 shell 元字符时直接调用 `python scripts/agent_kb.py "<查询>"`（见「约定」） | 已有 `docs/kb/chunks.json` | stdout，每条命中带 `doc` 与 `anchor` 便于回源 | 0，没有命中时输出「(无命中)」也是 0；KB 缺失、损坏或 schema 不符，以及没给查询词时 2 |
-| `just graph` | `graphify.py rebuild`：全量重建代码图谱，随后写入并校验指纹 | `just setup` 装好的 graphifyy 0.9.73；耗时数分钟 | 写 `graphify-out/`：入库的 `GRAPH_REPORT.md`、`source-fingerprint.json`，以及本机的 `graph.json` | 0；graphify 缺失、版本不符或抽取失败时非 0 |
-| `just graph-check` | `graphify.py check`：校验源码、管线与入库产物的指纹 | Python、Git；不需要 graphify 与 `graph.json` | 只读；`graph.json` 缺失时只提示 | 0 新鲜；过期或缺产物 2 |
-| `just graph-query <问题…>` | `graphify.py query`：在本机图谱上查询，多个词合并为一句；路径与解释查询没有配方，直接用 `python scripts/graphify.py path …` 或 `python scripts/graphify.py explain …` | 本机已有 `graph.json`（先 `just graph`） | stdout | 透传 graphify；缺 `graph.json` 时 1 |
+| `just graph` | 全量抽取代码，写原始指纹并生成离线浏览器 | 仓内 graphifyy 0.9.73；耗时数分钟 | 入库报告/指纹；本机 `graph.json` 与 `graphify-out/framework/` | 0；工具、抽取、浏览器或预算失败时非 0 |
+| `just graph-check` | 校验原始图谱指纹；有本机原图时也检查浏览器 | Python、Git；无原图时不需 graphify | 只读；无 `graph.json` 时仅签收入库指纹并提示缺少本机图 | 0 新鲜；过期或缺产物 2 |
+| `just graph-query <问题…>` | 新鲜度通过后查询；路径/解释直接用 `python scripts/graphify.py path …` / `explain …` | 本机新鲜 `graph.json` | stdout；不追加查询日志，但会更新 `graphify-out/cache/last_query_stamp` | 透传 graphify；缺失或陈旧时失败，见 GRAPH.md |
 | `just i18n` | `gx_i18n.py`：由上游 `po/zh_CN.po` 与 fork 的 `src/gx/i18n/gx.zh_CN.po`（同一 msgid 以 fork 为准）重新生成 GX 界面的 zh-CN 翻译表；跳过 fuzzy、废弃与空译文，带 msgctxt 的条目以 `<msgctxt>\x04<msgid>` 为键，fork 条目的 `{name}` 占位符必须与原文一致 | Python | 写 `src/gx/i18n/zh_CN.zig`（按键的 UTF-8 字节序排序、LF、无时间戳，入库，审 diff）；内容不变时不写 | 0；源文件缺失、语法错误、键重复或占位符不一致 2 |
 | `just i18n-check` | `gx_i18n.py --check`：内存重新生成后与已提交的翻译表比较（CRLF 检出视同 LF） | Python | 只读 | 0 新鲜；缺失或过期 1；源文件问题 2 |
 | `just pinyin` | `gx_pinyin.py`：从仓内钉版输入 `src/gx/pinyin/inputs/0.15.0/` 离线重新生成拼音首字母表与全音节表（只有显式 `--download` 才联网） | Python | 写 `src/gx/pinyin/initials.zig`、`syllables.zig`（生成物，入库，审 diff） | 见 `scripts/gx_pinyin.py` 的模块文档 |
@@ -75,8 +76,8 @@
 | `just build-vt <参数…>` | `zig build -Demit-lib-vt …`：只构建 libghostty-vt；交叉编译加 `-Dtarget=<triple>` | 钉版 Zig；Windows 本机目标需 MSVC 与 Windows SDK | 同 `just build` | 透传 zig；找不到 Zig 时 2 |
 | `just vt-wasm` | `zig build -Demit-lib-vt -Dtarget=wasm32-freestanding -Doptimize=small` | 钉版 Zig | `zig-out/bin/ghostty-vt.wasm` | 同上 |
 | `just dist-vt` | `zig build dist -Demit-lib-vt=true`：libghostty-vt 源码包 | 钉版 Zig、Git | 用 `git archive` 打包 HEAD（未提交的改动不在内），输出 `zig-out/dist/libghostty-vt-<版本>.tar.gz` | 同上 |
-| `just fmt` | `zig fmt --exclude .local --exclude zig-pkg --exclude zig-out --exclude .zig-cache .`：格式化全仓 Zig 文件；`zig-pkg/` 是 Zig 0.16 构建时拉进仓库根的第三方依赖，必须排除 | 钉版 Zig | **改写文件** | 同上 |
-| `just fmt-check` | 同上加 `--check`：只检查 | 钉版 Zig | 只读，列出未格式化的文件 | 0 / 非 0 |
+| `just fmt` | `scripts/zig_fmt.py`：经钉版 Zig 分批格式化 Git 可见的 `.zig` / `.zon`，包含合法未跟踪文件，排除忽略文件和任意层级构建缓存 | Python、Git、钉版 Zig | **改写文件** | 透传首个 Zig 失败；前置错误 2 |
+| `just fmt-check` | 同一脚本加 `--check`，与格式化使用相同范围 | Python、Git、钉版 Zig | 只读，列出未格式化的文件；不扫描示例生成的依赖 | 0 / 非 0 |
 
 `just test-vt` 与 `just test` 的补充说明（耗时与原理见 TESTING.md「并行运行器与耗时」）：
 
@@ -105,11 +106,11 @@
 
 | 命令 | 作用 | 前置 | 副作用 / 输出 | 退出码 |
 |---|---|---|---|---|
-| `just wsl <子命令> <参数…>` | `scripts/gx_wsl.py`：经 `wsl.exe -d <发行版> -e bash -c <脚本> gx-wsl <参数…>` 在 WSL 克隆（默认 `Ubuntu-24.04` 的 `~/src/gx_ghostty`）里执行，补上 Windows 本机编不出的 GTK app 与 Linux 上的单测。全局参数放在子命令前后都可以：`--distro`、`--clone`（Linux 路径；Git Bash 会改写以 `/` 开头的参数，写成 `'~/src/x'`）、`--dry-run`（只打印 wsl.exe 命令行与脚本） | Windows 与 WSL2；发行版里装好 apt 依赖（`setup --apt` 可补装）；首次 `setup` 要联网 | 只写 WSL 内：克隆、克隆内的 `.local/`（钉版 Zig、Zig 缓存）与 `zig-pkg/`、`~/.local/opt/blueprint-compiler-0.16.0` 与 `~/.local/bin/blueprint-compiler`；`smoke` 另写 `--out` 给的 Windows 目录 | 透传 WSL 内命令的退出码；用法错误、找不到 wsl.exe、缺克隆或缺构建产物、wsl.exe 自身失败为 2；`sync` 拒绝改动克隆为 3 |
+| `just wsl <子命令> <参数…>` | `scripts/gx_wsl.py`：经 `wsl.exe -d <发行版> -e bash -c <脚本> gx-wsl <参数…>` 在 WSL 克隆（默认 `Ubuntu-24.04` 的 `~/src/gx_ghostty`）里执行，补上 Windows 本机编不出的 GTK app 与 Linux 上的单测。全局参数放在子命令前后都可以：`--distro`、`--clone`（Linux 路径；Git Bash 会改写以 `/` 开头的参数，写成 `'~/src/x'`）、`--dry-run`（只打印 wsl.exe 命令行与脚本） | Windows 与 WSL2；发行版里装好 apt 依赖（`setup --apt` 可补装）；首次 `setup` 要联网 | 只写 WSL 内：克隆、克隆内的 `.local/`（钉版 Zig、Zig 缓存）与 `zig-pkg/`、`~/.local/opt/blueprint-compiler-0.20.0` 与 `~/.local/bin/blueprint-compiler`；`smoke` 另写 `--out` 给的 Windows 目录 | 透传 WSL 内命令的退出码；用法错误、找不到 wsl.exe、缺克隆或缺构建产物、wsl.exe 自身失败为 2；`sync` 拒绝改动克隆为 3 |
 
 | 子命令 | 作用 |
 |---|---|
-| `setup [--check] [--apt]` | 幂等：克隆不存在时从本仓 `git clone`；克隆内 `python3 scripts/setup_zig.py --install`；下载钉版 blueprint-compiler 0.16.0（GNOME GitLab 的 `v0.16.0` tag 归档，按 sha256 校验），用 meson 装到 `~/.local/opt/blueprint-compiler-0.16.0` 并写 `~/.local/bin/blueprint-compiler` shim（不覆盖别人写的同名文件）；最后预取 Zig 包。`--check` 只读报告；`--apt` 先以 root 安装缺失的 apt 包与 locale，只装缺的、不升级已装的 |
+| `setup [--check] [--apt]` | 幂等：克隆不存在时从本仓 `git clone`；克隆内 `python3 scripts/setup_zig.py --install`；下载钉版 blueprint-compiler 0.20.0（GNOME GitLab 的 `v0.20.0` tag 归档，按 sha256 校验），用 meson 装到 `~/.local/opt/blueprint-compiler-0.20.0` 并写 `~/.local/bin/blueprint-compiler` shim（不覆盖别人写的同名文件）；最后预取 Zig 包。`--check` 只读报告；`--apt` 先以 root 安装缺失的 apt 包与 locale，只装缺的、不升级已装的 |
 | `sync [<ref> \| <worktree 目录>] [--dirty]` | 把本仓的一个提交取进克隆并 detached 检出：目录参数按 worktree 处理（取其 HEAD），其余按本仓 ref 解析，省略时取脚本所在的 worktree。`--dirty` 用临时 index 把该 worktree 的未提交与未跟踪（未被忽略）文件快照成一个提交对象再同步，不动它的 index、ref 与文件，快照对象留在对象库里直到 gc。克隆有本地改动、或检出会孤立克隆里的本地提交时拒绝；同步结果记在克隆的 `refs/gx-wsl/synced` |
 | `build [--gtk] <zig build 参数…>` | 克隆内钉版 `python3 scripts/zigw.py build …`；`--gtk` 追加 `-Dapp-runtime=gtk -fno-sys=gtk4-layer-shell`。正常 GTK install 自动生成 `.local/gx-wsl/gtk-build-receipt.json`，绑定构建 argv/退出、构建前后源树及实际 exe SHA/版本；性能需精确提交后 `-Doptimize=fast`，默认目标/唯一 install 支持合法 `--summary all` 与 `-j4`；钉版不接受 `-j 4`。help/list 查询照常输出且透传退出 0，但写 ineligible attempt，不给旧映像新凭证；test/custom step、未知 flag、prefix/target/emit 等不签收。普通 Debug smoke 仍可用；CPU 差额/候选界仅诊断，非有效性或收益门，完整合同见 TESTING.md |
 | `test [--suite main\|vt] [--gtk] [--filter <子串>]… <zig_test 参数…>` | 克隆内 `python3 scripts/zig_test.py`；`main`（默认）与 gx-ci `linux-main` 一样加 `-Dapp-runtime=none`，`--gtk` 改为 GTK 运行时（含 `src/apprt/gtk/gx/` 的单测） |
@@ -163,7 +164,7 @@
 - 配方在 `cmd.exe` 里执行，不依赖 Git Bash 或 WSL；从 cmd、PowerShell、Git Bash 调用 `just` 结果相同。
 - `justfile` 在 Windows 上调用 `python`。如果它解析到 `WindowsApps` 下不可用的别名，所有配方（包括 `just doctor`）都会失败；用 `where python` 与 `python --version` 确认解析结果，必要时调整 PATH 让真实解释器排在前面。
 - 两种 ABI：`just build`、`just test`、`just package-windows` 按 `x86_64-windows-gnu` 构建 win32 app 与 `ghostty-test`，用 Zig 自带的 MinGW 头文件；`just test-vt`、`just build-vt` 与不经 `just` 的 `zig build` 用本机默认的 MSVC 目标，需要 MSVC 与 Windows SDK，由人类安装，`just doctor` 用 vswhere 查找带 C++ 工具组件的 Visual Studio，只报告不安装。
-- 本机能跑的全量：`just ci-check`（framework-check、fmt-check、test-vt）加 `just test`。只在 Linux 上编译的代码与 GTK 用 `just wsl` 或 `gx-ci` 的 `linux-main` 补证，Windows 上的单测不进 CI（`gx-ci` 的 `windows-app` 只构建）。
+- 本机能跑的全量：`just ci-check`（framework-check、fmt-check、test-vt）加 `just test`。只在 Linux 上编译的代码与 GTK 用 `just wsl` 或 `gx-ci` 的 `linux-main` 补证，`gx-ci` 的 `windows-app` 构建 fast/strip app 并跑 Windows 定向 Debug 单测，仍不等于本机完整 `just test`。
 - `just package-windows` 默认把 ReleaseFast 构建装进 `zig-out/`，之后要回到 Debug 构建就再跑一次 `just build`。
 - 装了 WSL2 时，`just wsl test`、`just wsl build --gtk` 与 `just wsl smoke --out <目录>` 在 WSL 克隆里补跑 Linux 完整单测、GTK 构建与 Xvfb 截图（见上文「WSL」）；这是本机 Linux 证据，与 `gx-ci` 的 job 互不代证。
 - 判断成败只看退出码，不把命令接到 `| tail`、`| head`；各 shell 的写法见 TESTING.md「证据规则」。

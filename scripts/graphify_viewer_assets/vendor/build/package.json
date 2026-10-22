@@ -1,0 +1,13 @@
+{
+  "name": "project-atlas-vendor",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "仅供本仓库维护者重建离线三维图谱依赖；生成项目图谱无需 Node。",
+  "dependencies": {
+    "three": "0.186.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

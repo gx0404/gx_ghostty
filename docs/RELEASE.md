@@ -35,10 +35,10 @@ libghostty-vt 的库版本是另一条线：`build.zig` 的常量 `lib_version`�
 
 ## 发版步骤（以 0.0.1 为例）
 
-1. **定版提交**：把 `CHANGELOG.md` 的 `## 0.0.1(TBD)` 改成发布当天的日期，如 `## 0.0.1(2026-10-10)`；然后依次运行 `just graph`、`just kb`、`just generated-check`。定版的 CHANGELOG、重建后的 `graphify-out/GRAPH_REPORT.md`、`graphify-out/source-fingerprint.json` 与 `docs/kb/chunks.json` 一起提交为 `chore(release): 定版 0.0.1`。图谱或 KB 不新鲜时 prepare 会拒绝发版。提交后可在干净检出上运行 `python scripts/gx_release.py prepare`（Linux/macOS 用 `python3`）预演：它跑完四道发版门，并打印将使用的 SHA、tag 与版本串。
+1. **定版提交**：把 `CHANGELOG.md` 的 `## 0.0.1(TBD)` 改成发布当天的日期，如 `## 0.0.1(2026-10-10)`；然后依次运行 `just graph`、`just graph-view`、`just kb`、`just generated-check` 与 `just graph-view-check`。定版的 CHANGELOG、重建后的 `graphify-out/GRAPH_REPORT.md`、`graphify-out/source-fingerprint.json` 与 `docs/kb/chunks.json` 一起提交为 `chore(release): 定版 0.0.1`。图谱或 KB 不新鲜时 prepare 会拒绝发版。提交后可在干净检出上运行 `python scripts/gx_release.py prepare`（Linux/macOS 用 `python3`）预演：它跑完四道发版门，并打印将使用的 SHA、tag 与版本串。
 2. **push**：由用户执行 `git push origin gx_ghostty`。
 3. **CI 变绿**：等这次 push 触发的 `gx-ci` 全部通过（`framework`、`zig-fmt`、`linux-vt`、`linux-main`、`lib-vt-cross`、`windows`、`windows-app`）。
-4. **发布**：由用户运行
+4. **只构建验收，再发布**：先由用户用 `-f publish=false` 跑完整构建，下载 `verified-release` 与 `evidence-linux-gtk-noble` 检查资产和截图；通过后由用户运行
 
    ```sh
    gh workflow run gx-release.yml -f ref=gx_ghostty -f publish=true
@@ -46,7 +46,7 @@ libghostty-vt 的库版本是另一条线：`build.zig` 的常量 `lib_version`�
 
    或在 Actions → gx-release → Run workflow 里选同样的输入；要附 macOS 产物时加 `-f macos=true`。workflow 文件取默认分支 `gx_ghostty` 上的版本，`ref` 在 prepare 里解析成完整 SHA，后续 job 只构建这个 SHA。`ref` 可以是分支、tag 或提交；提交必须写完整的 40 位 SHA，`actions/checkout` 取不到缩写 SHA（如 `ref=4f4e0e128`），prepare 会在检出这一步失败。这次运行从头构建全部资产，`verify` 通过后 `publish` 才发布；任何 job 失败都不会发布。agent 不运行这条命令（见下文）。
 
-   可选的预检：改过打包、`windows-app` 或 `linux-gtk-noble` 之后，发版前可以先用 `-f publish=false` 跑一次只构建验收，从该运行的 Artifacts 下载 `verified-release`（保留 14 天）与 `evidence-linux-gtk-noble` 检查；发布那次仍会重新构建，不复用这次的产物。0.0.1 发版前的只构建运行见下文「首跑记录」。
+   发布那次仍重新构建全部资产，不复用预检产物；预检 artifact 保留 14 天。0.0.1 发版前的只构建运行见下文「首跑记录」。
 5. **核对资产**：发布完成后只读地检查——
    - `gh release view gx-v0.0.1 --repo gx0404/gx_ghostty --json isDraft,isPrerelease,tagName,targetCommitish,assets`：`isDraft` 与 `isPrerelease` 都为 false，tag 指向定版提交，资产恰好是下文「资产」表里的 12 个（`macos=true` 时 14 个）。
    - 下载全部资产，`sha256sum -c SHA256SUMS` 通过；`manifest.json` 的 `schema_version` 为 2，`source_commit` 等于定版提交，`version_string` 为 `1.3.2-gx.0.0.1`。
@@ -55,7 +55,7 @@ libghostty-vt 的库版本是另一条线：`build.zig` 的常量 `lib_version`�
 6. **开新版本**：在 `CHANGELOG.md` 顶部加下一个 `## X.Y.Z(TBD)` 标题，运行 `just version-check` 与 `just kb`，把 CHANGELOG 与重建的 `docs/kb/chunks.json` 一起提交（KB 语料包含 CHANGELOG 开头，见「CHANGELOG 规则」）。
 7. **GX Shell 跟进**：GX Shell 从 0.4.0 起随包 Ghostty GX，它的来源锁 `components.lock.json` 用完整 SHA 钉住 `gx_ghostty`（0.4.0 钉的是 0.0.1 的定版提交 `5525f8bc`，0.4.1 钉的是 0.0.2 的定版提交 `1be3d19f`）。要随包新版本时，在 GX Shell 仓只改这一项（不要用更新全部组件的 `update`），写入新 `gx-vX.Y.Z` 指向的完整 SHA，再按 GX Shell 自己的文档运行 `python scripts/gx_shell_sources.py check --lock components.lock.json --require-remote`，然后走 GX Shell 的发版流程。GX Shell 按 `scripts/gx_package.py` 模块文档「Consumer contract」的命令从这个修订构建 stage，契约有变时要先告知 GX Shell。
 
-agent 可以准备定版提交并在本地验证；push、运行 workflow 与发布由用户决定。不要手工创建 `gx-v*` tag 或 GitHub release，tag 只由 publish job 创建。agent 执行 `gh workflow run … gx-release`、`gh release create|edit|delete|upload` 与写型 `gh api` 会被拒绝（`docs/AGENT_RULES/ci-release.md`）。
+agent 可以准备定版提交并在本地验证；push、运行 workflow 与发布由用户决定。不要手工创建 `gx-v*` tag 或 GitHub release，tag 只由 publish job 创建。流程禁止 agent 执行 `gh workflow run … gx-release`、`gh release create|edit|delete|upload` 与发布相关的写型 `gh api`；这不是 hook 的技术拦截保证（`docs/AGENT_RULES/ci-release.md`）。
 
 ## gx-release 的 job
 
@@ -86,7 +86,7 @@ agent 可以准备定版提交并在本地验证；push、运行 workflow 与发
 
 `linux-gtk` 的依赖取自 `src/build/docker/debian/Dockerfile`，另加 `git`、`ca-certificates`、`xz-utils` 与提供 `msgfmt` 的 `gettext`（i18n 编译 `.po`，见 `src/build/GhosttyI18n.zig::init`）。容器以 root 运行而工作区属于 runner 用户，所以检出后要把工作区加入 `safe.directory`，否则 `git archive` 会拒绝执行。完整源码包内含预生成的 `src/apprt/gtk/ghostty_resources.{c,h}` 与 `src/build/framegen/framedata.compressed`（`src/build/GhosttyDist.zig::Resource`），从源码包构建不再需要 blueprint-compiler。
 
-`linux-gtk-noble` 验证 GX Shell 在 Ubuntu 24.04 上要用的构建链，命令与 `scripts/gx_package.py` 模块文档「Consumer contract」一字不差（`scripts/test_gx_workflows.py` 锁定）：检出前只装 `ca-certificates`、`git`、`python3`，然后 `gx_package.py deb --build --install-deps` 与 `verify-stage`。构建配方是 `scripts/gx_linux_build.py`：apt 依赖按它的清单检查并安装；Ubuntu 24.04 的 blueprint-compiler 只有 0.12，配方下载 sha256 钉版的 0.16.0（GNOME GitLab 的 tag 归档，失败时用 GNOME 的 GitHub 镜像）并用 meson 装进 `.local/tools/`；Ubuntu 24.04 没有 `libgtk4-layer-shell-dev`，所以用 `-fno-sys=gtk4-layer-shell` 把它编成随包的 `libgtk4-layer-shell.so`，再用 `-Dpatch-rpath='$ORIGIN/../lib'`（patchelf 0.18.0）把可执行文件的 RUNPATH 换成相对路径，不需要 `LD_LIBRARY_PATH`。之后用 `test-deb` 把 stage 打成一次性测试包，在同一容器 `apt-get install` 后检查 `ghostty-gx +version`，并以与 `gtk-smoke` 相同的 Xvfb 参数截图（截图前装上 GTK 推荐的 `librsvg2-common`，否则标题栏的 SVG 图标画成占位）。证据（stage 日志、`stage-manifest.json`、`readelf -d`、测试包信息、`+version`、截图与日志）以 artifact `evidence-linux-gtk-noble` 上传，名字不以 `gx-` 开头，`verify` 不收集它；`verify` 要求这个 job 成功。真正的 deb 由 GX Shell 用 stage 的 `root/` 与 `deb_depends` 构建。
+`linux-gtk-noble` 验证 GX Shell 在 Ubuntu 24.04 上要用的构建链，命令与 `scripts/gx_package.py` 模块文档「Consumer contract」一字不差（`scripts/test_gx_workflows.py` 锁定）：检出前只装 `ca-certificates`、`git`、`python3`，然后 `gx_package.py deb --build --install-deps` 与 `verify-stage`。构建配方是 `scripts/gx_linux_build.py`：apt 依赖按它的清单检查并安装；Ubuntu 24.04 的 blueprint-compiler 只有 0.12，配方下载 sha256 钉版的 0.20.0（GNOME GitLab 的 tag 归档，失败时用 GNOME 的 GitHub 镜像）并用 meson 装进 `.local/tools/`；Ubuntu 24.04 没有 `libgtk4-layer-shell-dev`，所以用 `-fno-sys=gtk4-layer-shell` 把它编成随包的 `libgtk4-layer-shell.so`，再用 `-Dpatch-rpath='$ORIGIN/../lib'`（patchelf 0.18.0）把可执行文件的 RUNPATH 换成相对路径，不需要 `LD_LIBRARY_PATH`。之后用 `test-deb` 把 stage 打成一次性测试包，在同一容器 `apt-get install` 后检查 `ghostty-gx +version`，并以与 `gtk-smoke` 相同的 Xvfb 参数截图（截图前装上 GTK 推荐的 `librsvg2-common`，否则标题栏的 SVG 图标画成占位）。证据（stage 日志、`stage-manifest.json`、`readelf -d`、测试包信息、`+version`、截图与日志）以 artifact `evidence-linux-gtk-noble` 上传，名字不以 `gx-` 开头，`verify` 不收集它；`verify` 要求这个 job 成功。真正的 deb 由 GX Shell 用 stage 的 `root/` 与 `deb_depends` 构建。
 
 `windows-app` 的组件全部钉死在 `scripts/gx_windows_package.py`：ConPTY 来自 NuGet 包 `Microsoft.Windows.Console.ConPTY` 1.24.261001001（`conpty.dll`、`OpenConsole.exe`），软件渲染后备来自 pal1000/mesa-dist-win 的 Mesa 26.2.4（`opengl32.dll`、`libgallium_wgl.dll`、`dxil.dll`），字体是 Nerd Fonts v3.4.0 的 JetBrainsMono Nerd Font 6 个字重与 notofonts/noto-cjk `NotoSansV2.001` 的 Noto Sans CJK Regular/Bold，许可证文本另有一部分入库在 `dist/windows/gx/licenses/`；每个下载与包内文件都按 sha256 校验，不符即失败。安装包脚本是 `dist/windows/gx/ghostty-gx.iss`，要求 Inno Setup 7.1.x。
 

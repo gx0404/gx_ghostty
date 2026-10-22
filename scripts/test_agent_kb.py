@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -38,7 +39,7 @@ except ModuleNotFoundError:  # Python 3.10
         tomllib = None  # type: ignore[assignment]
 
 KB_PATH = REPO_ROOT / "docs" / "kb" / "chunks.json"
-SIZE_BUDGET_BYTES = int(2.5 * 1024 * 1024)
+SIZE_BUDGET_BYTES = build_agent_kb.SIZE_BUDGET_BYTES
 PAYLOAD_KEYS = ["schema_version", "doc_fields", "chunk_fields", "doc_count", "chunk_count", "docs"]
 
 # (查询, 期望命中：任一文档出现在 top-8 即通过)
@@ -437,6 +438,36 @@ class CodeStructureTests(unittest.TestCase):
 
 
 class BuildTests(unittest.TestCase):
+    def test_budget_blocks_check_and_write_without_touching_existing_output(self) -> None:
+        root = make_repo(self.base, TEMP_CORPUS)
+        target = root / build_agent_kb.DEFAULT_OUTPUT
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"preserve me\n")
+        before = target.stat().st_mtime_ns
+        with mock.patch.object(build_agent_kb, "SIZE_BUDGET_BYTES", 64):
+            for extra in ([], ["--confirm"]):
+                code, _, err = run_cli(build_agent_kb.main, ["--root", str(root), *extra])
+                self.assertEqual(code, 2)
+                self.assertIn("2.5 MiB", err)
+        self.assertEqual(target.read_bytes(), b"preserve me\n")
+        self.assertEqual(target.stat().st_mtime_ns, before)
+
+    def test_freshness_gate_is_readonly_and_rejects_stale_default_query(self) -> None:
+        root = make_repo(self.base, TEMP_CORPUS)
+        target = root / build_agent_kb.DEFAULT_OUTPUT
+        self.assertEqual(run_cli(build_agent_kb.main, ["--root", str(root), "--confirm"])[0], 0)
+        before = (target.read_bytes(), target.stat().st_mtime_ns)
+        build_agent_kb.check_freshness(root)
+        (root / "README.md").write_text("# Changed\n\nnew content\n", encoding="utf-8")
+        with self.assertRaises(build_agent_kb.KBError):
+            build_agent_kb.check_freshness(root)
+        self.assertEqual((target.read_bytes(), target.stat().st_mtime_ns), before)
+        with mock.patch.object(agent_kb, "DEFAULT_KB", target), mock.patch.object(
+            build_agent_kb, "check_freshness", side_effect=build_agent_kb.KBError("stale; just kb")
+        ), mock.patch.object(agent_kb, "load_index") as load:
+            self.assertEqual(run_cli(agent_kb.main, ["renderer"])[0], 2)
+            load.assert_not_called()
+
     def test_phase_documents_are_excluded_without_dropping_other_docs(self) -> None:
         excluded = [
             f"docs/GX_UI_{name}.md"

@@ -7,6 +7,7 @@ rebuild             全量重建 graphify-out/graph.json 与 GRAPH_REPORT.md（�
                     随后写入并校验 graphify-out/source-fingerprint.json
 check               只校验指纹（不需要 graphify；过期退出 2）
 query|path|explain  直通 graphify，图谱固定为 graphify-out/graph.json，拒绝自带 --graph
+                    查询前检查新鲜度；不写入库产物，但 graphify 会更新本机 query stamp
 
 graphify 查找顺序：$GX_GHOSTTY_GRAPHIFY_CLI > .local/tools/venv（用 venv 的 python -m graphify 运行）> PATH。
 不直接执行 venv 里的 graphify.exe：它是安装时生成的未签名启动器，Windows 应用控制（智能应用控制）
@@ -104,6 +105,7 @@ def graphify_env(
     # 输出目录由项目钉死，不继承外部 GRAPHIFY_OUT；禁止 graphify 顺手刷新用户级 skill 目录。
     env["GRAPHIFY_OUT"] = GRAPH_OUT
     env["GRAPHIFY_NO_AUTO_REFRESH"] = "1"
+    env["GRAPHIFY_QUERY_LOG_DISABLE"] = "1"
     if rebuild:
         # 固定 hash seed，避免社区划分与报告随解释器随机漂移。
         env["PYTHONHASHSEED"] = "0"
@@ -157,10 +159,36 @@ def rebuild(root: Path, cli: list[str], env: dict[str, str]) -> None:
         raise GraphifyError(f"graphify cluster-only 失败（退出码 {code}）", code)
     if not (root / REPORT).is_file():
         raise GraphifyError(f"聚类未生成报告：{REPORT}")
+    normalize_report(root)
     graphify_fingerprint.write_fingerprint(root)
     for note in graphify_fingerprint.check_fingerprint(root):
         print(f"note: {note}")
+    check_or_build_viewer(root, "build")
     print(f"[graphify] 图谱已重建：{GRAPH_JSON}（本机）+ {REPORT} 与指纹（入库）")
+
+
+def normalize_report(root: Path) -> None:
+    """Replace upstream commit-based freshness advice with the project contract."""
+    path = root / REPORT
+    report = path.read_text(encoding="utf-8")
+    replacement = (
+        "## Graph Freshness\n"
+        "- Validate current source content with `just graph-check`.\n"
+        "- Rebuild the AST graph and offline atlas with `just graph`.\n"
+        "- Refresh only the atlas after viewer changes with `just graph-view`.\n"
+        "- Commit metadata is provenance, not a freshness test.\n\n"
+    )
+    pattern = r"(?ms)^## Graph Freshness\n.*?(?=^## |\Z)"
+    report = re.sub(pattern, lambda _: replacement, report) if re.search(pattern, report) else report.rstrip() + "\n\n" + replacement
+    path.write_bytes(report.encode("utf-8"))
+
+
+def check_or_build_viewer(root: Path, mode: str) -> None:
+    import graphify_viewer
+    try:
+        graphify_viewer.run(root, mode)
+    except (graphify_viewer.ViewerError, OSError) as exc:
+        raise GraphifyError(f"viewer {mode}: {exc}", 2) from exc
 
 
 def reject_graph_override(args: list[str]) -> None:
@@ -194,6 +222,8 @@ def run_command(argv: list[str], root: Path, base_env: dict[str, str]) -> int:
             raise GraphifyError("check 不接受额外参数", 2)
         for note in graphify_fingerprint.check_fingerprint(root):
             print(f"note: {note}")
+        if (root / GRAPH_JSON).is_file():
+            check_or_build_viewer(root, "check")
         print("[graphify] 源码指纹、管线与入库产物一致")
         return 0
     if command == "rebuild":
@@ -211,6 +241,7 @@ def run_command(argv: list[str], root: Path, base_env: dict[str, str]) -> int:
         command_args = passthrough_args(command, args)
         if not (root / GRAPH_JSON).is_file():
             raise GraphifyError(f"本机尚未构建 {GRAPH_JSON}（不入库）；先运行 just graph")
+        graphify_fingerprint.check_fingerprint(root)
         cli = resolve_cli(root, base_env)
         env = graphify_env(
             base_env,

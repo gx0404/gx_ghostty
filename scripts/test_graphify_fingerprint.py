@@ -83,7 +83,7 @@ args = sys.argv[1:]
 log = os.environ.get("FAKE_GRAPHIFY_LOG")
 if log:
     with open(log, "a", encoding="utf-8") as handle:
-        keys = ("GRAPHIFY_OUT", "PYTHONHASHSEED", "GRAPHIFY_NO_AUTO_REFRESH")
+        keys = ("GRAPHIFY_OUT", "PYTHONHASHSEED", "GRAPHIFY_NO_AUTO_REFRESH", "GRAPHIFY_QUERY_LOG_DISABLE")
         record = {"args": args, "cwd": os.getcwd(), "env": {key: os.environ.get(key) for key in keys}}
         handle.write(json.dumps(record) + "\n")
 if args[:1] == ["--version"]:
@@ -494,6 +494,7 @@ class WrapperCliTests(unittest.TestCase):
                     before = dict(base)
                     with mock.patch.object(wrapper, "_is_executable", return_value=source != "path"), \
                             mock.patch.object(wrapper.subprocess, "run") as run, \
+                            mock.patch.object(fp, "check_fingerprint", return_value=[]), \
                             mock.patch.object(wrapper, "rebuild") as rebuild:
                         run.return_value = subprocess.CompletedProcess([], 0, "graphify 0.9.73\n", "")
                         self.assertEqual(wrapper.run_command(command, self.root, base), 0)
@@ -586,7 +587,9 @@ class WrapperCliTests(unittest.TestCase):
     def test_rebuild_runs_pinned_pipeline_and_writes_fingerprint(self) -> None:
         self._seed_repo()
         env = dict(self.env, **{wrapper.CLI_ENV: str(self.cli)})
-        self.assertEqual(quiet(wrapper.run_command, ["rebuild"], self.root, env), 0)
+        with mock.patch.object(wrapper, "check_or_build_viewer") as viewer:
+            self.assertEqual(quiet(wrapper.run_command, ["rebuild"], self.root, env), 0)
+            viewer.assert_called_once_with(self.root, "build")
         calls = self.calls()
         self.assertEqual([call["args"] for call in calls],
                          [["--version"], list(wrapper.EXTRACT_ARGS), list(wrapper.CLUSTER_ARGS)])
@@ -601,11 +604,13 @@ class WrapperCliTests(unittest.TestCase):
         for call in calls[1:]:
             self.assertEqual(Path(call["cwd"]).resolve(), self.root.resolve())
             self.assertEqual(call["env"],
-                             {"GRAPHIFY_OUT": "graphify-out", "PYTHONHASHSEED": "0", "GRAPHIFY_NO_AUTO_REFRESH": "1"})
+                             {"GRAPHIFY_OUT": "graphify-out", "PYTHONHASHSEED": "0", "GRAPHIFY_NO_AUTO_REFRESH": "1", "GRAPHIFY_QUERY_LOG_DISABLE": "1"})
         report = self.root / "graphify-out" / "GRAPH_REPORT.md"
         self.assertNotIn(b"\r", report.read_bytes())
         self.assertEqual(fp.check_fingerprint(self.root), [])
-        self.assertEqual(quiet(wrapper.run_command, ["check"], self.root, env), 0)
+        with mock.patch.object(wrapper, "check_or_build_viewer") as viewer:
+            self.assertEqual(quiet(wrapper.run_command, ["check"], self.root, env), 0)
+            viewer.assert_called_once_with(self.root, "check")
         write(self.root, "src/main.zig", "pub fn main() !void {}\n")
         self.assertEqual(quiet(wrapper.main, ["--root", str(self.root), "check"]), 2)
 
@@ -625,14 +630,40 @@ class WrapperCliTests(unittest.TestCase):
         self.assertEqual([call["args"] for call in self.calls()], [["--version"]])
 
     def test_query_passthrough_pins_graph(self) -> None:
+        self._seed_repo()
         write(self.root, "graphify-out/graph.json", "{}\n")
-        env = dict(self.env, **{wrapper.CLI_ENV: str(self.cli)})
+        write(self.root, "graphify-out/GRAPH_REPORT.md", "# Graph Report\n")
+        quiet(fp.write_fingerprint, self.root)
+        env = dict(self.env, GRAPHIFY_QUERY_LOG_ENABLE="1", **{wrapper.CLI_ENV: str(self.cli)})
         self.assertEqual(quiet(wrapper.run_command, ["query", "renderer", "thread"], self.root, env), 0)
         last = self.calls()[-1]
         self.assertEqual(last["args"], ["query", "renderer thread", "--graph", "graphify-out/graph.json"])
         self.assertEqual(last["env"]["GRAPHIFY_OUT"], "graphify-out")
         self.assertEqual(last["env"]["GRAPHIFY_NO_AUTO_REFRESH"], "1")
+        self.assertEqual(last["env"]["GRAPHIFY_QUERY_LOG_DISABLE"], "1")
         self.assertIsNone(last["env"]["PYTHONHASHSEED"])
+
+    def test_stale_queries_do_not_launch_cli(self) -> None:
+        self._seed_repo()
+        write(self.root, "graphify-out/graph.json", "{}\n")
+        write(self.root, "graphify-out/GRAPH_REPORT.md", "# report\n")
+        quiet(fp.write_fingerprint, self.root)
+        write(self.root, "src/main.zig", "pub fn changed() void {}\n")
+        for command in (["query", "main"], ["path", "a", "b"], ["explain", "main"]):
+            with self.assertRaises(fp.FingerprintError):
+                wrapper.run_command(command, self.root, dict(self.env, **{wrapper.CLI_ENV: str(self.cli)}))
+        self.assertEqual(self.calls(), [])
+
+    def test_report_uses_content_freshness_contract(self) -> None:
+        report = write(self.root, wrapper.REPORT, "# Report\n\n## Graph Freshness\n- compare HEAD\n- graphify update .\n\n## Hubs\nkeep\n")
+        wrapper.normalize_report(self.root)
+        content = report.read_text(encoding="utf-8")
+        self.assertIn("just graph-check", content)
+        self.assertIn("## Hubs\nkeep", content)
+        self.assertNotIn("compare HEAD", content)
+        self.assertNotIn("graphify update", content)
+        wrapper.normalize_report(self.root)
+        self.assertEqual(content, report.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

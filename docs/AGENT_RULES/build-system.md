@@ -47,7 +47,7 @@ fork 发布版本串与 tag 见 `ci-release.md`，GX-0001 的原因与移除条�
 
 ### Zig 版本与依赖
 
-- Zig 版本真源是 `build.zig.zon` 的 `.minimum_zig_version`；`build.zig` 编译期调用 `src/build/zig.zig::requireZig`，主次版本必须相同、补丁号不得更低，即只接受 0.17.x。同一版本号还硬编码在 `flake.nix`、`nix/package.nix`、`nix/libghostty-vt.nix`（`zig_0_17`）、`snap/snapcraft.yaml`、`flatpak/dependencies.yml`（以上随上游同步更新），以及 fork 的 `scripts/setup_zig.py::ZIG_VERSION` 与各平台 sha256 钉版 `PINS`（同步时手动升级，步骤见 `development.md`）。
+- Zig 版本真源是 `build.zig.zon` 的 `.minimum_zig_version`；`build.zig` 编译期调用 `src/build/zig.zig::requireZig`，主次版本必须相同、补丁号不得更低，即只接受 0.17.x。fork 的 `scripts/setup_zig.py::ZIG_VERSION` 与各平台 sha256 钉版 `PINS` 必须一致（升级见 `development.md`）。Nix、Snap 与 Flatpak 的上游镜像配置独立随同步更新；当前 `snap/snapcraft.yaml`、`flatpak/dependencies.yml` 仍下载 0.16.0，不能据其推断本仓可用工具链，也不为 fork 擅改这些上游文件。
 - 根 `build.zig.zon` 的 URL 依赖都带 `.hash`，大多取自上游镜像 `deps.files.ghostty.org`；`pkg/*/build.zig.zon` 再各自引入 C 源码包。完整清单（含传递依赖）是生成的 `build.zig.zon.txt`，少数来自 GitHub、Codeberg 与 freedesktop GitLab。
 - 经 zigw 运行时全局缓存默认在 `.local/zig-cache/global`；Zig 0.16 把依赖解包副本放在项目根 `zig-pkg/`，它与 `.zig-cache/`、`zig-out/` 都被上游 `.gitignore` 忽略，不入库。
 - `pkg/<名>/` 是独立 Zig 包（自带 `build.zig` 与 `build.zig.zon`），根清单以 `.path` 引用、大多为 lazy，由 `src/build/SharedDeps.zig::add` 统一挂到 exe、lib 与测试上；`override/` 放构建期配置头，`pkg/breakpad/vendor/`、`pkg/simdutf/vendor/` 是第三方源码副本；部分包有自己的 `test` 步骤（上游 CI 只跑 `pkg/wuffs`）。

@@ -57,5 +57,6 @@ vgcore.*
 !/.zcode/config.json
 !/.zcode/README.md
 /.kimi-code/
+/scripts/graphify_viewer_assets/vendor/build/node_modules/
 __pycache__/
 *.pyc

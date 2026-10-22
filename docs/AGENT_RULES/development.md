@@ -16,10 +16,10 @@
 - `scripts/resolve_agent_rules.py`：参数、输出顺序与退出码见 `docs/AGENT_RULES/README.md`；`--check` 单独使用，做全仓守门，违规退出 2。根 `AGENTS.md` 常驻加载，不在输出里。
 - 根 `AGENTS.md`：上游原文在前，标记行 `<!-- gx-fork: AI 协作框架（fork 维护段，上游没有；同步时保留）-->` 之后是 fork 段；`CLAUDE.md` 是指回它的薄入口。
 - 根 `README.md`：开头 `<!-- gx-fork: … -->` 到 `<!-- /gx-fork -->` 是中英文非官方分支声明，其后是上游原文；同步时保留声明块、其余取上游（`scripts/test_fork_patches.py` 锁定）。
-- `.claude/hooks/dangerous_patterns.conf`：危险操作策略唯一真源（`SECTION<TAB>regex<TAB>reason<TAB>deny|ask`；2026-10 起最小核心防线只保留四类 deny），Claude、Codex、ZCode 的 PreToolUse 适配器只读取它；探针 `scripts/test_ai_tool_hooks.py`；接入与逐客户端验证账本 `docs/AI_TOOLS.md`。
+- `.claude/hooks/dangerous_patterns.conf`：危险操作策略唯一真源（`SECTION<TAB>regex<TAB>reason<TAB>deny|ask`；2026-10 起最小核心防线只保留四类 deny），Claude、Codex 的 PreToolUse 适配器只读取它，ZCode 项目 hooks 不受支持；探针 `scripts/test_ai_tool_hooks.py`；接入与逐客户端验证账本 `docs/AI_TOOLS.md`。
 - `justfile` 与命令手册 `docs/MAKE_COMMANDS.md`；Zig 封装 `scripts/zigw.py`，环境 `scripts/setup_zig.py`、`scripts/setup_env.py`。
 - 测试运行器：`scripts/zig_test.py`（`just test-vt`、`just test`，用法见 `testing.md`）与 `scripts/run_unittests.py`（`just framework-test`），锁定测试 `scripts/test_zig_test.py`、`scripts/test_run_unittests.py`；耗时缓存只写 `.local/test-timings/`。
-- 生成物管线：`scripts/graphify.py`、`scripts/graphify_fingerprint.py`、`.graphifyignore`；`scripts/build_agent_kb.py`（默认只检查，`--confirm` 才写入）、`scripts/agent_kb.py`。
+- 图谱、浏览器与 KB 管线见 `docs/GRAPH.md`，命令与真源以对应脚本为准；生成器默认检查，写入必须走显式入口。
 - fork 补丁：`docs/FORK_PATCHES.md` 与 `scripts/test_fork_patches.py`。上游同步与交付闭环的步骤细则：`docs/DEVELOPMENT.md`。
 
 ## 不变量
@@ -42,7 +42,7 @@
 
 - `.claude/`、`.codex/`、`.zcode/` 只把 `.gitignore` fork 段白名单列出的无凭据配置入库（settings / config、hooks、rules、reviewer、README），会话、认证与本机覆盖留在本机；`.kimi-code/` 整目录忽略；`.agents/` 是上游内容，原样保留且不忽略。
 - 危险模式只改 `dangerous_patterns.conf` 一处，适配器不内嵌副本；工具规则文件、reviewer 定义与 `CLAUDE.md` 只提醒运行 resolver，不复制领域正文。hook 是安全门，不加载规则，也不静默改写源码。
-- 客户端状态见 `docs/AI_TOOLS.md`：规则注入、配置加载、拦截与信任分开验收，离线 fail-closed、`hooks=true` 或 `git status` 不能代证拦截；下文「hook 拒绝」以实际加载、受信任并收到调用为前提。agent 不自动 trust、不读私有配置与会话、不用 `config/read` 全层 RPC，不改 sandbox、model 或审批权限掩盖漏拦。
+- 客户端契约与证据见 `docs/AI_TOOLS.md`：原生 Read 复用 FILE 策略，Codex 角色按 name 发现且继承父会话选择，ZCode 无项目 hooks。解析、角色/规则发现、信任与真实拦截分别验收；不自动 trust、不读私人会话或全层配置 RPC，不改权限掩盖漏拦。
 - `GX_GATE_WATCHDOG_SECONDS` 只给测试缩短 hook 求值看门狗（`.claude/hooks/pre_tool_use_gate.py::evaluation_deadline` 只认 (0, 10] 秒）；不写进 hook 配置或会话环境，否则 hook 提前超时并按拒绝处理。
 
 ### 脚本约定
@@ -57,23 +57,26 @@
 
 - `justfile` 在 Windows 经 `cmd.exe` 执行（`set windows-shell`），解释器在 Windows 取 `python`、其余取 `python3`；配方体只写单条命令（Python 脚本调用，`install-hooks` 是 `git config`），串联的门用配方依赖表达，不写 POSIX 守卫或多行 shell。`.githooks/commit-msg` 必须以可执行模式入库（`git add --chmod=+x`），由提交规范测试锁定。上游 `Makefile` 不改，也不作 fork 入口。
 - `just framework-check`：rules-check → version-check → framework-test → kb-check → i18n-check → pinyin-check；不需要 Zig，本机约 15 s，改规则、脚本、文档后必跑。
-- `just generated-check`：kb-check → i18n-check → pinyin-check → fluent-check → graph-check；生成物新鲜度门，上游同步后执行，`gx-release` 的 prepare 也跑 kb、graph 两项。图谱重建要几分钟，graph-check 刻意不进 framework-check、ci-check 与 push CI。
-- `just ci-check`：framework-check → fmt-check → test-vt；本地复现 CI 主干（不含完整单测 `just test`），需要钉版 Zig，热缓存约 100 s，改过 Zig 源码另加约 2 min 编译；不得自行排除冷编译或用本机结果代证 CI（`docs/TESTING.md`）。
-- `just doctor`：`setup_env.py --check` 只读诊断，缺必需项（zig、python、git、venv、graphify，Windows 另需 MSVC）退出 1，其余（hooksPath、符号链接权限、Inno Setup、各 CLI）只报可选；只给修复命令，不隐式安装。配方参数不加引号拼进命令行，含 shell 元字符的自由文本直接调用脚本。
+- `just generated-check`：kb-check → i18n-check → pinyin-check → fluent-check → graph-check（图谱浏览器另跑 `just graph-view-check`，详见 `docs/GRAPH.md`）；生成物新鲜度门，上游同步后执行，`gx-release` 的 prepare 也跑 kb、graph 两项。图谱重建要几分钟，graph-check 刻意不进 framework-check、ci-check 与 push CI。
+- `just ci-check`：framework-check → fmt-check → test-vt；不含完整 `just test`。需要钉版 Zig，覆盖与历史耗时见 `docs/TESTING.md`，不排除冷编译或用本机代证 CI。
+- `just doctor` 只读报告前置，缺必需项退出 1，不隐式安装；实际集合见 `setup_env.py`。just 参数会交给 shell，含元字符的自由文本直接调用脚本。
 
 ### 工具链本地性
 
-- Zig 只经 `just setup` 装进 `.local/toolchains/zig/zig-0.16.0/`（sha256 钉版、镜像回退；`GX_GHOSTTY_ZIG_HOME`、`GX_GHOSTTY_ZIG_MIRROR` 覆盖位置与镜像；安装幂等，损坏需 `--force`）。graphify 只装进 `.local/tools/venv`（`graphifyy==0.9.73`）。
+- Zig 只经 `just setup` 装进 `.local/toolchains/zig/zig-0.17.0/`（sha256 钉版、镜像回退；`GX_GHOSTTY_ZIG_HOME`、`GX_GHOSTTY_ZIG_MIRROR` 覆盖位置与镜像；安装幂等，损坏需 `--force`）。graphify 只装进 `.local/tools/venv`（`graphifyy==0.9.73`）。
 - `zigw.py` 解析顺序 `$GX_GHOSTTY_ZIG` > `$ZIG` > 项目内钉版 > PATH，版本须等于 `scripts/setup_zig.py::ZIG_VERSION`（测试锁定其与 `build.zig.zon` 的 `minimum_zig_version` 一致）；找不到 Zig 或版本不符时退出 2 并提示 `just setup`，其余情况原样透传 zig 的退出码。
 - 未设 `ZIG_GLOBAL_CACHE_DIR` 时默认 `.local/zig-cache/global`；`.zig-cache/`、`zig-out/` 由上游 `.gitignore` 忽略，`.local/` 由 fork 段忽略。工具链、缓存与产物都不指向仓库外。
-- Inno Setup 7.1.0 只经 `just setup --innosetup`（仅 Windows，sha256 钉版、便携安装）装进 `.local/tools/innosetup/`，供 `just package-windows`。WSL 克隆的工具链由 `just wsl setup` 装进 WSL 用户目录；`--apt` 以 root 装 apt 包与 locale，先征得用户同意。
+- Inno Setup 7.1.0 经 `just setup --innosetup` 便携安装到 `.local/tools/innosetup/`。WSL 工具链由 `just wsl setup` 管理，`--apt` 的 root 安装须在授权范围内。
 - 禁止系统级或用户级安装（winget、choco、scoop、msiexec 等，2026-10 起不再由安全门拦截）；MSVC、Windows SDK 这类无法仓内化的前置由人类安装，`just doctor` 报告。
 
 ### 生成物默认只检查
 
-- 入库的图谱产物只有 `graphify-out/GRAPH_REPORT.md` 与 `source-fingerprint.json`；`graph.json` 本机重建并被忽略，缺它 graph-check 照常运行。KB 产物是 `docs/kb/chunks.json`。这些路径只能经 `just graph` / `just kb` 生成，不手改（2026-10 起不再由安全门拦截）；有意重建后审 diff，检查失败时不得手改产物或放宽排除表来「变绿」。`GRAPH_REPORT.md` 提示的 `graphify update .` 不适用（`scripts/graphify.py` 拒绝 `update`），重建一律 `just graph`。
-- KB 触发：语料变化：各级 AGENTS 与根目录说明文档（含 `CHANGELOG.md`）、`docs/*.md`（排除 `GX_UI_*.md`）与 `docs/AGENT_RULES/*.md`、`src/**/*.zig` 的 `//!` 模块文档与 `pub` 签名（含 `///`）、`include/ghostty/**/*.h` 的声明；详见 `docs/DEVELOPMENT.md`，真源 `scripts/build_agent_kb.py`；函数体改动不触发。`framework-check` 内 `kb-check` 过期即失败，运行 `just kb`。体积预算 2.5 MiB 不放宽（`scripts/test_agent_kb.py::SIZE_BUDGET_BYTES`）。
-- 图谱触发：未被 `.graphifyignore` 排除的被索引源文件增删改（扩展名见 `scripts/graphify_fingerprint.py::INDEXED_EXTENSIONS`），或管线输入 `scripts/graphify_fingerprint.py::PIPELINE_INPUTS`（两个图谱脚本与 `.graphifyignore`）变化。日常可不立即重建；发版前与同步后 `just graph`，再 `just generated-check`。已知盲区：graphify 跳过名为 `build` 的目录（`src/build/**` 不在图里），拿不到 `include/` 头文件的符号，这两处直接读源码或用 `just kb-query`。graphify 一律经 venv 的 `python -m graphify` 运行，不直接执行 `graphify.exe`（Windows 智能应用控制会拦截）。
+- 人工真源和产物的完整登记见 `docs/DEVELOPMENT.md`；图谱/浏览器/KB 契约见 `docs/GRAPH.md`。不手改产物，不放宽排除或预算让检查变绿。有意重建后审 diff。
+- 原图入库仅 `GRAPH_REPORT.md`、`source-fingerprint.json`；`graph.json` 与 `graphify-out/framework/` 留本机。`just graph` 全量抽取后生成浏览器；`just graph-view` 单独重建。无本机原图时 `graph-check` 只证明入库指纹；浏览器检查不能签收缺失的原图。
+- Graphify 版本钉 0.9.73，经仓内 venv 的 `python -m graphify` 调用；不直接执行 Windows graphify.exe，不用报告建议的 update。它跳过 build/dist/target，并可能缺少头文件关系，盲区查源码或 KB，不由浏览器造边。
+- 受索引源码或 `graphify_fingerprint.py::PIPELINE_INPUTS` 变化会使图谱过期；浏览器另外绑定 adapter、全部 assets、原图和来源内容。日常可延后抽取，同步与发布前必须追平。
+- KB 语料是根/嵌套规则、根说明与 CHANGELOG 头部、fork 文档、Zig 模块文档及公开签名、C 声明。函数体不触发结构层变化；真源见 `scripts/build_agent_kb.py`。2.5 MiB 写前预算不放宽，超限先精简重复文档。
+- 同步完成后依次原图 → viewer → KB，再检查新鲜度。浏览器 check 只读，拒绝未知或手改输出；不得把文件存在、mtime 或单测通过当作交互/视觉验收。
 
 ### fork 补丁登记
 

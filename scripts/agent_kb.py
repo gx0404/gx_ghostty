@@ -252,6 +252,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--kb", type=Path, default=DEFAULT_KB, help="知识库路径（默认 docs/kb/chunks.json）")
     args = parser.parse_intermixed_args(argv)
     try:
+        if args.kb.resolve() == DEFAULT_KB.resolve():
+            import build_agent_kb
+            try:
+                build_agent_kb.check_freshness()
+            except build_agent_kb.KBError as exc:
+                raise KBLoadError(str(exc)) from exc
         index = load_index(args.kb)
     except KBLoadError as exc:
         print(f"error: {exc}", file=sys.stderr)

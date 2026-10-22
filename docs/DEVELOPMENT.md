@@ -4,7 +4,7 @@
 
 ## 首次准备
 
-以下前置需要人工准备。框架不代装系统级工具，hook 也会拒绝 winget、choco、scoop、msiexec。
+以下系统级前置需要人工准备；仓内工具链由 `just setup` 安装。系统级安装不属于本仓自动安装流程，hook 的最小防线也不拦截这些命令。
 
 - Git、`just`、Python ≥ 3.10（框架脚本只用标准库；3.10 需已装 `tomli`）。
 - Windows：Visual Studio 2022 Build Tools（MSVC）与 Windows SDK——libghostty-vt 的本机构建与测试（`just test-vt`、`just build-vt`）用默认的 MSVC 目标；Windows app 与完整单测（`just build`、`just test`）按 `x86_64-windows-gnu` 构建，用 Zig 自带的 MinGW 头文件，不依赖 MSVC。另需在「设置 → 系统 → 开发者选项」开启开发者模式，允许非管理员创建符号链接，否则 `src/lib/tinyio` 的两个符号链接用例以 `PermissionDenied` 失败（`just test-vt` 里 4 处，`just test` 里 2 处）。
@@ -149,7 +149,7 @@ just rules-review <本轮全部路径…>
 - **界面语言**：Windows 构建关闭 gettext i18n（`zig build update-translations` 在 Windows 上报错），win32 界面的文字全部走 `gx.i18n`，改译文用 `just i18n`。
 - **编译耗时**：改过 Zig 源码后，`just test-vt` 要用 LLVM 重新编译 `ghostty-vt`、`ghostty-vt-c` 两个 Debug 测试二进制，两次编译并行，约 2 min；`just test` 另编 `ghostty-test`（2026-10-09 本机冷构建 `test-bin` 用了 3 min 52 s）。这段时间省不掉：Zig 自托管后端在 Windows 上编出的测试二进制无法运行。运行器给测试构建钉住版本串（`X.Y.Z-dev+0000000`），换提交不会让缓存失效；源码没变时构建步骤几秒内完成。
 - **python 别名**：`justfile` 在 Windows 上调用 `python`，其他平台调用 `python3`。`%LOCALAPPDATA%\Microsoft\WindowsApps` 下的 `python.exe`、`python3.exe` 是应用执行别名：可能转到 Python 安装管理器（找不到匹配运行时会把 Python 装进当前目录，`.gitignore` 的 fork 段因此忽略 `/Python/`），也可能只是 Microsoft Store 占位程序。`scripts/setup_env.py::find_real_python` 建 venv 时跳过这类别名，`just doctor` 显示实际解析到的解释器；`.githooks/commit-msg` 也只用能实际运行的 `python3` 或 `python`。`zig build test-lib-vt-schema` 由 `build.zig` 直接调用 `python3`，这个名字同样必须能运行。
-- **本机状态都在 `.local/`**：钉版 Zig、Zig 全局缓存（未设置 `ZIG_GLOBAL_CACHE_DIR` 时 `scripts/zigw.py` 指向 `.local/zig-cache/global`）、图谱 venv、钉版 Inno Setup、打包下载缓存（`.local/cache/`）与两个测试运行器的耗时缓存（`.local/test-timings/`，只影响调度顺序）都在仓内 `.local/`，由 `.gitignore` 的 fork 段忽略，不写用户全局目录。构建输出与依赖工作副本仍在上游默认的 `zig-out/`、`.zig-cache/`、`zig-pkg/`，已被上游 `.gitignore` 忽略。agent 的文件编辑工具被 hook 禁止写 `.local/`；删除 `.local/` 后要重新 `just setup`，Zig 依赖与打包下载也会重新下载。
+- **本机状态都在 `.local/`**：钉版 Zig、Zig 全局缓存（未设置 `ZIG_GLOBAL_CACHE_DIR` 时 `scripts/zigw.py` 指向 `.local/zig-cache/global`）、图谱 venv、钉版 Inno Setup、打包下载缓存（`.local/cache/`）与两个测试运行器的耗时缓存（`.local/test-timings/`，只影响调度顺序）都在仓内 `.local/`，由 `.gitignore` 的 fork 段忽略，不写用户全局目录。构建输出与依赖工作副本仍在上游默认的 `zig-out/`、`.zig-cache/`、`zig-pkg/`，已被上游 `.gitignore` 忽略。删除 `.local/` 后要重新 `just setup`，Zig 依赖与打包下载也会重新下载。
 - **换行**：本机 `core.autocrlf=true`。上游 `.gitattributes` 已把 `.zig`、`.md`、`.py`、`.toml`、`.yml` 等固定为 LF，但 `justfile`、`.graphifyignore`、`.conf` 与无扩展名的 hook 不在其中，检出后可能是 CRLF。框架脚本一律用 `splitlines()` 解析，容忍 CRLF；`.githooks/.gitattributes` 把 hook 固定为 LF。打包脚本会把 fork 主题转成 LF 再放进包里。提交前跑 `git diff --check`。
 - **shell**：`just` 在 Windows 上用 `cmd.exe` 执行配方（`justfile` 的 `set windows-shell`），所以从 cmd、PowerShell、Git Bash 调用效果相同。配方都是单行 Python 调用，不依赖 POSIX shell。参数是不加引号拼进命令行的：含 `& | < > ^ %` 的自由文本（以及单条提交标题）会被 cmd 解释，这时直接调用脚本，如 `python scripts/conventional_commits.py "<标题>"`、`python scripts/agent_kb.py "<查询>"`。
 
@@ -237,30 +237,17 @@ git commit -m "chore(sync): 合并上游 main（<sha>）"
 - **fork 补丁**：按 `docs/FORK_PATCHES.md` 逐条核对补丁是否仍然需要、是否仍然成立，冲突按该补丁小节的「同步冲突处理」放回，标记与登记由 `scripts/test_fork_patches.py` 检查。热点见下表。
 - **其余上游文件**：取上游版本。不用整文件 ours/theirs 糊过冲突，也不用 squash、cherry-pick 或 rebase 代替合并。
 
-**补丁热点**：42 个上游文件带 GX 补丁（登记表另有一个已恢复上游原样的 `removed` 文件），其中 `src/Surface.zig`（GX-0005、GX-0006、GX-0012、GX-0014）、`src/apprt/gtk/class/application.zig`（GX-0011、GX-0015、GX-0016、GX-0023）、`src/config/Config.zig`（GX-0003、GX-0010、GX-0024）与 `src/termio/Exec.zig`（GX-0005、GX-0012、GX-0022）各叠了多个补丁，最容易冲突。
+**补丁热点**以 [FORK_PATCHES.md](FORK_PATCHES.md) 的 active 登记和对应小节为准，不另维护文件计数或完整 ID 副本。重点复核：
 
-| 补丁 | 上游文件 | 冲突时核对 |
-|---|---|---|
-| GX-0001 | `src/build/Config.zig` | `vsn.tag` 判断的形状由 `scripts/test_fork_patches.py` 锁定 |
-| GX-0002 | `build.zig` | 三个纯新增块的位置与安装路径，路径与 `scripts/zig_test.py::SUITES` 对应 |
-| GX-0003 | `src/apprt.zig`、`src/apprt/runtime.zig`、`src/build/SharedDeps.zig`、`src/main_ghostty.zig`、`src/config/Config.zig`，以及按 `app_runtime` 穷举的 GObject 分支（`src/apprt/{action,structs,surface}.zig`、`src/datastruct/split_tree.zig`、`src/font/face.zig`、`src/input/Binding.zig`、`src/terminal/mouse.zig`） | 上游新增按 `app_runtime` 穷举的 switch 要补 `.win32`（编译 win32 目标会报出）；上游合入 PR #14608 后 `posix_c` 守卫改取上游 |
-| GX-0004 | `src/renderer/OpenGL.zig`、`src/renderer/opengl/Frame.zig` | 上游改 `init`/`threadEnter`/`present`、`Device` 接口或帧呈现协议时同步 `src/renderer/opengl/wgl.zig` |
-| GX-0005 | `src/Surface.zig`、`src/termio/{Exec,Options,Termio,stream_handler}.zig` | 唤醒句柄按指针传递、Windows 读线程退出、退出管道的 Win32 句柄、命令行切分、URL 不按路径解析 |
-| GX-0006 | `src/terminal/modes.zig`、`include/ghostty/vt/modes.h`、`src/terminal/snapshot/{terminal.zig,snapshot.ksy}`、`src/terminal/stream_terminal.zig`、`src/Surface.zig` | 上游在 `entries` 末尾加模式时 fork 条目顺延，快照位号、ksy 与单测一起改；`encodeKey` 开头的分流 |
-| GX-0007 | `src/pty.zig` | `WindowsPty` 的创建、缩放、关闭走同一个 `gx_conpty.Instance` |
-| GX-0008 | `src/termio/stream_handler.zig`、`src/os/hostname.zig` | `reportPwd` 在主机检查之后、`setPwd` 之前调 `gx_osc7.nativePath` |
-| GX-0009 | `src/font/{discovery,DeferredFace,backend}.zig` | `Discover`、`DeferredFace.Windows` 的接口变化时同步 `src/font/directwrite/` |
-| GX-0010 | `src/config/Config.zig` | `gx-*` 字段块留在字段区末尾；`Config.load`、`Replay`、`loadCliArgs` 改动后核对 `src/gx/config_layers.zig::loadWith` 的分层下标 |
-| GX-0011、GX-0015、GX-0016 | `src/apprt/gtk/class/{application,window,tab,surface}.zig`、`src/apprt/gtk/App.zig`、`src/apprt/gtk/build/gresource.zig` | `Application.new`/`startupActionMap`/`propConfig`、`Window.getTabsVisible` 等钩子位置；上游改菜单时同步 `src/apprt/gtk/ui/1.5/gx/menus.blp` |
-| GX-0012 | `src/Surface.zig`、`src/termio/Exec.zig` | `needsConfirmQuit` 的 `.true` 分支、`Subprocess.getProcessInfo` 的 Windows 分支 |
-| GX-0014 | `src/input/Binding.zig`、`src/input/command.zig`、`src/Surface.zig` | `Binding.Action` 新增穷举 switch 时补 `.gx`；`src/apprt/gtk/class/command_palette.zig` 的过滤块已移除（登记为 `removed`），该文件取上游 |
-| GX-0021 | `src/renderer/generic.zig` | 预编辑追赶循环的 `< len` 上界；上游自己修好后按移除条件删除 |
-| GX-0022 | `src/terminal/Terminal.zig`、`src/termio/Exec.zig` | `flags.semantic_prompt_fresh_line` 紧跟 `resize_pull_scrollback` 且 `fullReset` 保留它；`semanticPromptFreshLine` 开头的早退；`Exec.initTerminal` 在 Windows 上关闭它与 `resize_pull_scrollback`；上游改 `PageList.resize` 的拉回语义时跑 `scrollback pull` 用例 |
-| GX-0023 | `src/apprt/gtk/css/style.css`、`src/apprt/gtk/class/application.zig` | GTK 4.14 能解析的 CSS：渐变不用过渡提示、`hsl()` 用逗号、`loadRuntimeCss414` 不用 `oklab(from …)`；上游新增的 CSS 跑 `scripts/test_fork_patches.py` 并看 `just wsl smoke` 日志有无 `Theme parser error` |
-| GX-0024 | `src/config/Config.zig` | `background-opacity` 文档注释末尾的 Windows 段落与其上方的标记行留在字段之前；上游改写这段文档时取上游再放回 |
-| GX-0026 | `src/build/GhosttyExe.zig` | Windows 分支的 `addWin32ResourceFile` 仍指向 `dist/windows/gx/ghostty-gx.rc`；上游改了 `dist/windows/ghostty.rc` 时把同样的变化搬进 fork 的 rc |
+| 接口 | 同步时核对 |
+|---|---|
+| `src/Surface.zig`、`src/config/Config.zig`、`src/termio/` | GX 配置层、显式光标优先级、输入、关闭确认与生命周期 |
+| `src/apprt/gtk/class/`、GTK 模板与 CSS | GX 钩子、稳定视图引用、GTK 4.14 / libadwaita 1.5 的兼容分支 |
+| `src/renderer/`、`src/font/` | WGL 与远程帧、GPU 资源恢复、字体发现与回退 |
+| `src/terminal/snapshot/`、`include/ghostty/vt/` | Win32 模式位、快照布局、C 导出和消费方迁移 |
+| `build.zig`、`src/build/` | 测试安装步骤、Windows 系统库与资源、SEH unwind tables（GX-0061） |
 
-合并后，`gx-ci` 的 `windows-app` 只构建 app、不跑单测，`linux-main` 只编译 `-Dapp-runtime=none`、不含 GTK apprt，所以 Windows 上的单测与 GTK apprt 的编译和单测要在本机补齐：Windows 上 `just build` 与 `just test`，WSL 里 `just wsl build --gtk` 与 `just wsl test --gtk`。
+合并后，`gx-ci` 的 `windows-app` 构建 app 并跑 win32、GX、DirectWrite、WGL、Command 与 tinyio 定向单测；`linux-main` 使用 `-Dapp-runtime=none`，不含 GTK。完整 Windows 与 GTK 覆盖仍在本机补齐：`just build`、`just test`，WSL 里 `just wsl build --gtk`、`just wsl test --gtk`。
 
 **5. 登记新路径、嵌套 AGENTS 与钉版 Zig**
 
@@ -274,26 +261,30 @@ git commit -m "chore(sync): 合并上游 main（<sha>）"
 
   `GX_GHOSTTY_ZIG`、`ZIG` 只用来指向已装好的同版本 Zig，不能拿来换版本、绕过钉版（zigw 也会拒绝与 `ZIG_VERSION` 不一致的 Zig）；正确做法是按上面的步骤升级钉版。
 
-**6. 验证**
+**6. 重建生成物**
+
+完成源码、脚本、规则和文档后，先重建受影响的翻译/拼音/Fluent，再依次运行：
 
 ```sh
+just graph
+just graph-view
+just kb
+```
+
+图谱浏览器必须消费本轮原始图谱；KB 最后生成，避免文档回写后再次过期。详细输入、输出与预算见 [GRAPH.md](GRAPH.md)。
+
+**7. 验证**
+
+```sh
+just generated-check
+just graph-view-check
 just framework-check
 just ci-check
-just test                 # Windows 上按 win32 apprt 编译并运行完整单测
+just test                 # Windows 的完整 win32 单测
 just wsl test --gtk       # GTK apprt（需要 WSL）
 ```
 
-framework-check 会捕获未覆盖的新路径、嵌套 AGENTS 变化、被重新启用的 workflow 与丢失的补丁标记；上游改了 `po/zh_CN.po` 时它里面的 `i18n-check` 失败，修法是 `just i18n`。
-
-**7. 重建生成物**
-
-```sh
-just kb
-just graph
-just generated-check
-```
-
-上游改动几乎总会改变 KB 语料与被索引源码，所以同步后两类生成物都要重建，并且必须通过 `generated-check`。
+另按变更跑针对性 ABI、快照或平台测试。检查不得吞退出码；缺环境记 PENDING，符号链接权限失败记 FAIL。GUI 可见变化要读回实际截图。门的覆盖差异见 [TESTING.md](TESTING.md)。
 
 **8. 收尾**
 
@@ -319,12 +310,14 @@ just generated-check
 |---|---|---|---|---|
 | `docs/kb/chunks.json` | KB 语料变化：根与嵌套 `AGENTS.md`、`CLAUDE.md`、`README.md`、`HACKING.md`、`CONTRIBUTING.md`、`PACKAGING.md`、`AI_POLICY.md`、`CHANGELOG.md`、`docs/*.md`（排除 `docs/GX_UI_*.md`）、`docs/AGENT_RULES/*.md`、`src/**/*.zig` 的 `//!` 模块文档与 `pub` 签名（含其 `///` 注释）、`include/ghostty/**/*.h` 的声明 | `just kb` | `just kb-check`，属于 framework-check 与 `gx-ci` 的 `framework` job | 是 |
 | `graphify-out/GRAPH_REPORT.md`、`graphify-out/source-fingerprint.json` | 被索引源码增删改：Git 可见、未被 `.graphifyignore` 排除、扩展名在 `scripts/graphify_fingerprint.py::INDEXED_EXTENSIONS` 内的文件（如 `.zig .swift .c .h .cpp .m .py .sh`），实际主要是 `src/`、`pkg/`、`include/`、`macos/` 与 `build.zig`；或者管线输入 `scripts/graphify.py`、`scripts/graphify_fingerprint.py`、`.graphifyignore` 变化 | `just graph` | `just graph-check`，只在 `gx-release` 的 prepare 阶段与上游同步后强制 | 是 |
-| `graphify-out/graph.json` | 同上，约 20 MB | `just graph` | 无 | 否，仅本机 |
+| `graphify-out/graph.json` | 原图输入变化 | `just graph` | 有本机原图时 `just graph-check` | 否 |
+| `graphify-out/framework/` | 原图、来源、适配器或浏览器资源变化 | `just graph-view`（graph 重建后也会自动生成） | `just graph-view-check`；manifest 闭集与写前预算见 GRAPH.md | 否 |
 | `src/gx/i18n/zh_CN.zig` | `po/zh_CN.po` 或 `src/gx/i18n/gx.zh_CN.po` 变化（上游同步改了 `po/zh_CN.po` 也算） | `just i18n` | `just i18n-check`，属于 framework-check 与 generated-check；`scripts/test_gx_i18n.py` 也校验，随框架单测进 `gx-ci` 的 `framework` job | 是 |
-| `src/gx/pinyin/initials.zig` | 升级钉版 pinyin-data（`scripts/gx_pinyin.py` 的 `SOURCE_VERSION` 与 `SOURCE_FILES`，同时核对同目录的两份许可原文）或改了生成规则 | `just pinyin`（联网下载钉版源数据） | `just pinyin-check`，属于 framework-check 与 generated-check；`scripts/test_gx_pinyin.py` 也校验 | 是 |
+| `src/gx/pinyin/{initials,syllables}.zig` | 钉版输入、许可或生成规则变化 | `just pinyin`（离线；显式 `--download` 才联网） | `just pinyin-check`；属于 framework-check 与 generated-check | 是 |
+| `src/gx/fluent/paths.zig` | 钉版 SVG、许可或生成规则变化 | `just fluent`（离线） | `just fluent-check`；属于 generated-check | 是 |
 | `CHANGELOG.md` 版本标题 | fork 可观察变化、定版 | 手写 | `just version-check` | 是 |
 | `build.zig.zon.json`、`build.zig.zon.nix`、`build.zig.zon.txt`、`flatpak/zig-packages.json` | `build.zig.zon` 依赖变化 | `nix/build-support/check-zig-cache.sh --update`（要 `nix develop` 提供的 zon2nix、alejandra、prettier） | 同一脚本不带参数 | 是，上游生成物 |
 | `po/com.mitchellh.ghostty.pot` 与 `po/*.po` | 源码或 Blueprint 中的可翻译字符串变化 | `zig build update-translations`（需要启用 i18n，Windows 不可用） | `.github/scripts/check-translations.sh` | 是，上游生成物 |
 | `vendor/glad/` | 更新 GLAD loader | 上游 `Makefile` 的 `glad` 目标 | 无 | 是，上游 vendored |
 
-图谱新鲜度刻意不进 `framework-check`、`ci-check` 和 push CI：每改一次 Zig 源码就要花几分钟重建图谱，不划算。日常允许图谱落后于源码，但发版和上游同步时必须追平。检查失败时不手改产物，也不放宽排除表来「变绿」。
+图谱新鲜度刻意不进 `framework-check`、`ci-check` 和 push CI：每改一次 Zig 源码就要花几分钟重建图谱，不划算。日常允许图谱落后于源码，但发版和上游同步时必须追平；浏览器只能消费通过新鲜度检查的原图。检查失败时不手改产物，也不放宽排除表来「变绿」。

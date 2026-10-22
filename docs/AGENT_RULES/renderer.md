@@ -49,7 +49,7 @@
 - 不在主线程、`threadEnter` 之前或 `threadExit` 之后调用 GL，不在主线程创建或销毁 GPU 资源。
 - 不在持 `draw_mutex` 或 `SharedGrid.lock` 时获取 `State.mutex`；不在 `State` 临界区内做 shaping、大块分配或 I/O；不靠 sleep 或改 mutex 公平性解决饥饿。
 - 不只改一个后端的 uniform、顶点结构或 pipeline 名；不调整 `Health` 既有值的顺序。
-- 不手改 `vendor/glad/`（AI hook 也拦截写入）；重新生成后确认 EGL 文件仍在、新文件是否该入库，并审 diff。
+- 不手改 `vendor/glad/`；这是生成物维护约定，当前核心 hook 不负责拦截该路径。重新生成后确认 EGL 文件仍在、新文件是否该入库，并审 diff。
 - 不把 `passthrough.glsl` 当作代码依赖：没有代码引用它，它只是手工验证 `custom-shader` 时可用的直通样例。
 
 ## 验证

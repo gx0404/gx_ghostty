@@ -1,0 +1,2 @@
+# Keep reproducible text resources byte-identical on Windows checkouts.
+* text eol=lf

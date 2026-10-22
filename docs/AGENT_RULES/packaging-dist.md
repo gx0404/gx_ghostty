@@ -61,7 +61,7 @@
 ### GX Shell 组件 stage（`scripts/gx_package.py`、`scripts/gx_linux_build.py`）
 
 - `gx_package.py windows|deb --stage-dir DIR` 生成 schema 3 的 stage，`verify-stage` 复核，`test-deb` 把 deb stage 打成一次性测试包。契约（`stage-manifest.json` 的键与布局、GX Shell 的消费方命令、所需工具与网络）只写在该模块文档里，由 `scripts/test_gx_package.py` 与 `scripts/test_gx_workflows.py` 锁定。`--build` 先构建：windows 为 win32 ReleaseFast（`-Dtarget=x86_64-windows-gnu`），deb 调 `gx_linux_build.py build`。
-- `gx_linux_build.py` 是 Ubuntu 24.04 配方：按清单检查或安装 apt 依赖，要求 patchelf 0.18.0，用钉版 Zig 与 sha256 钉版的 blueprint-compiler 0.16.0，或改从 dist 源码包构建（自带预生成资源）；ReleaseFast、`-fno-sys=gtk4-layer-shell`，`-Dpatch-rpath='$ORIGIN/../lib'` 让随包的 `libgtk4-layer-shell.so` 不靠 `LD_LIBRARY_PATH` 加载，`check-prefix` 在不设它时跑 `+version`。
+- `gx_linux_build.py` 是 Ubuntu 24.04 配方：按清单检查或安装 apt 依赖，要求 patchelf 0.18.0，用钉版 Zig 与 sha256 钉版的 blueprint-compiler 0.20.0，或改从 dist 源码包构建（自带预生成资源）；ReleaseFast、`-fno-sys=gtk4-layer-shell`，`-Dpatch-rpath='$ORIGIN/../lib'` 让随包的 `libgtk4-layer-shell.so` 不靠 `LD_LIBRARY_PATH` 加载，`check-prefix` 在不设它时跑 `+version`。
 - `gx-release` 的 `linux-gtk-noble` 在 `ubuntu:24.04` 容器跑模块文档里的 deb 命令，只上传证据 artifact `evidence-linux-gtk-noble`，不产出发布资产。
 
 ## 不变量
@@ -87,7 +87,7 @@
 
 ## 验证
 
-- 改 `GhosttyDist.zig` 或 lib-vt 包含范围：`just dist-vt`，确认 `zig-out/dist/libghostty-vt-<版本>.tar.gz` 生成且不超过 5 MiB；再 `just zig build distcheck -Demit-lib-vt=true`（PATH 上要有 0.16.x 的 `zig`、`tar`、`cmake`，缺则记 PENDING）。
+- 改 `GhosttyDist.zig` 或 lib-vt 包含范围：`just dist-vt`，确认 `zig-out/dist/libghostty-vt-<版本>.tar.gz` 生成且不超过 5 MiB；再 `just zig build distcheck -Demit-lib-vt=true`（PATH 上要有 0.17.x 的 `zig`、`tar`、`cmake`，缺则记 PENDING）。
 - 改完整源码包或 GTK 资源：在装好 GTK 构建依赖的 Linux 上跑 `zig build distcheck`（上游形态 `nix develop -c zig build distcheck`）；本机 Windows 记 PENDING，交 `gx-release` 以 `publish=false` 运行的 `linux-gtk` job 验收。
 - 改 `GhosttyResources.zig` 或 `dist/linux/`：Linux 上 `just build` 后检查 `zig-out/share/` 的安装布局；GUI 可见的影响按 `testing.md` 走 `gtk-smoke`。
 - 改资产命名或集合：`just framework-test`（含 `scripts/test_gx_release.py`），再以 `publish=false` 运行 `gx-release` 看 `verify`，未运行前记 PENDING。

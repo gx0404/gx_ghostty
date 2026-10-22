@@ -13,6 +13,7 @@
 - Zig 公开面 `src/lib_vt.zig`：`sys` 即 `src/terminal/sys.zig`（启动时可替换的 `decode_png`、`random_secure`），`TinyIo` 即 `src/lib/TinyIo.zig`，`input`、`unicode` 只挑具体文件导入。C 侧 sys 为 `src/terminal/c/sys.zig::Option`，经 `ghostty_sys_set` 安装；C ABI 构建的 std.log 经 `src/terminal/c/sys.zig::logFn` 交给嵌入方回调。
 - C 导出表：`src/lib_vt.zig` 顶层 `comptime` 的 `@import("root") == lib` 守卫块，按 `terminal.options` 的 feature 位分组 `@export`；实现别名集中在 `src/terminal/c/main.zig`。
 - feature 门：`src/terminal/build_options.zig::Options.Features`（`-Dvt-features`，app 恒为全开）；`Options.kittyGraphics` 在 freestanding 上恒关。
+- 分界写入：`include/ghostty/vt/terminal.h` 的 `ghostty_terminal_vt_write_until` 接受 boundary mask 与 sized `GhosttyTerminalWriteStop`；调用方用 `GHOSTTY_INIT_SIZED` 初始化，再读 `consumed`。旧 `ghostty_terminal_vt_write_until_ground` 已由上游移除，无兼容 shim。已在 ground 时可消费 0，循环必须调整边界或改普通 write。
 - ABI 工具：`src/terminal/lib.zig` 转出 `calling_conv`、`Enum`、`TaggedUnion`、`Struct`、`structSizedFieldFits`、`alloc`；返回码 `src/terminal/c/result.zig::Result` 即 `GhosttyResult`；头文件宏 `GHOSTTY_API`、`GHOSTTY_ENUM_TYPED`、`GHOSTTY_ENUM_MAX_VALUE`、`GHOSTTY_INIT_SIZED` 在 `include/ghostty/vt/types.h`。
 - ABI 清单：`src/terminal/c/types.zig::type_decls` 生成 `ghostty_type_json`，格式真源 `src/terminal/c/types.schema.json`（`schema` 恒为 1）；`build.zig` 的 `test-lib-vt-schema` 用 `python3` 跑 `types-schema-verify.py` 校验刚构建的库（原生走 ctypes，`.wasm` 走 wasmtime）。
 - 版本：`build.zig::lib_version`（当前 `0.1.0-dev`，`-Dlib-version-string` 可覆盖）决定 so/dylib 版本名、pkg-config `Version` 与清单的 `library_version`。
@@ -69,6 +70,7 @@
 
 ## 验证
 
+- 分界写入与快照接口变化：`just test-vt --filter vt_write_until --filter nextSliceUntil --filter snapshot --filter kitty`，并构建运行 `example/c-vt-snapshot`；已有 c-vt-static 构建不代证快照消费流程。
 - 定向：`just test-vt --filter <filter>`，同时跑 `ghostty-vt`（Zig API）与 `ghostty-vt-c`（C ABI）两个模块，清单测试也在内；全量 `just test-vt` 属于 `just ci-check`。
 - Windows 环境前置：未开开发者模式（也不是管理员）时，全量 `just test-vt` 固定有 4 处失败，都是 `src/lib/tinyio` 的符号链接用例报 `PermissionDenied`。这不是回归：记 FAIL 并写明原因，不跳过、不修改这些上游用例，开启开发者模式后重跑（见 `docs/TESTING.md`「Windows 本机限制」）。
 - 构建：`just build-vt`；交叉 `just build-vt -Dtarget=<triple>`（同 gx-ci 的 `lib-vt-cross` 矩阵）；freestanding 抽查 `just build-vt -Dtarget=thumb-freestanding-eabi -Dcpu=cortex_m4 -Doptimize=safe`。

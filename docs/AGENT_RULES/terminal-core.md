@@ -73,7 +73,8 @@ Pin 与代际：
 
 - 压缩策略只放在 `PageList`，`src/terminal/compress/lz4.zig` 只依赖 std；只压缩 active 边界之前、且不与 viewport 相交的完整历史页。
 - `src/terminal/mem.zig::canReclaim` 的 strict 模式只在 64 位 Linux、Darwin、Windows 上为真（测试构建恒真），否则 `compress` 返回 `unsupported`；恢复不可失败，解码错误按内部损坏 panic。调用方以 `compressionActivity` 变化为调度信号，app 由渲染线程调用 `compress(.incremental)`。
-- 快照格式 v1 仍在演进，不承诺二进制兼容；每条记录各带 CRC32C（`src/crc32c.zig`），READY 之前是可渲染状态与 continuation，之后是历史页。改线格式要同步 `snapshot.ksy` 与对应金样，必要时升 `src/terminal/snapshot/envelope.zig::version` 并为新版本另建金样，不覆盖旧版本。
+- 快照格式 v1 仍在演进，不承诺二进制兼容；每条记录各带 CRC32C（`src/crc32c.zig`），READY 恢复元数据与 continuation，图像像素可继续按需解码；之后的进度可能是历史页或 IMAGE，消费方必须检查 progress kind。改线格式要同步 `snapshot.ksy` 与对应金样，必要时升 `src/terminal/snapshot/envelope.zig::version` 并为新版本另建金样，不覆盖旧版本。
+- `Stream.nextSliceUntil(input, boundaries)` 返回停止原因与 `consumed`，替代旧 ground 专用方法；字符串的 END 边界停在 ST 的 ESC，后续反斜杠由下一次写入消费。Kitty 图像的 complete/pending 状态由 `renderData().bytes()` 判断，不用“元数据已到”代替当前帧像素就绪。
 - `Decoded.toOwned` 会移动 Terminal：先放到最终地址，再建持久 Stream，continuation 只重放一次。
 - Unicode 查找表是构建产物，不手写、不入库；改属性走 `src/unicode/props_uucode.zig::get`、`Properties` 或 `uucode_config.zig`，由测试 `unicode props: tables match uucode` 守住一致性。`Properties` 是 `packed struct(u16)`，加属性影响查表效率，要跑基准（流程见 `src/benchmark/AGENTS.md`）。
 

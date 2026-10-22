@@ -40,135 +40,107 @@ A file for [guiding coding agents](https://agents.md/).
 
 <!-- gx-fork: AI 协作框架（fork 维护段，上游没有；同步时保留）-->
 
-本仓库是 `gx0404/gx_ghostty`（fork 自 `ghostty-org/ghostty`）。标记以上是上游原文，同步时取上游版本；以下是 fork 维护段（整个文件 ≤16 KiB）。领域规则正文在 `docs/AGENT_RULES/*.md`；本段索引只做导航，必读集合以 resolver 输出为准。
+本仓库是 `gx0404/gx_ghostty`，fork 自 `ghostty-org/ghostty`。标记以上保持上游原文；以下是 fork 规则索引，整份 ≤16 KiB。领域真源只在 `docs/AGENT_RULES/`，必读集合以 resolver 为准。
 
 ## 规则加载协议
 
-任务开始时对本轮全部触及路径运行 resolver（目录展开为 Git 可见文件，多路径取并集；scope 扩大后用完整集合重跑）：
+任务开始时对全部触及路径运行；目录展开为 Git 可见文件，多路径取并集，scope 扩大后用完整集合重跑：
 
-```bash
-just rules <paths...>         # = python scripts/resolve_agent_rules.py <paths...>
-just rules-review <paths...>  # 审核任务：--task review
-just rules-check              # 闭集/体积/嵌套 AGENTS 守门：--check
+```sh
+just rules <paths...>         # python scripts/resolve_agent_rules.py <paths...>
+just rules-review <paths...>  # --task review
+just rules-check             # --check
 ```
 
-Linux/macOS 直接调用脚本时用 `python3`。读完输出列出的每份领域文档再动手；输出随后列出适用的上游嵌套 `AGENTS.md`（按祖先目录匹配，如 `src/terminal/c/AGENTS.md`），同样必读，`--json` 时在 `upstream_agents` 字段。
-
-- 未知路径或任务、路由缺失、`--check` 违规都以退出码 2 失败。这是有意设计：补登记路由，不要绕过。
-- 不得新增嵌套 `AGENTS.md`。现有 9 份是上游文件，原样保留并登记在 `docs/AGENT_RULES/routes.toml` 的 `nested_agents`；上游新增时只登记，不改写。
-- 规则真源唯一：领域规则只在 `docs/AGENT_RULES/` 维护；`.claude/`、`.codex/`、`.zcode/` 与 reviewer 只引用 resolver，不复制正文或清单。
+读完输出的领域文档及适用上游嵌套 `AGENTS.md` 再动手。根规则常驻，不在输出中。未知路径/任务、路由缺失、闭集或体积违规退出 2，先补登记。机器路由唯一真源是 `docs/AGENT_RULES/routes.toml`；不得新增嵌套 AGENTS，现有上游文件只登记、不改写。`.claude/`、`.codex/`、`.zcode/` 与 reviewer 只引用 resolver，不复制正文。
 
 ## 语言与协作
 
-- 与人类用其使用的语言交流；代码、标识符与代码注释用英文；fork 文档用中文。
-- 提交信息按下文「提交规范」，优先于上游 `.agents/skills/writing-commit-messages`；该 skill 只用于准备回馈上游的提交。上游 `.agents/commands/review-branch`（nushell 审核提示脚本）仍可使用，结论按 `code-review` 域的格式输出。
-- 回馈上游的内容遵守 `AI_POLICY.md`：披露 AI 使用，人类完全理解改动。
-- 先读代码再下结论；长期引用写 `path::symbol`，不钉行号；不确定就报告，不猜测。
+- 与人类用其使用的语言；代码、标识符、代码注释用英文，fork 文档用中文。先读实现再下结论；长期引用用 `path::symbol`，不钉行号，不确定就报告。
+- 客户端角色只承载职责与工具边界，模型、推理档和个人路由由宿主与用户级策略决定，不复制进项目。配置解析、真实加载、信任、工具调用和任务验收分别记录，见 `docs/AI_TOOLS.md`。
+- 上游 `.agents/commands/review-branch` 可作只读审核提示，结论按 `code-review` 域四段格式。回馈上游遵守 `AI_POLICY.md`，由人类理解并披露 AI 使用。
 
 ## fork 治理
 
-- 上游 `ghostty-org/ghostty`（remote `upstream`），fork `gx0404/gx_ghostty`（remote `origin`）。`main` 只快进镜像上游；`gx_ghostty` 是开发与发布分支。
-- 同步用 merge：`main` 快进到 `upstream/main` 后合入 `gx_ghostty`。永不 force push，永不推送 `upstream`；流程见 `docs/DEVELOPMENT.md`。
-- 上文 Issue and PR Guidelines 照常适用：agent 不创建 issue 或 PR，上游与本 fork 都一样。
-- 改动过的上游文件以 `docs/FORK_PATCHES.md` 登记表（源码补丁 GX-NNNN）为准，另有本文件、`.gitignore`、`.prettierignore` 的标记追加段，根 `README.md` 开头的标记声明块与归档的 workflow；fork 代码一律放上游没有的新路径（`src/gx/`、`src/apprt/win32/`、`src/apprt/gtk/gx/`、`src/font/directwrite/` 等），上游文件里只留登记过的钩子。
-- 改上游源码必须加 `fork(gx): GX-NNNN` 标记并登记到 `docs/FORK_PATCHES.md`，`scripts/test_fork_patches.py` 锁定闭集。
-- `.github/workflows/` 只启用 `gx-ci.yml` 与 `gx-release.yml`；上游 workflow 原样归档在 `.github/workflows-archive/`，同步带来的新 workflow 也 `git mv` 进去，不得重新启用。
-- 根 `CHANGELOG.md` 只记 fork 的可观察变更（上游没有 CHANGELOG）；产品版本仍以 `build.zig.zon` 为真源。
-- 发布只经 `gx-release`（手动触发，tag `gx-vX.Y.Z`，正式 release，首版 0.0.1），不手工创建 release 或 tag；见 `docs/RELEASE.md`。
+- `upstream` 是 `ghostty-org/ghostty`，`origin` 是本 fork。`main` 只快进镜像上游；`gx_ghostty` 开发与发布。同步用 merge：先更新 `main`，再 `git merge --no-ff main`。永不 force push、永不推 `upstream`，步骤见 `docs/DEVELOPMENT.md`。
+- 上游 Issue and PR Guidelines 对本 fork 同样适用：agent 不创建 issue 或 PR。
+- 上游源码补丁以 `docs/FORK_PATCHES.md` 为唯一登记表，改动紧邻 `fork(gx): GX-NNNN` 标记；`scripts/test_fork_patches.py` 锁定闭集。fork 代码放上游没有的新路径，如 `src/gx/`、`src/apprt/win32/`、`src/apprt/gtk/gx/`、`src/font/directwrite/`；不顺手重排上游文件。
+- 根 AGENTS、`.gitignore`、`.prettierignore` 只保留各自标记追加段；根 README 保留开头声明块，其余取上游。上游治理、嵌套 AGENTS 与 `.agents/` 原样保留。
+- `.github/workflows/` 只启用 `gx-ci.yml`、`gx-release.yml`。上游 workflow 原样归档在 `.github/workflows-archive/`；同步新增的也移入归档，不重新启用。
+- 产品版本以 `build.zig.zon` 为真源；fork 版本取根 `CHANGELOG.md` 的最大数值 SemVer，互不同步。CHANGELOG 只记 fork 可观察变化。发布仅由人类手动触发 `gx-release`，tag `gx-vX.Y.Z`、正式 release；不手工建 tag/release，见 `docs/RELEASE.md`。
 
 ## 项目模型
 
-- Zig 0.17.0（`build.zig.zon` 的 `minimum_zig_version`）。共享核心在 `src/`；产品版本在 `build.zig.zon`，最终版本由 `src/build/Config.zig::init` 推导。
-- 产物：Windows app（win32 apprt `src/apprt/win32/`，Windows 目标的默认 apprt，WGL 渲染、Direct2D 自绘界面）、GTK app（Linux/FreeBSD，`src/apprt/gtk`，GX 层在 `src/apprt/gtk/gx/`）、macOS Swift app（`macos/`，经 `include/ghostty.h`）、libghostty-vt（`src/lib_vt.zig` 与 `include/ghostty/`，可构建到 wasm32）。两个 GX apprt 共用 `src/gx/`：配置分层、界面语言、界面库（颜色、token、动效、模糊匹配）、启动配置、`gx:` 动作与进程判断。
-- 入口：`src/main.zig::entrypoint` 按 `exe_entrypoint` 分派；`src/main_ghostty.zig::main` 先 `global.init` 再 `App.create`；`src/apprt.zig::runtime` 编译期选定 apprt。
-- 数据流：pty → `src/termio/Exec.zig::ReadThread` → `src/termio/Termio.zig::processOutput` → `terminal.Stream` → `Terminal`/`Screen`/`PageList` → `src/renderer/generic.zig::Renderer.updateFrame` → `drawFrame`。每个 surface 有 termio 写线程、pty 读取线程（POSIX 另有 `io-gather`）与渲染线程，搜索时按需另起 search 线程。全貌见 `docs/ARCHITECTURE.md`。
+Zig 真源为 `build.zig.zon::minimum_zig_version`（当前 0.17.0），一律经 `scripts/zigw.py` 使用仓内钉版。共享 Zig 核心在 `src/`；入口 `src/main.zig::entrypoint` → `src/main_ghostty.zig::main` → `App.create`，`src/apprt.zig::runtime` 编译期选择 apprt。
+
+| 产物 | 入口与边界 |
+|---|---|
+| Windows app | `src/apprt/win32/`，Windows 默认 apprt，WGL 渲染、Direct2D 自绘 UI |
+| GTK app | Linux/FreeBSD 的 `src/apprt/gtk/`，GX 层在 `src/apprt/gtk/gx/` |
+| macOS app | `macos/` Swift，经 `include/ghostty.h` 访问 internal 库 |
+| libghostty-vt | `src/lib_vt.zig`、`include/ghostty/`，支持 wasm32-freestanding |
+
+两个 GX apprt 共用 `src/gx/` 的配置、i18n、UI 模型、动作、会话与进程策略。数据流为 pty → `Termio.processOutput` → `terminal.Stream` → `Terminal/Screen/PageList` → `Renderer.updateFrame/drawFrame`。surface 有 termio 写线程、pty 读线程与渲染线程，POSIX 另有 io-gather；所有者与远程窗格边界见 `docs/ARCHITECTURE.md`。
 
 ## 常用命令
 
-zig 一律经 `scripts/zigw.py` 调用钉版 Zig（工具链与缓存在 gitignored 的 `.local/`）；上游段的 `zig build …` 改用对应 just 配方（测试定向用运行期 `--filter <子串>`，不重编；`-Dtest-filter` 仍可透传，但换值就重编），`zig fmt .` 改用 `just fmt` / `just fmt-check`（排除 `.local`、`zig-pkg` 等，后者是拉取的第三方依赖）。
+上游段的 `zig build …` 改用对应 just 入口；定向测试用运行期 `--filter <子串>`，`-Dtest-filter` 换值会重编。命令参数含 shell 元字符或必须保留空格时直接调用脚本，见 `docs/MAKE_COMMANDS.md`。
 
 | 命令 | 用途 |
 |---|---|
-| `just setup` / `just doctor` | 安装钉版 Zig 与 graphify（`--innosetup` 另装 Inno Setup）/ 只读诊断 |
-| `just test-vt <a>` / `just test <a>` | lib-vt 单测 / 完整单测，经 `scripts/zig_test.py` 并行分片 |
-| `just build <a>` / `just build-vt <a>` | `zig build`（Windows 主机补 `-Dtarget=x86_64-windows-gnu`，产出 win32 app）/ `zig build -Demit-lib-vt` |
-| `just package-windows <a>` / `just stage <平台> <目录>` | Windows 便携 zip 与安装包 / GX Shell 组件 stage |
-| `just wsl <子命令>` | 经 WSL 做 Linux GTK 构建、完整单测、Xvfb 截图与 GTK 场景（`setup`、`sync`、`build`、`test`、`smoke`、`scenario`、`run`） |
-| `just win-gui <a>` / `just perf <a>` | Windows GUI 场景回放与截图（`test/gui/win32/`）/ 耗时度量与新旧构建交替对比 |
-| `just vt-wasm` / `just dist-vt` | lib-vt wasm32 构建 / lib-vt 源码包 |
-| `just fmt` / `just fmt-check` / `just zig <a>` | 格式化 / 只检查 / 直通钉版 zig |
-| `just rules <p>` / `just rules-review <p>` / `just rules-check` | resolver |
+| `just setup` / `just doctor` | 仓内安装钉版 Zig、graphify / 只读诊断；`--innosetup` 另装便携 Inno Setup |
+| `just build` / `just build-vt` | app / lib-vt；Windows app 自动用 x86_64-windows-gnu |
+| `just test` / `just test-vt` | 完整 / lib-vt 单测，均由 `scripts/zig_test.py` 并行分片 |
+| `just fmt` / `just fmt-check` / `just zig <a>` | Zig 格式化 / 检查 / 直通钉版；排除依赖与缓存 |
+| `just quick-prepare` / `just quick-check` | Windows 日常编译签收 / 固定 60 s 快速门，不代完整回归 |
+| `just framework-test` / `just framework-check` / `just ci-check` | 框架单测 / 框架门 / 再加 fmt-check 与 test-vt |
+| `just wsl <命令>` | WSL Linux/GTK 的 setup、sync、build、test、smoke、scenario、run |
+| `just win-gui <a>` / `just perf <a>` | 隔离 GUI 场景与截图 / 耗时度量 |
+| `just package-windows` / `just stage <平台> <新目录>` | Windows zip/安装包 / GX Shell 组件 stage |
+| `just vt-wasm` / `just dist-vt` | lib-vt wasm32 / 源码包 |
+| `just graph` / `just graph-check` / `just graph-query <q>` | 原始图谱生成 / 新鲜度 / 查询 |
+| `just graph-view` / `just graph-view-check` | 离线 3D/2D 浏览器生成 / 校验，见 `docs/GRAPH.md` |
+| `just kb` / `just kb-check` / `just kb-query <q>` | KB 生成 / 校验 / 检索 |
+| `just i18n` / `just pinyin` / `just fluent` | 翻译、拼音、图标生成，各有 `-check` |
+| `just generated-check` | kb、i18n、pinyin、fluent、原始 graph 新鲜度；浏览器另跑 graph-view-check |
 | `just version` / `just version-check` | fork 版本 / CHANGELOG 标题校验 |
-| `just quick-prepare` / `just quick-check` | Windows 日常快速门：编译独立签收，检查与固定测试总预算 60 s；不代完整 CI |
-| `just framework-test` / `just framework-check` / `just ci-check` | 框架单测（`scripts/run_unittests.py` 并行）/ 框架聚合门 / 再加 fmt-check 与 test-vt（完整回归，不设 60 s 预算） |
-| `just graph` / `just graph-check` / `just graph-query <q>` | 图谱重建 / 新鲜度 / 查询 |
-| `just kb` / `just kb-check` / `just kb-query <q>` | 知识库构建 / 校验 / 检索 |
-| `just i18n` / `just i18n-check` | 由 `po/zh_CN.po` 与 `src/gx/i18n/gx.zh_CN.po` 重建 / 校验 GX 翻译表 |
-| `just pinyin` / `just pinyin-check` | 从仓内钉版输入重建 / 离线校验拼音表 `src/gx/pinyin/{initials,syllables}.zig` |
-| `just fluent` / `just fluent-check` | 离线重建 / 校验 Fluent 图标路径 `src/gx/fluent/paths.zig` |
-| `just generated-check` | kb-check、i18n-check、pinyin-check、fluent-check 与 graph-check（同步后、发版前；framework-check 也含 pinyin-check） |
-| `just install-hooks` / `just commit-check <a>` | 启用 `.githooks` / 校验提交信息 |
+| `just install-hooks` / `just commit-check <a>` | commit-msg 钩子 / 提交信息校验 |
 
-Windows 的 `just build` 与 `just test` 使用 win32/windows-gnu；POSIX 用 WSL 或 CI。日常先 `just quick-prepare` 编译并签收，再 `just quick-check`，产物过期即拒绝。60 s 只计快速门，完整回归仍由同步、发版和 push CI 执行。符号链接用例缺权限时记 FAIL，不跳过。完整命令、覆盖与历史耗时见 `docs/TESTING.md`、`docs/MAKE_COMMANDS.md`。
+Windows 的 `just test` 使用 win32/windows-gnu，只覆盖 Windows 分支；POSIX 用 WSL 或 CI。快速门先 prepare 再 check，过期产物拒绝；同步、发版与完整回归不受 60 s 预算限制。符号链接用例缺权限记 FAIL，不跳过。覆盖与历史耗时见 `docs/TESTING.md`。
 
 ## 跨域硬边界
 
-详情见括号内的领域文档（`docs/AGENT_RULES/`）：
-
-- **C ABI**：libghostty-vt 函数按 `src/terminal/c/AGENTS.md` 的四步导出到 `include/ghostty/vt/`；C 枚举以 `_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE` 收尾；可扩展结构用 sized struct 与 `GHOSTTY_INIT_SIZED`（`libghostty-vt.md`）。
-- **freestanding**：libghostty-vt 必须能构建到 `wasm32-freestanding`，该路径不链接 libc 与 C++ SIMD 依赖（`src/simd` 走纯 Zig 回退）；lib-vt 不启用 oniguruma（`libghostty-vt.md`、`terminal-core.md`）。
-- **全局状态**：`src/global.zig` 只由 exe 的 `main`、libghostty 的 `ghostty_init` 或 `src/benchmark/cli.zig::main` 初始化；libghostty-vt 引用即编译失败（`app-core.md`）。
-- **线程与锁**：终端状态只在持有 `renderer_state.mutex` 时读写，不能被饿死的一方用 `src/renderer/State.zig` 的 `lockDemand`/`unlockDemand`；OpenGL context 同时只在一个线程 current；win32 的 HWND 与 Direct2D 只在 GUI 线程，其他线程只投递消息（`termio-pty-os.md`、`renderer.md`、`apprt-win32.md`）。
-- **嵌入边界**：`include/ghostty.h` 是只供 macOS app 的 libghostty-internal，外部嵌入方用 libghostty-vt；Swift 只经 `ghostty.h`/`module.modulemap` 访问核心（`libghostty-embedding.md`、`macos-app.md`）。
-- **配置即文档**：`src/config/Config.zig` 字段的 doc comment 生成用户文档，用 Pandoc Markdown 写（`config.md`）。
-- **i18n**：上游 GTK 字符串用 gettext 的 `_`/`N_`/`C_` 标记，pot 经 `update-translations` 同步；fork 字符串（GTK 的 GX 层、win32 全部界面）一律是英文 msgid 经 `gx.i18n.tr`/`trRuntime` 翻译，不得用 `_`，新译文写进 `src/gx/i18n/gx.zh_CN.po` 后 `just i18n`；macOS 未本地化（`apprt-gtk.md`、`gx-core.md`）。
-- **配置分层**：GX 默认值 < 用户配置（含 include）< `gui-settings.ghostty` < 命令行；设置界面只写 `gui-settings.ghostty`，不写用户的 `config.ghostty`；fork 配置键一律 `gx-*`（`gx-core.md`、`config.md`）。
-- **生成物**：`build.zig.zon.{json,nix,txt}`、`flatpak/zig-packages.json`、`vendor/glad/`、`graphify-out/`、`docs/kb/chunks.json`、`src/gx/i18n/zh_CN.zig`、`src/gx/pinyin/{initials,syllables}.zig`、`src/gx/fluent/paths.zig` 只经生成器重建；默认只检查，有意变更才重建并审 diff（`build-system.md`、`development.md`）。
-- **工具链本地性**：Zig、graphify 与 Inno Setup 只经 `just setup`（后者加 `--innosetup`）装进 `.local/`，禁止 winget/choco/scoop/msiexec 等系统级安装（`development.md`）。
+- **C ABI / freestanding**：lib-vt 四步导出遵守 `src/terminal/c/AGENTS.md`；C 枚举以 `_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE` 收尾，可扩展结构用 sized struct 与 `GHOSTTY_INIT_SIZED`。wasm32-freestanding 不链接 libc、C++ SIMD 或 oniguruma（`libghostty-vt`、`terminal-core`）。
+- **状态与线程**：`global.init` 只由 exe、internal 初始化或 benchmark 入口调用，lib-vt 不得引用 global。终端状态持 `renderer_state.mutex`，需要公平性时用 `lockDemand/unlockDemand`；GL context 同时只在一个线程 current，win32 HWND 与 D2D 只在 GUI 线程（`app-core`、`termio-pty-os`、`renderer`、`apprt-win32`）。
+- **嵌入**：`ghostty.h` 只给 macOS app，外部使用 lib-vt；Swift 只经头文件/module map 访问核心（`libghostty-embedding`、`macos-app`）。
+- **配置 / i18n**：GX 默认值 < 用户配置及 include < `gui-settings.ghostty` < CLI；设置只写 overlay，不改 `config.ghostty`。fork 键为 `gx-*`，字段 doc comment 用 Pandoc Markdown。上游 GTK 字符串走 gettext，fork 界面走英文 msgid + `gx.i18n`，译文写 `src/gx/i18n/gx.zh_CN.po` 后生成，macOS 未本地化（`config`、`gx-core`、`apprt-gtk`）。
+- **生成物 / 工具链**：默认只检查，有意变更才经生成器重建并审 diff；不手改 `build.zig.zon.{json,nix,txt}`、Flatpak 依赖清单、GLAD、图谱、KB、译表、拼音表和 Fluent 路径。Zig、graphify、Inno Setup 只经 setup 安装到 `.local/`，不做系统级安装（`build-system`、`development`）。
 
 ## 提交规范
 
-格式 `type(scope): 中文描述`：type 是小写英文 `feat fix perf docs ci test refactor chore build revert style release` 之一，scope 可选，`!` 标记破坏性变更；不加 emoji，不加 AI co-author 行。
+格式 `type(scope): 中文描述`；type 是 `feat fix perf docs ci test refactor chore build revert style release` 之一，scope 可选，`!` 标记破坏性变更。不加 emoji、AI 会话链接或身份尾注。此规范优先于上游 writing-commit-messages skill；该 skill 只用于准备回馈上游。
 
-```text
-fix(build): 非 v 前缀 tag 不再触发版本号 panic
-```
+只精确暂存本轮文件，不用 `git add -A` 或 `-f`；提交前提出消息与用户对齐。没有明确要求不 commit/push，普通 push 只到 `origin`。`just commit-check --range <base>..HEAD` 按首父链检查；同步合并消息为 `chore(sync): 合并上游 main（<sha>）`。
 
-`just install-hooks` 启用本地 commit-msg 校验；`gx-ci` 用 `scripts/conventional_commits.py` 校验首父链。只精确暂存本轮相关文件（不用 `git add -A` 或 `-f`）；提交前先提出 commit message 与用户对齐；没有明确要求不 commit、不 push，push 只到 `origin`。
+## 领域导航
 
-## 领域规则索引
+全部文档位于 `docs/AGENT_RULES/<域>.md`，以下只供定位，不能替代 resolver：
 
-| 域 | 覆盖 |
+| 领域 | 覆盖 |
 |---|---|
-| `app-core` | `App`/`Surface`、apprt 接口、入口与 `global.zig`、崩溃上报 |
-| `apprt-gtk` | GTK apprt 与其 GX 层、i18n 与 `po/`、`dist/linux/` |
-| `apprt-win32` | Windows app：`src/apprt/win32/`、WGL 呈现钩子、`dist/windows/` 的 rc 与 manifest |
-| `build-system` | `build.zig(.zon)`、`src/build/`、`pkg/`、`vendor/`、nix、版本推导、`just build` |
-| `ci-release` | `.github/`、gx-ci/gx-release、CHANGELOG、发布脚本（`--task release`/`sync`） |
-| `cli-inspector` | CLI 动作、inspector 与 dcimgui、`src/extra/` |
-| `code-review` | 审核输出格式（`--task review`） |
-| `config` | 配置字段、解析与 helpgen，GX 配置层的接口 |
-| `development` | 框架自身：AGENTS、工具面、`docs/`、`scripts/`、`justfile`（`--task sync`） |
-| `font` | 字体发现（含 DirectWrite）、栅格化、shaping 与相关 `pkg/` |
-| `gx-core` | GX 共享核心 `src/gx/`：配置分层、i18n 与生成器、界面库、`gx:` 动作、启动配置、进程策略 |
-| `input` | 键鼠输入、绑定、编码（含 win32-input-mode） |
-| `libghostty-embedding` | `include/ghostty.h`、embedded apprt、`src/main_c.zig` |
-| `libghostty-vt` | `include/ghostty/`、`src/terminal/c/`、`src/lib_vt.zig`、`example/`、CMake/Doxygen |
-| `macos-app` | `macos/` Swift app、XCFramework、Darwin 专用代码 |
-| `packaging-dist` | `dist/`、flatpak、snap、`images/`、资源与源码包 |
-| `renderer` | 渲染线程、图形后端、着色器 |
-| `shell-integration` | shell 集成脚本、terminfo |
-| `support-libs` | `src/datastruct/`、`src/lib/` 与通用小模块 |
-| `terminal-core` | `src/terminal/` 状态机与页存储、simd、unicode |
-| `termio-pty-os` | termio、Exec、pty（含随包 ConPTY）、`src/os/` |
-| `testing` | `test/`（含 GUI 场景）、benchmark、synthetic、fuzz、测试运行器、`just wsl`、`just win-gui` 与 `just perf`（`--task test`） |
+| `app-core`、`config`、`input` | App/Surface/入口、配置、键鼠与绑定 |
+| `apprt-gtk`、`apprt-win32`、`macos-app` | 三端 UI 与桌面集成 |
+| `terminal-core`、`termio-pty-os`、`renderer`、`font` | 终端模型、PTY/OS、渲染、字体 |
+| `libghostty-vt`、`libghostty-embedding` | 外部 VT API / macOS internal API |
+| `gx-core`、`shell-integration`、`support-libs` | GX 共享层、shell/terminfo、通用库 |
+| `build-system`、`packaging-dist`、`ci-release` | 构建/依赖、安装资源、CI/发布 |
+| `cli-inspector`、`testing` | CLI/inspector、测试/GUI/性能（`--task test`） |
+| `development`、`code-review` | 协作框架/文档（`--task sync`）、只读审核（`--task review`） |
 
 ## 完成门
 
-1. `just rules-check` 通过；scope 扩大后对完整路径集合重跑 `just rules`。
-2. 按 resolver 列出的领域文档「验证」段跑最小针对性测试：libghostty-vt 用 `just test-vt --filter <子串>`，其他 Zig 用 `just test --filter <子串>`（Windows 与 POSIX 分支各自验证，POSIX 用 `just wsl test` 或 gx-ci 的 `linux-main`），框架脚本用 `python scripts/run_unittests.py test_<name>`；合并前跑 `just framework-check` 与 `just ci-check`。
-3. 改 Zig 跑 `just fmt-check`；改 Swift 按 `macos/AGENTS.md` 跑 swiftlint。
-4. 触及生成物必须用对应生成器重建并审 diff，或说明为何无影响；改公开签名或文档后跑 `just kb`，上游同步后跑 `just generated-check`。
-5. GUI 可见变更要有读过的截图才记 PASS：win32 用 `just build` 的 app 在隔离配置下启动，经 `just win-gui`（或 kimi-cu 桌面自动化、PowerShell）截图并逐张读图；GTK 用 `just wsl smoke` / `just wsl scenario` 截图，或 gx-ci 的 `gtk-smoke`；macOS 记 PENDING（`apprt-win32.md`、`testing.md`）。
-6. `git diff --check` 干净。
-7. 交付说明列出改动、真源、实际运行的命令与结果，逐项标 PASS / FAIL / PENDING / N/A；未运行项附补验命令与理由，不写假绿。
+1. scope 完整且 `just rules-check` 通过。按命中领域的验证段跑最相关检查，规则/脚本/文档变化跑 `just framework-check`。
+2. Zig 改动跑 `just fmt-check` 与针对性 `just test` 或 `just test-vt`；Swift 按 macOS 局部规则跑 swiftlint。平台分支分别验证；合并前跑 `just ci-check`，同步还跑 Windows 完整单测与 WSL Linux/GTK。
+3. 文档或公开签名变化重建 KB；同步后依次 `just graph` → `just graph-view` → `just kb`，再 `just generated-check` 与 `just graph-view-check`。输入、预算与离线验收见 `docs/GRAPH.md`。
+4. GUI 可见变化读回真实截图才记 PASS：Windows 用隔离的 `just win-gui`，GTK 用 WSL smoke/scenario 或 CI artifact，macOS 缺环境记 PENDING；步骤或 DOM 通过不能代视觉验收。
+5. `git diff --check` 干净。交付逐项列 PASS / FAIL / PENDING / N/A，给实际命令、证据与缺失前置；未运行不写通过。

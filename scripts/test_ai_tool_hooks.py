@@ -51,7 +51,6 @@ CLAUDE_ROOT = "${CLAUDE_PROJECT_DIR:-" + TOPLEVEL + "}"
 # missing) would be a non-blocking hook error, so the registered commands normalize it to 2.
 FAIL_CLOSED = " || exit 2"
 CLAUDE_HOOK_COMMAND = f'bash "{CLAUDE_ROOT}/.claude/hooks/block_dangerous.sh"{FAIL_CLOSED}'
-ZCODE_HOOK_COMMAND = f'bash "{TOPLEVEL}/.claude/hooks/block_dangerous.sh"{FAIL_CLOSED}'
 CODEX_HOOK_COMMAND = f'python3 "{TOPLEVEL}/.codex/hooks/pre_tool_use_policy.py"{FAIL_CLOSED}'
 # Codex runs command_windows through PowerShell: 5.1 rejects "||" and 7 ends every failure
 # with exit 1, so the Windows form checks $? (python3 not found leaves $LASTEXITCODE unset)
@@ -59,7 +58,7 @@ CODEX_HOOK_COMMAND = f'python3 "{TOPLEVEL}/.codex/hooks/pre_tool_use_policy.py"{
 CODEX_WINDOWS_HOOK_COMMAND = (
     f'python3 "{TOPLEVEL}/.codex/hooks/pre_tool_use_policy.py"; if (-not $? -or $LASTEXITCODE -ne 0) {{ exit 2 }}'
 )
-CLIENT_MATCHER = "Bash|Edit|Write|MultiEdit|NotebookEdit"
+CLIENT_MATCHER = "Bash|Read|Edit|Write|MultiEdit|NotebookEdit"
 CODEX_MATCHER = "^(Bash|apply_patch)$"
 COMMAND_POSITION = "(?m)(?:^|[;&|(){`]|\\$\\()[ \\t]*(?:(?:if|elif|while|until|then|do|else|!)[ \\t]+)*"
 WRITE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
@@ -602,14 +601,11 @@ def _toplevel() -> str:
 
 
 def _registered_commands() -> list[tuple[str, str]]:
-    """(client, command) for every PreToolUse hook registered in the three configs."""
+    """(client, command) for project hooks; ZCode ignores project-level hooks."""
     commands: list[tuple[str, str]] = []
     claude = json.loads(CLAUDE_SETTINGS.read_text(encoding="utf-8"))
     for block in claude["hooks"]["PreToolUse"]:
         commands += [("claude", hook["command"]) for hook in block["hooks"]]
-    zcode = json.loads(ZCODE_CONFIG.read_text(encoding="utf-8"))
-    for block in zcode["hooks"]["events"]["PreToolUse"]:
-        commands += [("zcode", hook["command"]) for hook in block["hooks"]]
     codex = tomllib.loads(CODEX_CONFIG.read_text(encoding="utf-8"))
     for block in codex["hooks"]["PreToolUse"]:
         commands += [("codex", hook["command"]) for hook in block["hooks"]]
@@ -822,7 +818,7 @@ class ShellProbeTests(unittest.TestCase):
 
     def test_tool_names_are_case_insensitive_and_unguarded_tools_pass(self) -> None:
         self.assertEqual("deny", _level("bash", {"command": FORCE_PUSH}))
-        self.assertIsNone(_level("Read", {"file_path": str(REPO_ROOT / DOT_ENV)}))
+        self.assertEqual("deny", _level("read", {"file_path": str(REPO_ROOT / DOT_ENV)}))
         self.assertIsNone(_level("Grep", {"pattern": FORCE_PUSH}))
         self.assertIsNone(_level("Bash", {}))
 
@@ -843,6 +839,19 @@ class FileProbeTests(unittest.TestCase):
                     key = "notebook_path" if tool == "NotebookEdit" else "file_path"
                     with self.subTest(tool=tool, path=form):
                         self.assertEqual("deny", _level(tool, {key: form}, cwd=REPO_ROOT))
+
+    def test_read_tool_covers_existing_credential_variants(self) -> None:
+        protected = [*FILE_DENY, f"config/{DOT_ENV}.production", "certs/client.p12", "certs/client.pfx"]
+        for relative in protected:
+            for form in self._forms(relative):
+                with self.subTest(path=form):
+                    self.assertEqual("deny", _level("Read", {"file_path": form}, cwd=REPO_ROOT))
+
+    def test_read_tool_keeps_templates_public_keys_and_ordinary_paths(self) -> None:
+        allowed = [*FILE_ALLOW, f"config/{DOT_ENV}.sample", f"config/{DOT_ENV}.template"]
+        for relative in allowed:
+            with self.subTest(path=relative):
+                self.assertIsNone(_level("Read", {"file_path": relative}, cwd=REPO_ROOT))
 
     def test_gate_and_client_configs_pass_for_every_write_tool(self) -> None:
         # 2026-10 最小核心防线：安全门与客户端配置不再需要人工确认，与普通文件一样放行。
@@ -1078,7 +1087,7 @@ class ProtocolTests(unittest.TestCase):
 
 
 class FailClosedTests(unittest.TestCase):
-    """A broken policy or a missing gate must block Bash, file writes and patches, not allow them."""
+    """A broken policy must block guarded shell, read, write and patch tools."""
 
     def _layout(self, conf: bytes | None, *, with_gate: bool = True) -> Path:
         tmp = tempfile.TemporaryDirectory()
@@ -1099,6 +1108,7 @@ class FailClosedTests(unittest.TestCase):
     def test_broken_policy_blocks_guarded_tools_only(self) -> None:
         guarded = (
             ("Bash", {"command": f"{GIT} status"}),
+            ("Read", {"file_path": "a.txt"}),
             *((t, {"file_path": "a.txt"}) for t in WRITE_TOOLS),
             (APPLY_PATCH, {"input": _patch("*** Add File: a.txt")}),
         )
@@ -1109,7 +1119,7 @@ class FailClosedTests(unittest.TestCase):
             for tool, tool_input in guarded:
                 labels.append((name, tool, 2))
                 calls.append((gate, {"tool_name": tool, "tool_input": tool_input}, {"cwd": root}))
-            for tool in ("Read", ""):
+            for tool in ("Grep", ""):
                 labels.append((name, tool or "<none>", 0))
                 calls.append((gate, {"tool_name": tool, "tool_input": {}}, {"cwd": root}))
         with _started(calls) as results:
@@ -1193,27 +1203,27 @@ class RegisteredEntryTests(unittest.TestCase):
     """Run each configured hook command verbatim through bash, the way the clients do."""
 
     PROBES = [
-        ("Bash", {"command": FORCE_PUSH}, {"claude": "deny", "zcode": "deny", "codex": "deny"}),
-        ("Bash", {"command": ROOT_RM}, {"claude": "deny", "zcode": "deny", "codex": "deny"}),
-        ("Bash", {"command": f"cat {DOT_ENV}"}, {"claude": "deny", "zcode": "deny", "codex": "deny"}),
-        ("Bash", {"command": HARD_RESET}, {"claude": None, "zcode": None, "codex": None}),
-        ("Bash", {"command": f"{GIT} status"}, {"claude": None, "zcode": None, "codex": None}),
-        ("Write", {"file_path": str(REPO_ROOT / DOT_ENV)}, {"claude": "deny", "zcode": "deny", "codex": "deny"}),
-        ("Write", {"file_path": str(REPO_ROOT / "docs" / "kb" / "chunks.json")}, {"claude": None, "zcode": None, "codex": None}),
-        ("Edit", {"file_path": str(REPO_ROOT / "src" / "main.zig")}, {"claude": None, "zcode": None, "codex": None}),
+        ("Bash", {"command": FORCE_PUSH}, {"claude": "deny", "codex": "deny"}),
+        ("Bash", {"command": ROOT_RM}, {"claude": "deny", "codex": "deny"}),
+        ("Bash", {"command": f"cat {DOT_ENV}"}, {"claude": "deny", "codex": "deny"}),
+        ("Bash", {"command": HARD_RESET}, {"claude": None, "codex": None}),
+        ("Bash", {"command": f"{GIT} status"}, {"claude": None, "codex": None}),
+        ("Write", {"file_path": str(REPO_ROOT / DOT_ENV)}, {"claude": "deny", "codex": "deny"}),
+        ("Write", {"file_path": str(REPO_ROOT / "docs" / "kb" / "chunks.json")}, {"claude": None, "codex": None}),
+        ("Edit", {"file_path": str(REPO_ROOT / "src" / "main.zig")}, {"claude": None, "codex": None}),
         (APPLY_PATCH, {"input": _patch("*** Add File: " + str(REPO_ROOT / DOT_ENV))},
-         {"claude": "deny", "zcode": "deny", "codex": "deny"}),
+         {"claude": "deny", "codex": "deny"}),
         (APPLY_PATCH, {"input": _patch("*** Update File: " + str(REPO_ROOT / "docs" / "kb" / "chunks.json"))},
-         {"claude": None, "zcode": None, "codex": None}),
+         {"claude": None, "codex": None}),
         (APPLY_PATCH, {"input": _patch("*** Update File: " + str(REPO_ROOT / "src" / "terminal" / "Terminal.zig"))},
-         {"claude": None, "zcode": None, "codex": None}),
+         {"claude": None, "codex": None}),
     ]
     # Every entry answers every probe from the checkout root. A subdirectory session only changes
     # how an entry locates its script (git rev-parse) and the payload cwd, so there each entry runs
     # the probe whose answer differs per protocol plus a path that resolves against that cwd.
     SUBDIR_PROBES = [
         PROBES[3],
-        ("Write", {"file_path": "../" + DOT_ENV}, {"claude": "deny", "zcode": "deny", "codex": "deny"}),
+        ("Write", {"file_path": "../" + DOT_ENV}, {"claude": "deny", "codex": "deny"}),
     ]
     # CLAUDE_PROJECT_DIR only changes how the Claude entry finds its script: one probe per answer
     # (deny through a FILE rule, deny through a SHELL rule, allow) shows that each form gates from
@@ -1244,9 +1254,35 @@ class RegisteredEntryTests(unittest.TestCase):
 
     def test_registered_commands_are_exact(self) -> None:
         self.assertEqual(
-            [("claude", CLAUDE_HOOK_COMMAND), ("zcode", ZCODE_HOOK_COMMAND), ("codex", CODEX_HOOK_COMMAND)],
+            [("claude", CLAUDE_HOOK_COMMAND), ("codex", CODEX_HOOK_COMMAND)],
             _registered_commands(),
         )
+
+    def test_claude_read_uses_registered_matcher_and_file_policy(self) -> None:
+        settings = json.loads(CLAUDE_SETTINGS.read_text(encoding="utf-8"))
+        registration = settings["hooks"]["PreToolUse"][0]
+        self.assertRegex("Read", registration["matcher"])
+        command = registration["hooks"][0]["command"]
+        paths = [
+            (f"config/{DOT_ENV}.local", "deny"),
+            ("certs/client.p12", "deny"),
+            ("certs/client.pfx", "deny"),
+            (f"config/{DOT_ENV}.example", None),
+            (f"config/{DOT_ENV}.sample", None),
+            (f"config/{DOT_ENV}.template", None),
+            ("id_ed25519.pub", None),
+            ("docs/AI_TOOLS.md", None),
+        ]
+        calls = [
+            ([self._bash(), "-c", command],
+             {"tool_name": "Read", "tool_input": {"file_path": path}, "cwd": str(REPO_ROOT)},
+             {"env": _bash_env()})
+            for path, _ in paths
+        ]
+        with _started(calls, ENTRY_PROBE_WORKERS) as results:
+            for (path, expected), future in zip(paths, results):
+                with self.subTest(path=path):
+                    self._assert_gates(future.result(), expected)
 
     def test_registered_commands_gate_as_configured(self) -> None:
         bash = self._bash()
@@ -1410,7 +1446,7 @@ class AdapterIntegrityTests(unittest.TestCase):
                     result = subprocess.run([bash, "-n", str(script)], capture_output=True, timeout=60, check=False)
                     self.assertEqual(0, result.returncode, result.stderr)
                     checked += 1
-        self.assertGreaterEqual(checked, 2)
+        self.assertEqual(checked, 1)
 
     def test_every_hook_script_parses(self) -> None:
         for script in [*HOOKS_DIR.glob("*.py"), *CODEX_ADAPTER_PATH.parent.glob("*.py")]:
@@ -1528,29 +1564,36 @@ class CodexConfigTests(unittest.TestCase):
         self.assertRegex(text, r"(?m)^\[\[hooks\.PreToolUse\]\]$")
         self.assertRegex(text, r"(?m)^\[\[hooks\.PreToolUse\.hooks\]\]$")
 
-    def test_reviewer_is_registered_read_only(self) -> None:
-        agent = self.config["agents"]["gx_ghostty_reviewer"]
-        self.assertEqual("agents/gx-ghostty-reviewer.toml", agent["config_file"])
-        self.assertTrue(agent["description"])
-        path = CODEX_CONFIG.parent / agent["config_file"]
-        self.assertTrue(path.is_file())
+    def test_project_agents_inherit_model_and_parent_permissions(self) -> None:
+        for config in self.config.get("agents", {}).values():
+            if isinstance(config, dict):
+                self.assertNotIn("config_file", config)
+        agents = sorted((CODEX_CONFIG.parent / "agents").glob("*.toml"))
+        self.assertTrue(agents)
+        names = set()
+        for path in agents:
+            agent = tomllib.loads(path.read_text(encoding="utf-8"))
+            with self.subTest(agent=path.name):
+                for field in ("name", "description", "developer_instructions"):
+                    self.assertIsInstance(agent.get(field), str)
+                    self.assertTrue(agent[field].strip())
+                self.assertNotIn(agent["name"], names)
+                names.add(agent["name"])
+                for field in ("model", "model_reasoning_effort", "model_provider", "sandbox_mode", "approval_policy", "mcp_servers"):
+                    self.assertNotIn(field, agent)
+
+    def test_reviewer_keeps_read_only_duties_without_claiming_isolation(self) -> None:
+        path = CODEX_CONFIG.parent / "agents" / "gx-ghostty-reviewer.toml"
         reviewer = tomllib.loads(path.read_text(encoding="utf-8"))
         self.assertEqual("gx_ghostty_reviewer", reviewer["name"])
         self.assertTrue(reviewer["description"])
-        self.assertEqual("read-only", reviewer["sandbox_mode"])
-        for needle in ("--task review", "rules-review", "docs/AGENT_RULES/code-review.md"):
+        for needle in ("--task review", "rules-review", "docs/AGENT_RULES/code-review.md", "继承父会话", "不构成独立沙箱"):
             self.assertIn(needle, reviewer["developer_instructions"])
 
 
 class ZcodeConfigTests(unittest.TestCase):
-    def test_hooks_enabled_with_millisecond_timeouts(self) -> None:
-        hooks = json.loads(ZCODE_CONFIG.read_text(encoding="utf-8"))["hooks"]
-        self.assertIs(True, hooks["enabled"], "a missing or false flag silently disables every hook")
-        self.assertEqual(30000, hooks["timeoutMs"])
-        blocks = hooks["events"]["PreToolUse"]
-        self.assertEqual(1, len(blocks))
-        self.assertEqual(CLIENT_MATCHER, blocks[0]["matcher"])
-        self.assertEqual([{"type": "command", "command": ZCODE_HOOK_COMMAND, "timeoutMs": 30000}], blocks[0]["hooks"])
+    def test_project_config_does_not_claim_executable_hooks(self) -> None:
+        self.assertEqual({}, json.loads(ZCODE_CONFIG.read_text(encoding="utf-8")))
 
 
 if __name__ == "__main__":

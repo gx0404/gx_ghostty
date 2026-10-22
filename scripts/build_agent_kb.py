@@ -44,6 +44,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = "docs/kb/chunks.json"
 SCHEMA_VERSION = 2
+SIZE_BUDGET_BYTES = int(2.5 * 1024 * 1024)
 DOC_FIELDS = ("path", "source_sha256", "chunks")
 CHUNK_FIELDS = ("anchor", "text")
 MAX_DOC_CHARS = 1500
@@ -792,6 +793,28 @@ def write_atomic(target: Path, content: str) -> None:
         raise
 
 
+def checked_render(root: Path = REPO_ROOT) -> tuple[dict, str]:
+    """Build in memory, enforcing the shared budget before check or write."""
+    payload = build_payload(root)
+    content = render(payload)
+    size = len(content.encode("utf-8"))
+    if size > SIZE_BUDGET_BYTES:
+        raise KBError(f"知识库 {size} 字节超出 2.5 MiB 预算（{SIZE_BUDGET_BYTES}）；精简语料，不写产物")
+    return payload, content
+
+
+def check_freshness(root: Path = REPO_ROOT, target: Path | None = None) -> None:
+    """Read-only freshness gate shared by default queries and build checks."""
+    _, content = checked_render(root)
+    path = target if target is not None else root / DEFAULT_OUTPUT
+    try:
+        current = path.read_bytes().replace(b"\r\n", b"\n")
+    except OSError as exc:
+        raise KBError(f"知识库不可读；运行 just kb：{exc}") from exc
+    if current != content.encode("utf-8"):
+        raise KBError("知识库已过期；运行 just kb 后重试查询")
+
+
 def _display(path: Path, root: Path) -> str:
     try:
         return path.relative_to(root).as_posix()
@@ -824,11 +847,10 @@ def main(argv: list[str] | None = None) -> int:
     target = (args.output if args.output else root / DEFAULT_OUTPUT).resolve()
     shown = _display(target, root)
     try:
-        payload = build_payload(root)
+        payload, content = checked_render(root)
     except KBError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    content = render(payload)
     summary = (
         f"{payload['doc_count']} docs，{payload['chunk_count']} chunks，"
         f"{len(content.encode('utf-8')) / 1024:.0f} KiB"
